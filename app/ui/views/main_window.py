@@ -7,6 +7,10 @@ import wave
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import sqlite3
+
+from app.database import Database, DEFAULT_DATABASE
+from app.ui.views.bases_page import BasesPage
 
 from PySide6.QtCore import QByteArray, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap
@@ -369,8 +373,9 @@ class CallCard(QFrame):
 
 
 class SentryWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, database_path: Path = DEFAULT_DATABASE) -> None:
         super().__init__()
+        self.database = Database(database_path)
         self.setWindowTitle("Sentry · Auditoría de grabaciones")
         self.resize(1440, 860)
         self.setMinimumSize(1080, 680)
@@ -401,6 +406,12 @@ class SentryWindow(QMainWindow):
 
         self._build_ui()
         self.setStyleSheet(self._stylesheet())
+        settings = self.database.settings()
+        if "audio_directory" in settings:
+            self.config_directory.setText(settings["audio_directory"])
+            self._set_directory_display(settings["audio_directory"])
+        if "keywords" in settings:
+            self.keywords_input.setText(settings["keywords"])
         self.call_list.setCurrentRow(0)
 
     def _build_ui(self) -> None:
@@ -415,6 +426,8 @@ class SentryWindow(QMainWindow):
         self.pages.addWidget(self._build_audit_page())
         self.pages.addWidget(self._build_reports_page())
         self.pages.addWidget(self._build_config_page())
+        self.bases_page = BasesPage(self.database)
+        self.pages.addWidget(self.bases_page)
         root_layout.addWidget(self.pages, 1)
         self.setCentralWidget(root)
 
@@ -478,6 +491,17 @@ class SentryWindow(QMainWindow):
         change.clicked.connect(self._choose_directory)
         directory_layout.addWidget(change)
         layout.addWidget(directory)
+        self.bases_button = QPushButton("Bases")
+        self.bases_button.setObjectName("navButton")
+        self.bases_button.setCheckable(True)
+        self.bases_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.bases_button.setIconSize(QSize(16, 16))
+        self.bases_button.setAccessibleName("Preparar bases DB_delete")
+        self.bases_button.setToolTip("Preparar bases CSV / Excel · DB_delete")
+        self.bases_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.bases_button.clicked.connect(lambda: self._switch_page("bases"))
+        self.nav_buttons["bases"] = self.bases_button
+        layout.addWidget(self.bases_button)
         layout.addStretch()
 
         nav = QHBoxLayout()
@@ -1247,7 +1271,7 @@ class SentryWindow(QMainWindow):
         button.setAccessibleName(f"{'Ocultar' if visible else 'Mostrar'} {field.accessibleName().lower()}")
 
     def _switch_page(self, key: str) -> None:
-        page_index = {"audit": 0, "reports": 1, "config": 2}[key]
+        page_index = {"audit": 0, "reports": 1, "config": 2, "bases": 3}[key]
         self.pages.setCurrentIndex(page_index)
         for name, button in self.nav_buttons.items():
             button.setChecked(name == key)
@@ -1470,8 +1494,13 @@ class SentryWindow(QMainWindow):
             self.keywords_input.setFocus()
             return
         self._set_directory_display(directory)
+        try:
+            self.database.save_settings({"audio_directory": directory, "keywords": ", ".join(keywords)})
+        except (sqlite3.Error, OSError) as exc:
+            self._show_toast(f"No se pudieron guardar los ajustes: {exc}")
+            return
         api_count = sum(bool(field.text().strip()) for field in (self.transcription_api_key, self.analysis_api_key))
-        self._show_toast(f"Ajustes aplicados a esta sesión · {api_count}/2 claves configuradas")
+        self._show_toast(f"Ajustes guardados · {api_count}/2 claves solo en esta sesión")
 
     def _scan_directory(self) -> None:
         directory_text = self.config_directory.text().strip()
@@ -1497,7 +1526,15 @@ class SentryWindow(QMainWindow):
             message = "No se pudo leer la carpeta seleccionada"
         else:
             count = len(self.detected_audio_files)
-            self.call_records = [call_record_from_audio(path, index) for index, path in enumerate(self.detected_audio_files, 1)]
+            records = [call_record_from_audio(path, index) for index, path in enumerate(self.detected_audio_files, 1)]
+            try:
+                self.database.register_calls(records)
+            except (sqlite3.Error, OSError) as exc:
+                self.scan_button.setEnabled(True)
+                self.scan_button.setToolTip("Escanear carpeta")
+                self._show_toast(f"No se pudo guardar el escaneo: {exc}")
+                return
+            self.call_records = records
             self.calls = {call.call_id: call for call in self.call_records}
             self._populate_call_list()
             self.search_input.clear()
@@ -1545,6 +1582,14 @@ class SentryWindow(QMainWindow):
             self.export_button.setText("Excel" if compact else "Exportar Excel")
         self._position_toast()
 
+    def closeEvent(self, event) -> None:
+        if hasattr(self, "bases_page") and self.bases_page.busy:
+            self._show_toast("Espera a que termine el procesamiento antes de cerrar Sentry")
+            event.ignore()
+            return
+        self.media_player.stop()
+        super().closeEvent(event)
+
     @staticmethod
     def _stylesheet() -> str:
         combo_arrow = (Path(__file__).resolve().parents[1] / "assets" / "chevron-down.svg").as_posix()
@@ -1554,7 +1599,7 @@ class SentryWindow(QMainWindow):
                 font-size: 13px;
                 color: {PALETTE['text_soft']};
             }}
-            QMainWindow, QWidget#appRoot, QWidget#auditPage, QWidget#reportsPage, QWidget#configPage {{
+            QMainWindow, QWidget#appRoot, QWidget#auditPage, QWidget#reportsPage, QWidget#configPage, QWidget#basesPage, QWidget#basesContent {{
                 background: {PALETTE['canvas']};
             }}
             QScrollArea#configScroll {{ background: {PALETTE['canvas']}; border: none; }}
@@ -1592,6 +1637,9 @@ class SentryWindow(QMainWindow):
             }}
             QPushButton#iconButton {{ padding: 0; }}
             QPushButton#secondaryButton:hover, QPushButton#iconButton:hover {{ color: {PALETTE['text']}; background: {PALETTE['surface']}; border-color: #afb6af; }}
+            QPushButton#secondaryButton:disabled {{ color: {PALETTE['gray_light']}; background: {PALETTE['surface']}; border-color: {PALETTE['border']}; }}
+            QTableWidget {{ background: {PALETTE['panel']}; border: 1px solid {PALETTE['border']}; gridline-color: {PALETTE['border']}; selection-background-color: {PALETTE['green_soft']}; selection-color: {PALETTE['text']}; }}
+            QHeaderView::section {{ background: {PALETTE['surface']}; padding: 7px; border: none; border-bottom: 1px solid {PALETTE['border']}; }}
             QPushButton#primaryButton {{
                 background: {PALETTE['green_accessible']};
                 color: white;

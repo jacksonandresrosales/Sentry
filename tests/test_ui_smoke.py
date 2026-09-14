@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 import wave
 from pathlib import Path
@@ -21,10 +22,12 @@ class SentryWindowSmokeTest(unittest.TestCase):
         install_ui_font(cls.app)
 
     def setUp(self) -> None:
-        self.window = SentryWindow()
+        self.temp = tempfile.TemporaryDirectory()
+        self.window = SentryWindow(Path(self.temp.name) / "audit.db")
 
     def tearDown(self) -> None:
         self.window.close()
+        self.temp.cleanup()
 
     def test_filters_selection_and_evidence_jump(self) -> None:
         self.assertEqual(self.window.call_list.count(), 4)

@@ -18,7 +18,28 @@ Para consultar el diseño detallado del sistema, el flujo de procesamiento, el e
 
 ---
 
+## Transformación de bases de llamadas
+
+El script [scripts/transformar_base.py](scripts/transformar_base.py) convierte bases CSV o Excel al formato NO, con clasificación de cédula/RUC y consolidación sin teléfonos repetidos. Consulta instalación, uso y reglas en [scripts/README.md](scripts/README.md).
+
+En Windows, haz doble clic en `DB_delete.cmd` para abrir la mini aplicación, cargar tu base y abrir el resultado o la carpeta de salida.
+
+La funcionalidad también está integrada en Sentry: abre `Sentry.cmd` y pulsa **Bases**, en el header junto al directorio. Permite cargar una o varias bases, consolidarlas, elegir carpeta, configurar V/R y número de base, usar opciones avanzadas y abrir el Excel o su carpeta. Conserva el modelo NO y la numeración sin sobrescrituras. El procesamiento trabaja en segundo plano y el historial permanece al reiniciar.
+
+## Base de datos local
+
+Se crea automáticamente en `data/db/sentry_audit.db`. Incluye `calls`, `keyword_hits`, `app_settings`, `base_jobs` y `base_records`. Guarda los audios detectados, ajustes no secretos, ejecuciones y registros únicos procesados; mantiene teléfonos y documentos como texto. Las llamadas de demostración no se guardan. Las claves API siguen solo en memoria.
+
+Para preparar el esquema sin abrir la interfaz:
+
+```powershell
+python -m app.database
+```
+
+La base SQLite y los Excel de `outputs` son privados y no se suben a Git. Contienen información sensible: deben guardarse en un equipo y carpetas con acceso restringido. El SQLite no está cifrado; no sustituye los controles de acceso del equipo. Para respaldarlo, cierra Sentry y copia `data/db/sentry_audit.db`, además de los Excel si quieres conservarlos.
+
 ## 🔒 Confidencialidad
+
 Software desarrollado para uso interno exclusivo de la empresa. Todos los derechos reservados.
 
 ---
@@ -34,4 +55,10 @@ python -m pip install -r requirements.txt
 python -m app.main
 ```
 
-La versión actual es un prototipo funcional de interfaz. El botón **Escanear carpeta** busca archivos `.wav` y `.mp3` de forma recursiva, sustituye los datos demostrativos de la lista por los audios encontrados y obtiene la duración de archivos WAV compatibles. Los archivos aparecen como pendientes hasta conectarlos con el proceso de transcripción y análisis. En Configuración se pueden cambiar proveedor, modelo y clave para transcripción y análisis. El botón **Validar** comprueba la credencial contra el proveedor seleccionado, carga sus modelos disponibles y conserva un modelo compatible seleccionado. Las claves permanecen en memoria durante la sesión y también pueden suministrarse mediante `DEEPGRAM_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY` u `OPENAI_API_KEY`. Las integraciones de procesamiento con Deepgram, Gemini, OpenAI, SQLite y Excel se conectarán en etapas posteriores.
+El botón **Escanear carpeta** busca archivos `.wav` y `.mp3` de forma recursiva, sustituye los datos demostrativos de la lista por los audios encontrados y obtiene la duración de archivos WAV compatibles. Los archivos se registran en SQLite como pendientes; la lista de auditoría se carga mediante el escaneo. La transcripción y el análisis automatizados siguen pendientes de implementación. En Configuración se pueden cambiar proveedor, modelo y clave para transcripción y análisis. El botón **Validar** comprueba la credencial contra el proveedor seleccionado, carga sus modelos disponibles y conserva un modelo compatible seleccionado. Las claves permanecen en memoria durante la sesión y también pueden suministrarse mediante `DEEPGRAM_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY` u `OPENAI_API_KEY`. Guardar ajustes persiste el directorio y los términos sensibles, nunca las claves. La transformación de bases y su exportación Excel ya están conectadas a SQLite desde **Bases**; los reportes de auditoría siguen siendo demostrativos.
+
+Pruebas con CSV ficticios, SQLite temporal e interfaz sin pantalla:
+
+```powershell
+python -m unittest discover -s tests -v
+```

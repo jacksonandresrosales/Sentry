@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import sys
+import sqlite3
 from pathlib import Path
 
 
 def main() -> int:
     try:
         from PySide6.QtGui import QIcon
-        from PySide6.QtWidgets import QApplication
+        from PySide6.QtWidgets import QApplication, QMessageBox
         from app.ui.views.main_window import SentryWindow, install_ui_font
     except ModuleNotFoundError as exc:
-        if exc.name == "PySide6":
+        if exc.name in {"PySide6", "openpyxl", "xlsxwriter"}:
             raise SystemExit(
-                "PySide6 no está instalado. Ejecuta: python -m pip install -r requirements.txt"
+                f"Falta {exc.name}. Ejecuta: python -m pip install -r requirements.txt"
             ) from exc
         raise
 
@@ -24,7 +25,12 @@ def main() -> int:
     app.setStyle("Fusion")
     install_ui_font(app)
 
-    window = SentryWindow()
+    try:
+        window = SentryWindow()
+    except (sqlite3.Error, OSError, RuntimeError) as exc:
+        QMessageBox.critical(None, "No se pudo iniciar Sentry",
+                             f"No se pudo preparar la base de datos local. Revisa permisos y espacio en disco.\n\n{exc}")
+        return 1
     window.show()
     return app.exec()
 

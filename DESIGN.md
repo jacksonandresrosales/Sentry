@@ -203,6 +203,8 @@ Los paneles usan radios de 8–10px; campos y botones, 7px; chips, 5px. Las fila
 
 La navegación es una fila compacta. La vista activa usa fondo verde suave y texto verde oscuro; las vistas inactivas permanecen blancas con texto gris.
 
+El acceso **Bases** vive inmediatamente al lado del directorio en la cabecera, con el mismo control de navegación y estado seleccionado. Su vista mantiene paneles planos, una sola acción primaria, opciones avanzadas desplegables e historial tabular. El progreso solo aparece durante una conversión; el estado inicial no muestra una barra activa.
+
 ### Línea de tiempo de evidencia
 
 La onda usa verde oscuro para el recorrido y gris claro para lo pendiente. Una marca vertical indica el segundo sensible; admite clic y teclado, y “Ir al momento” ofrece una alternativa explícita.

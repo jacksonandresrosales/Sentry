@@ -20,11 +20,15 @@ dist/
 data/db/*.db
 data/db/*.sqlite
 data/db/*.sqlite3
+data/db/*-journal
+data/db/*-wal
+data/db/*-shm
 !data/db/.gitkeep
 
 # Grabaciones de audio
 data/samples/*
 !data/samples/.gitkeep
+outputs/
 *.wav
 *.mp3
 *.ogg

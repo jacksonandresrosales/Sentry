@@ -28,7 +28,7 @@ Uso interno en escritorio, con grabaciones almacenadas en carpetas locales, unid
 
 ## Capabilities and Constraints
 
-- Primera etapa enfocada en una interfaz nativa de demostración; las integraciones de audio, IA, base de datos y exportación se conectarán después.
+- Audio local con escaneo y reproducción; transcripción y análisis automatizados aún pendientes. La vista Bases integra la transformación CSV/Excel al modelo NO, exportación con numeración segura e historial SQLite. Los reportes de auditoría siguen siendo demostrativos.
 - La configuración permite sustituir proveedor, modelo y claves de transcripción y análisis. La credencial se valida únicamente contra el proveedor seleccionado y, si es aceptada, se carga su catálogo de modelos. Mientras no exista almacenamiento protegido, las claves permanecen solo durante la sesión.
 - Estructura de referencia: barra superior, navegación entre Auditoría, Reportes y Configuración, métricas, lista maestra y panel de detalle.
 - Idioma principal: español.
