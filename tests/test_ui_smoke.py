@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 import unittest
+import wave
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton
 
 from app.ui.views.main_window import SentryWindow, install_ui_font, scan_audio_files
@@ -26,6 +28,8 @@ class SentryWindowSmokeTest(unittest.TestCase):
 
     def test_filters_selection_and_evidence_jump(self) -> None:
         self.assertEqual(self.window.call_list.count(), 4)
+        self.assertFalse(self.window.play_button.isEnabled())
+        self.assertFalse(self.window.original_button.isEnabled())
 
         self.window.status_filter.setCurrentIndex(1)
         visible = sum(
@@ -87,13 +91,24 @@ class SentryWindowSmokeTest(unittest.TestCase):
         files = (root / "llamada.wav", root / "ignorar.txt", nested / "LLAMADA.MP3")
         nested.mkdir(parents=True, exist_ok=True)
         try:
-            for path in files:
+            with wave.open(str(files[0]), "wb") as audio:
+                audio.setnchannels(1)
+                audio.setsampwidth(2)
+                audio.setframerate(8000)
+                audio.writeframes(b"\0\0" * 8000)
+            for path in files[1:]:
                 path.touch()
 
             detected = scan_audio_files(root)
             self.window._finish_scan(root)
             displayed_names = [self.window.call_records[index].filename for index in range(len(self.window.call_records))]
+            media_source = self.window.media_player.source().toLocalFile()
+            play_enabled = self.window.play_button.isEnabled()
+            original_enabled = self.window.original_button.isEnabled()
         finally:
+            self.window.media_player.stop()
+            self.window.media_player.setSource(QUrl())
+            self.app.processEvents()
             for path in files:
                 path.unlink(missing_ok=True)
             nested.rmdir()
@@ -103,6 +118,9 @@ class SentryWindowSmokeTest(unittest.TestCase):
         self.assertEqual(displayed_names, ["llamada.wav", "LLAMADA.MP3"])
         self.assertEqual(self.window.call_list.count(), 2)
         self.assertEqual(self.window.files_metric.text(), "2")
+        self.assertEqual(Path(media_source), files[0])
+        self.assertTrue(play_enabled)
+        self.assertTrue(original_enabled)
 
 
 if __name__ == "__main__":

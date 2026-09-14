@@ -9,7 +9,8 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -379,15 +380,20 @@ class SentryWindow(QMainWindow):
         self.detected_audio_files: tuple[Path, ...] = ()
         self.current_call = DEMO_CALLS[0]
         self.current_second = 0
-        self.is_playing = False
+        self.current_duration = self.current_call.duration
         self.call_cards: dict[int, CallCard] = {}
         self.nav_buttons: dict[str, QPushButton] = {}
         self.critical_line: QWidget | None = None
         self.network = QNetworkAccessManager(self)
 
-        self.play_timer = QTimer(self)
-        self.play_timer.setInterval(1000)
-        self.play_timer.timeout.connect(self._advance_audio)
+        self.audio_output = QAudioOutput(self)
+        self.audio_output.setVolume(1.0)
+        self.media_player = QMediaPlayer(self)
+        self.media_player.setAudioOutput(self.audio_output)
+        self.media_player.positionChanged.connect(self._on_player_position_changed)
+        self.media_player.durationChanged.connect(self._on_player_duration_changed)
+        self.media_player.playbackStateChanged.connect(self._on_playback_state_changed)
+        self.media_player.errorOccurred.connect(self._on_player_error)
 
         self.toast_timer = QTimer(self)
         self.toast_timer.setSingleShot(True)
@@ -778,12 +784,12 @@ class SentryWindow(QMainWindow):
         reviewed = QPushButton("Marcar como revisada")
         reviewed.setObjectName("secondaryButton")
         reviewed.clicked.connect(lambda: self._show_toast("Llamada marcada como revisada"))
-        original = QPushButton("Abrir audio original")
-        original.setObjectName("linkButton")
-        original.clicked.connect(lambda: self._show_toast("La apertura del archivo se conectará con el directorio real"))
+        self.original_button = QPushButton("Abrir audio original")
+        self.original_button.setObjectName("linkButton")
+        self.original_button.clicked.connect(self._open_original_audio)
         actions.addWidget(reviewed)
         actions.addStretch()
-        actions.addWidget(original)
+        actions.addWidget(self.original_button)
         return actions
 
     def _build_reports_page(self) -> QWidget:
@@ -1289,6 +1295,12 @@ class SentryWindow(QMainWindow):
         self._stop_playback()
         self.current_call = call
         self.current_second = 0
+        self.current_duration = call.duration
+        source = call.source_path
+        has_audio = source is not None and source.is_file()
+        self.play_button.setEnabled(has_audio)
+        self.original_button.setEnabled(has_audio)
+        self.media_player.setSource(QUrl.fromLocalFile(str(source)) if has_audio else QUrl())
         self.filename_label.setText(call.filename)
         badge_text = "Término sensible" if call.sensitive else "Sin alerta crítica"
         self.risk_badge.setText("Pendiente de análisis" if call.risk == "Pendiente" else badge_text)
@@ -1301,7 +1313,7 @@ class SentryWindow(QMainWindow):
         self.time_value.setText(call.clock)
         self.risk_value.setText(call.risk)
         self.summary_label.setText(call.summary)
-        self.timeline.set_audio(call.duration, call.hit_second)
+        self.timeline.set_audio(self.current_duration, call.hit_second)
         self._update_time_display()
 
         if call.hit_second is None:
@@ -1359,36 +1371,71 @@ class SentryWindow(QMainWindow):
         return f"{safe[:start]}<span style='color:{PALETTE['green_accessible']}; font-weight:700'>{safe[start:end]}</span>{safe[end:]}"
 
     def _toggle_playback(self) -> None:
-        if self.is_playing:
-            self._stop_playback()
+        source = self.current_call.source_path
+        if source is None or not source.is_file():
+            self._show_toast("Selecciona un audio real antes de reproducir")
             return
-        if self.current_second >= self.current_call.duration:
-            self._seek_audio(0)
-        self.is_playing = True
-        self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
-        self.play_button.setAccessibleName("Pausar audio")
-        self.play_timer.start()
+
+        if self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.media_player.pause()
+            return
+
+        if self.media_player.duration() > 0 and self.media_player.position() >= self.media_player.duration():
+            self.media_player.setPosition(0)
+        self.media_player.play()
 
     def _stop_playback(self) -> None:
-        self.is_playing = False
-        self.play_timer.stop()
+        self.media_player.stop()
         if hasattr(self, "play_button"):
             self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
             self.play_button.setAccessibleName("Reproducir audio")
 
-    def _advance_audio(self) -> None:
-        if self.current_second >= self.current_call.duration:
-            self._stop_playback()
+    def _on_player_position_changed(self, position_ms: int) -> None:
+        self.current_second = max(0, position_ms // 1000)
+        self.timeline.set_position(self.current_second)
+        self._update_time_display()
+
+    def _on_player_duration_changed(self, duration_ms: int) -> None:
+        if self.current_call.source_path is None or duration_ms <= 0:
             return
-        self._seek_audio(self.current_second + 1)
+        self.current_duration = max(1, round(duration_ms / 1000))
+        self.duration_label.setText(format_time(self.current_duration))
+        self.timeline.set_audio(self.current_duration, self.current_call.hit_second)
+        self.timeline.set_position(self.current_second)
+        self._update_time_display()
+
+    def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
+        if not hasattr(self, "play_button"):
+            return
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        icon = QStyle.StandardPixmap.SP_MediaPause if playing else QStyle.StandardPixmap.SP_MediaPlay
+        self.play_button.setIcon(self.style().standardIcon(icon))
+        self.play_button.setAccessibleName("Pausar audio" if playing else "Reproducir audio")
+
+    def _on_player_error(self, error: QMediaPlayer.Error, error_string: str) -> None:
+        if error == QMediaPlayer.Error.NoError:
+            return
+        detail = error_string.strip() or "formato no compatible"
+        self._show_toast(f"No se pudo reproducir el audio: {detail}")
 
     def _seek_audio(self, seconds: int) -> None:
-        self.current_second = max(0, min(seconds, self.current_call.duration))
+        self.current_second = max(0, min(seconds, self.current_duration))
+        source = self.current_call.source_path
+        if source is not None and source.is_file():
+            self.media_player.setPosition(self.current_second * 1000)
         self.timeline.set_position(self.current_second)
         self._update_time_display()
 
     def _update_time_display(self) -> None:
-        self.time_display.setText(f"{format_time(self.current_second)} / {format_time(self.current_call.duration)}")
+        self.time_display.setText(f"{format_time(self.current_second)} / {format_time(self.current_duration)}")
+
+    def _open_original_audio(self) -> None:
+        source = self.current_call.source_path
+        if source is None or not source.is_file():
+            self._show_toast("El archivo de audio ya no está disponible")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(source))):
+            self._show_toast("Windows no pudo abrir el archivo con el reproductor predeterminado")
 
     def _jump_to_evidence(self) -> None:
         if self.current_call.hit_second is None:
@@ -1563,6 +1610,7 @@ class SentryWindow(QMainWindow):
                 text-decoration: underline;
             }}
             QPushButton#linkButton:hover {{ color: {PALETTE['text']}; }}
+            QPushButton#linkButton:disabled {{ color: {PALETTE['gray_light']}; }}
             QFrame#filterBar {{
                 background: {PALETTE['panel']};
                 border-bottom: 1px solid {PALETTE['border']};
@@ -1663,6 +1711,10 @@ class SentryWindow(QMainWindow):
                 padding: 0;
             }}
             QPushButton#playButton:hover {{ background: #238537; }}
+            QPushButton#playButton:disabled {{
+                background: #eceeec;
+                border-color: {PALETTE['border']};
+            }}
             QScrollArea#transcriptScroll, QWidget#transcriptBody {{ background: transparent; border: none; }}
             QFrame#transcriptLine {{ background: transparent; border: none; border-bottom: 1px solid #edf0ed; border-radius: 0; }}
             QFrame#criticalTranscript {{
