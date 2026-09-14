@@ -3,11 +3,13 @@ from __future__ import annotations
 import html
 import json
 import os
+import wave
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QKeyEvent, QMouseEvent, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -53,6 +55,22 @@ PALETTE = {
     "muted": "#656263",
 }
 
+AUDIO_SUFFIXES = {".mp3", ".wav"}
+
+
+def scan_audio_files(directory: Path) -> tuple[Path, ...]:
+    if not directory.exists():
+        raise FileNotFoundError(directory)
+    if not directory.is_dir():
+        raise NotADirectoryError(directory)
+
+    return tuple(
+        sorted(
+            (path for path in directory.rglob("*") if path.is_file() and path.suffix.casefold() in AUDIO_SUFFIXES),
+            key=lambda path: str(path).casefold(),
+        )
+    )
+
 
 def install_ui_font(app: QApplication) -> str:
     font_path = Path(__file__).resolve().parents[1] / "assets" / "Inter-Variable.ttf"
@@ -87,6 +105,7 @@ class CallRecord:
     summary: str
     snippet: str
     transcript: tuple[TranscriptLine, ...]
+    source_path: Path | None = None
 
 
 DEMO_CALLS = (
@@ -179,6 +198,47 @@ DEMO_CALLS = (
 def format_time(seconds: int) -> str:
     minutes, remaining = divmod(max(0, seconds), 60)
     return f"{minutes:02d}:{remaining:02d}"
+
+
+def call_record_from_audio(path: Path, call_id: int) -> CallRecord:
+    parts = path.stem.split("-")
+    customer = "Sin identificar"
+    try:
+        clock = datetime.fromtimestamp(path.stat().st_mtime).strftime("%H:%M")
+    except OSError:
+        clock = "--:--"
+    if len(parts) >= 5:
+        phone, raw_time = parts[2], parts[4]
+        if phone.isdigit() and len(phone) >= 7:
+            customer = f"{phone[:3]}***{phone[-4:]}"
+        if raw_time.isdigit() and len(raw_time) == 6:
+            clock = f"{raw_time[:2]}:{raw_time[2:4]}"
+
+    duration = 0
+    if path.suffix.casefold() == ".wav":
+        try:
+            with wave.open(str(path), "rb") as audio:
+                duration = max(1, round(audio.getnframes() / audio.getframerate()))
+        except (EOFError, OSError, ZeroDivisionError, wave.Error):
+            pass
+
+    return CallRecord(
+        call_id=call_id,
+        filename=path.name,
+        agent="Agente sin identificar",
+        customer=customer,
+        clock=clock,
+        duration=duration,
+        category="Pendiente",
+        sensitive=False,
+        keyword="Sin analizar",
+        hit_second=None,
+        risk="Pendiente",
+        summary="El audio fue detectado correctamente y está pendiente de transcripción y análisis.",
+        snippet="Archivo listo para procesar.",
+        transcript=(TranscriptLine(0, "Sistema", "Transcripción pendiente."),),
+        source_path=path,
+    )
 
 
 class AudioTimeline(QWidget):
@@ -314,7 +374,9 @@ class SentryWindow(QMainWindow):
         self.resize(1440, 860)
         self.setMinimumSize(1080, 680)
 
-        self.calls = {call.call_id: call for call in DEMO_CALLS}
+        self.call_records = list(DEMO_CALLS)
+        self.calls = {call.call_id: call for call in self.call_records}
+        self.detected_audio_files: tuple[Path, ...] = ()
         self.current_call = DEMO_CALLS[0]
         self.current_second = 0
         self.is_playing = False
@@ -356,6 +418,7 @@ class SentryWindow(QMainWindow):
         self.toast.hide()
 
     def _build_header(self) -> QWidget:
+        assets_path = Path(__file__).resolve().parents[1] / "assets"
         header = QFrame()
         header.setObjectName("topbar")
         header.setFixedHeight(64)
@@ -364,12 +427,22 @@ class SentryWindow(QMainWindow):
         layout.setSpacing(18)
 
         brand = QHBoxLayout()
-        brand.setSpacing(10)
-        mark = QLabel("S")
-        mark.setObjectName("brandMark")
-        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        mark.setFixedSize(34, 34)
-        brand.addWidget(mark)
+        brand.setSpacing(8)
+        logo = QLabel()
+        logo.setObjectName("brandLogo")
+        logo.setAccessibleName("Logo de Ecuaconexión")
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo.setFixedSize(42, 34)
+        logo_path = assets_path / "ecuaconexion-logo.png"
+        logo.setPixmap(
+            QPixmap(str(logo_path)).scaled(
+                40,
+                30,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        brand.addWidget(logo)
         title = QLabel("SENTRY")
         title.setObjectName("brandTitle")
         brand.addWidget(title)
@@ -377,43 +450,60 @@ class SentryWindow(QMainWindow):
 
         directory = QFrame()
         directory.setObjectName("directoryBar")
+        directory.setMinimumWidth(220)
+        directory.setMaximumWidth(290)
         directory_layout = QHBoxLayout(directory)
-        directory_layout.setContentsMargins(11, 5, 6, 5)
+        directory_layout.setContentsMargins(10, 5, 6, 5)
         directory_layout.setSpacing(7)
-        label = QLabel("Directorio")
-        label.setObjectName("mutedLabel")
-        directory_layout.addWidget(label)
-        self.directory_label = QLabel(r"C:\Grabaciones\Llamadas_Entrantes")
+        folder_icon = QLabel()
+        folder_icon.setAccessibleName("Directorio")
+        folder_icon.setPixmap(self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon).pixmap(16, 16))
+        directory_layout.addWidget(folder_icon)
+        self.directory_label = QLabel()
         self.directory_label.setObjectName("directoryPath")
-        self.directory_label.setMinimumWidth(120)
-        self.directory_label.setMaximumWidth(320)
+        self.directory_label.setAccessibleName("Directorio actual")
+        self.directory_label.setMinimumWidth(90)
+        self.directory_label.setMaximumWidth(155)
+        self._set_directory_display(r"C:\Grabaciones\Llamadas_Entrantes")
         directory_layout.addWidget(self.directory_label, 1)
         change = QPushButton("Cambiar")
         change.setObjectName("linkButton")
         change.setCursor(Qt.CursorShape.PointingHandCursor)
         change.clicked.connect(self._choose_directory)
         directory_layout.addWidget(change)
-        layout.addWidget(directory, 1)
+        layout.addWidget(directory)
+        layout.addStretch()
 
         nav = QHBoxLayout()
         nav.setSpacing(4)
-        for index, (key, text) in enumerate((
-            ("audit", "Auditoría  ·  2"),
-            ("reports", "Reportes"),
-            ("config", "Configuración"),
+        for index, (key, text, icon) in enumerate((
+            ("audit", "Auditoría  ·  2", None),
+            ("reports", "Reportes", None),
+            ("config", "Configuración", QIcon(str(assets_path / "settings.svg"))),
         )):
-            button = QPushButton(text)
+            button = QPushButton("" if icon else text)
             button.setObjectName("navButton")
             button.setCheckable(True)
             button.setChecked(index == 0)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setAccessibleName(text)
+            if icon:
+                button.setIcon(icon)
+                button.setIconSize(QSize(17, 17))
+                button.setFixedSize(38, 36)
+                button.setToolTip(text)
             button.clicked.connect(lambda _checked=False, k=key: self._switch_page(k))
             self.nav_buttons[key] = button
             nav.addWidget(button)
         layout.addLayout(nav)
 
-        self.scan_button = QPushButton("Escanear carpeta")
-        self.scan_button.setObjectName("secondaryButton")
+        self.scan_button = QPushButton()
+        self.scan_button.setObjectName("iconButton")
+        self.scan_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.scan_button.setIconSize(QSize(17, 17))
+        self.scan_button.setFixedSize(38, 36)
+        self.scan_button.setAccessibleName("Escanear carpeta")
+        self.scan_button.setToolTip("Escanear carpeta")
         self.scan_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.scan_button.clicked.connect(self._scan_directory)
         layout.addWidget(self.scan_button)
@@ -446,17 +536,20 @@ class SentryWindow(QMainWindow):
         layout.setContentsMargins(20, 10, 20, 10)
         layout.setSpacing(18)
 
-        for value, label, accent in (
-            ("22", "Archivos", False),
-            ("02", "Sensibles", True),
-            ("20", "Sin novedad", False),
+        for attribute, value, label, accent in (
+            ("files_metric", "22", "Archivos", False),
+            ("sensitive_metric", "02", "Sensibles", True),
+            ("normal_metric", "20", "Sin novedad", False),
         ):
             metric = QVBoxLayout()
             metric.setSpacing(0)
             number = QLabel(value)
             number.setObjectName("metricAccent" if accent else "metricValue")
+            setattr(self, attribute, number)
             caption = QLabel(label)
             caption.setObjectName("metricLabel")
+            if attribute == "normal_metric":
+                self.normal_metric_label = caption
             metric.addWidget(number)
             metric.addWidget(caption)
             layout.addLayout(metric)
@@ -510,17 +603,28 @@ class SentryWindow(QMainWindow):
         self.call_list.setSpacing(0)
         self.call_list.setContentsMargins(0, 0, 0, 0)
         self.call_list.currentItemChanged.connect(self._on_call_selected)
-        for call in DEMO_CALLS:
-            item = QListWidgetItem()
-            item.setData(Qt.ItemDataRole.UserRole, call.call_id)
-            card = CallCard(call)
-            item.setSizeHint(QSize(0, 100))
-            card.clicked.connect(self._select_call_by_id)
-            self.call_cards[call.call_id] = card
-            self.call_list.addItem(item)
-            self.call_list.setItemWidget(item, card)
+        self._populate_call_list()
         layout.addWidget(self.call_list, 1)
         return panel
+
+    def _populate_call_list(self) -> None:
+        self.call_list.blockSignals(True)
+        try:
+            self.call_list.clear()
+            self.call_cards.clear()
+            for call in self.call_records:
+                item = QListWidgetItem()
+                item.setData(Qt.ItemDataRole.UserRole, call.call_id)
+                card = CallCard(call)
+                item.setSizeHint(QSize(0, 100))
+                card.clicked.connect(self._select_call_by_id)
+                self.call_cards[call.call_id] = card
+                self.call_list.addItem(item)
+                self.call_list.setItemWidget(item, card)
+        finally:
+            self.call_list.blockSignals(False)
+        count = len(self.call_records)
+        self.call_count.setText(f"{count} {'llamada' if count == 1 else 'llamadas'}")
 
     def _build_detail_panel(self) -> QWidget:
         scroll = QScrollArea()
@@ -1147,10 +1251,14 @@ class SentryWindow(QMainWindow):
         status = self.status_filter.currentData()
         visible = 0
         first_visible: QListWidgetItem | None = None
-        for row, call in enumerate(DEMO_CALLS):
+        for row, call in enumerate(self.call_records):
             searchable = f"{call.filename} {call.agent} {call.customer} {call.keyword} {call.snippet}".casefold()
             matches_query = not query or query in searchable
-            matches_status = status == "all" or (status == "sensitive" and call.sensitive) or (status == "normal" and not call.sensitive)
+            matches_status = (
+                status == "all"
+                or (status == "sensitive" and call.sensitive)
+                or (status == "normal" and not call.sensitive and call.risk != "Pendiente")
+            )
             item = self.call_list.item(row)
             item.setHidden(not (matches_query and matches_status))
             if not item.isHidden():
@@ -1182,7 +1290,8 @@ class SentryWindow(QMainWindow):
         self.current_call = call
         self.current_second = 0
         self.filename_label.setText(call.filename)
-        self.risk_badge.setText("Término sensible" if call.sensitive else "Sin alerta crítica")
+        badge_text = "Término sensible" if call.sensitive else "Sin alerta crítica"
+        self.risk_badge.setText("Pendiente de análisis" if call.risk == "Pendiente" else badge_text)
         self.risk_badge.setProperty("sensitive", call.sensitive)
         self.risk_badge.style().unpolish(self.risk_badge)
         self.risk_badge.style().polish(self.risk_badge)
@@ -1295,8 +1404,12 @@ class SentryWindow(QMainWindow):
             return
         normalized = selected.replace("/", "\\")
         self.config_directory.setText(normalized)
-        self.directory_label.setText(normalized)
+        self._set_directory_display(normalized)
         self._show_toast("Directorio actualizado")
+
+    def _set_directory_display(self, directory: str) -> None:
+        self.directory_label.setText(Path(directory).name or directory)
+        self.directory_label.setToolTip(directory)
 
     def _save_settings(self) -> None:
         directory = self.config_directory.text().strip()
@@ -1309,19 +1422,51 @@ class SentryWindow(QMainWindow):
             self._show_toast("Agrega al menos un término sensible")
             self.keywords_input.setFocus()
             return
-        self.directory_label.setText(directory)
+        self._set_directory_display(directory)
         api_count = sum(bool(field.text().strip()) for field in (self.transcription_api_key, self.analysis_api_key))
         self._show_toast(f"Ajustes aplicados a esta sesión · {api_count}/2 claves configuradas")
 
     def _scan_directory(self) -> None:
-        self.scan_button.setEnabled(False)
-        self.scan_button.setText("Escaneando…")
-        QTimer.singleShot(900, self._finish_scan)
+        directory_text = self.config_directory.text().strip()
+        if not directory_text:
+            self._show_toast("Selecciona un directorio antes de escanear")
+            self.config_directory.setFocus()
+            return
 
-    def _finish_scan(self) -> None:
+        self.scan_button.setEnabled(False)
+        self.scan_button.setToolTip("Escaneando…")
+        directory = Path(directory_text).expanduser()
+        # ponytail: el escaneo síncrono basta para esta etapa; mover a un hilo si un NAS grande bloquea la interfaz.
+        QTimer.singleShot(0, lambda: self._finish_scan(directory))
+
+    def _finish_scan(self, directory: Path) -> None:
+        try:
+            self.detected_audio_files = scan_audio_files(directory)
+        except FileNotFoundError:
+            message = "La carpeta seleccionada no existe"
+        except NotADirectoryError:
+            message = "La ruta seleccionada no es una carpeta"
+        except OSError:
+            message = "No se pudo leer la carpeta seleccionada"
+        else:
+            count = len(self.detected_audio_files)
+            self.call_records = [call_record_from_audio(path, index) for index, path in enumerate(self.detected_audio_files, 1)]
+            self.calls = {call.call_id: call for call in self.call_records}
+            self._populate_call_list()
+            self.search_input.clear()
+            self.status_filter.setCurrentIndex(0)
+            self.files_metric.setText(str(count))
+            self.sensitive_metric.setText("0")
+            self.normal_metric.setText(str(count))
+            self.normal_metric_label.setText("Pendientes")
+            if self.call_records:
+                self.call_list.setCurrentRow(0)
+            self._filter_calls()
+            noun = "audio encontrado" if count == 1 else "audios encontrados"
+            message = f"Escaneo completado · {count} {noun}"
         self.scan_button.setEnabled(True)
-        self.scan_button.setText("Escanear carpeta")
-        self._show_toast("Escaneo de demostración completado · sin archivos nuevos")
+        self.scan_button.setToolTip("Escanear carpeta")
+        self._show_toast(message)
 
     def _show_toast(self, message: str) -> None:
         self.toast.setText(message)
@@ -1349,13 +1494,13 @@ class SentryWindow(QMainWindow):
         super().resizeEvent(event)
         compact = self.width() < 1240
         if hasattr(self, "directory_label"):
-            self.directory_label.setMaximumWidth(170 if compact else 320)
-            self.scan_button.setText("Escanear" if compact else "Escanear carpeta")
+            self.directory_label.setMaximumWidth(120 if compact else 155)
             self.export_button.setText("Excel" if compact else "Exportar Excel")
         self._position_toast()
 
     @staticmethod
     def _stylesheet() -> str:
+        combo_arrow = (Path(__file__).resolve().parents[1] / "assets" / "chevron-down.svg").as_posix()
         return f"""
             * {{
                 font-family: "Inter", "Segoe UI", sans-serif;
@@ -1369,13 +1514,6 @@ class SentryWindow(QMainWindow):
             QFrame#topbar {{
                 background: {PALETTE['panel']};
                 border-bottom: 1px solid {PALETTE['border']};
-            }}
-            QLabel#brandMark {{
-                background: {PALETTE['green_accessible']};
-                color: white;
-                border-radius: 8px;
-                font-size: 16px;
-                font-weight: 700;
             }}
             QLabel#brandTitle {{ color: {PALETTE['text']}; font-size: 15px; font-weight: 650; letter-spacing: 0.5px; }}
             QFrame#directoryBar {{
@@ -1400,12 +1538,13 @@ class SentryWindow(QMainWindow):
                 background: {PALETTE['green_soft']};
                 border: 1px solid #cfe7d3;
             }}
-            QPushButton#secondaryButton {{
+            QPushButton#secondaryButton, QPushButton#iconButton {{
                 background: {PALETTE['panel']};
                 color: {PALETTE['text_soft']};
                 border: 1px solid {PALETTE['border_strong']};
             }}
-            QPushButton#secondaryButton:hover {{ color: {PALETTE['text']}; background: {PALETTE['surface']}; border-color: #afb6af; }}
+            QPushButton#iconButton {{ padding: 0; }}
+            QPushButton#secondaryButton:hover, QPushButton#iconButton:hover {{ color: {PALETTE['text']}; background: {PALETTE['surface']}; border-color: #afb6af; }}
             QPushButton#primaryButton {{
                 background: {PALETTE['green_accessible']};
                 color: white;
@@ -1449,6 +1588,11 @@ class SentryWindow(QMainWindow):
                 border-left: 1px solid {PALETTE['border']};
                 border-top-right-radius: 6px;
                 border-bottom-right-radius: 6px;
+            }}
+            QComboBox::down-arrow {{
+                image: url("{combo_arrow}");
+                width: 12px;
+                height: 12px;
             }}
             QComboBox QAbstractItemView {{
                 background: {PALETTE['panel']};

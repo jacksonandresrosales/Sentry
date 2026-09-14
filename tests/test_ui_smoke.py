@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import os
 import unittest
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QLineEdit, QPushButton
+from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton
 
-from app.ui.views.main_window import SentryWindow, install_ui_font
+from app.ui.views.main_window import SentryWindow, install_ui_font, scan_audio_files
 
 
 class SentryWindowSmokeTest(unittest.TestCase):
@@ -39,6 +40,17 @@ class SentryWindowSmokeTest(unittest.TestCase):
         self.assertIn("00:38", self.window.time_display.text())
 
     def test_api_keys_are_masked_and_escalation_action_is_removed(self) -> None:
+        logo = self.window.findChild(QLabel, "brandLogo")
+        self.assertIsNotNone(logo)
+        self.assertFalse(logo.pixmap().isNull())
+        self.assertEqual(self.window.nav_buttons["config"].text(), "")
+        self.assertEqual(self.window.nav_buttons["config"].accessibleName(), "Configuración")
+        self.assertEqual(self.window.scan_button.text(), "")
+        self.assertEqual(self.window.scan_button.accessibleName(), "Escanear carpeta")
+        self.assertEqual(self.window.directory_label.text(), "Llamadas_Entrantes")
+        self.assertEqual(self.window.directory_label.toolTip(), r"C:\Grabaciones\Llamadas_Entrantes")
+        self.assertIn("QComboBox::down-arrow", self.window.styleSheet())
+
         self.assertEqual(self.window.transcription_api_key.echoMode(), QLineEdit.EchoMode.Password)
         self.window.transcription_key_toggle.click()
         self.assertEqual(self.window.transcription_api_key.echoMode(), QLineEdit.EchoMode.Normal)
@@ -68,6 +80,29 @@ class SentryWindowSmokeTest(unittest.TestCase):
         self.assertEqual(self.window._extract_models("deepgram", "transcription", deepgram), ["nova-3-general"])
         self.assertEqual(self.window._extract_models("gemini", "analysis", gemini), ["gemini-flash"])
         self.assertEqual(self.window._extract_models("openai", "transcription", openai), ["gpt-audio-transcribe"])
+
+    def test_directory_scan_finds_supported_audio_recursively(self) -> None:
+        root = Path.cwd() / ".tmp" / "scan-audio-test"
+        nested = root / "septiembre"
+        files = (root / "llamada.wav", root / "ignorar.txt", nested / "LLAMADA.MP3")
+        nested.mkdir(parents=True, exist_ok=True)
+        try:
+            for path in files:
+                path.touch()
+
+            detected = scan_audio_files(root)
+            self.window._finish_scan(root)
+            displayed_names = [self.window.call_records[index].filename for index in range(len(self.window.call_records))]
+        finally:
+            for path in files:
+                path.unlink(missing_ok=True)
+            nested.rmdir()
+            root.rmdir()
+
+        self.assertEqual([path.suffix.casefold() for path in detected], [".wav", ".mp3"])
+        self.assertEqual(displayed_names, ["llamada.wav", "LLAMADA.MP3"])
+        self.assertEqual(self.window.call_list.count(), 2)
+        self.assertEqual(self.window.files_metric.text(), "2")
 
 
 if __name__ == "__main__":

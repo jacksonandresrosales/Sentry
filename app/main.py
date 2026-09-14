@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 
 def main() -> int:
     try:
+        from PySide6.QtGui import QIcon
         from PySide6.QtWidgets import QApplication
         from app.ui.views.main_window import SentryWindow, install_ui_font
     except ModuleNotFoundError as exc:
@@ -17,6 +19,8 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Sentry")
     app.setOrganizationName("Ecuaconexión")
+    icon_path = Path(__file__).resolve().parent / "ui" / "assets" / "sentry-app-icon.png"
+    app.setWindowIcon(QIcon(str(icon_path)))
     app.setStyle("Fusion")
     install_ui_font(app)
 
