@@ -9,6 +9,8 @@ env/
 build/
 dist/
 *.egg-info/
+.tmp/
+.impeccable/review/
 
 # Secretos y credenciales
 .env

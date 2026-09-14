@@ -1,0 +1,131 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-14T13:54:03.5614541-05:00",
+  "title": "Design System: Sentry",
+  "extensions": {
+    "colorMeta": {
+      "signal-deep": { "role": "primary", "displayName": "Verde de señal", "canonical": "#27953c" },
+      "action-accessible": { "role": "primary", "displayName": "Verde accesible", "canonical": "#1f7830" },
+      "confirmation": { "role": "secondary", "displayName": "Verde corporativo", "canonical": "#40b73c" },
+      "evidence": { "role": "tertiary", "displayName": "Lima corporativo", "canonical": "#7eca29" },
+      "charcoal": { "role": "neutral", "displayName": "Carbón", "canonical": "#4f4c4c" },
+      "gray": { "role": "neutral", "displayName": "Gris corporativo", "canonical": "#656263" },
+      "gray-light": { "role": "neutral", "displayName": "Gris claro corporativo", "canonical": "#7a7879" },
+      "canvas": { "role": "neutral", "displayName": "Lienzo", "canonical": "#f5f6f5" },
+      "panel": { "role": "neutral", "displayName": "Blanco de panel", "canonical": "#ffffff" },
+      "green-soft": { "role": "neutral", "displayName": "Verde suave", "canonical": "#eef7ef" },
+      "border": { "role": "neutral", "displayName": "Borde sutil", "canonical": "#dfe3df" }
+    },
+    "typographyMeta": {
+      "headline": { "displayName": "Titular", "purpose": "Títulos de vistas secundarias." },
+      "body": { "displayName": "Lectura", "purpose": "Resumen, transcripción y controles." },
+      "data": { "displayName": "Dato compacto", "purpose": "Tiempos, rutas y valores con la misma familia Inter." }
+    },
+    "shadows": [],
+    "motion": [
+      { "name": "feedback-brief", "value": "900ms", "purpose": "Escaneo breve antes de devolver el control." },
+      { "name": "toast-readable", "value": "2600ms", "purpose": "Tiempo de lectura de confirmaciones." }
+    ],
+    "breakpoints": [
+      { "name": "desktop-compact", "value": "1080px" },
+      { "name": "desktop-wide", "value": "1240px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Única acción dominante dentro de un contexto.",
+      "html": "<button class=\"ds-btn-primary\">Guardar ajustes</button>",
+      "css": ".ds-btn-primary { background:#1f7830; color:#fff; min-height:36px; padding:0 13px; border:1px solid #1f7830; border-radius:7px; font:600 13px Inter,sans-serif; } .ds-btn-primary:hover { background:#238537; } .ds-btn-primary:focus-visible { outline:2px solid #27953c; outline-offset:2px; }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Acción subordinada y visualmente tranquila.",
+      "html": "<button class=\"ds-btn-secondary\">Marcar como revisada</button>",
+      "css": ".ds-btn-secondary { background:#fff; color:#4f4c4c; min-height:36px; padding:0 13px; border:1px solid #c8cdc8; border-radius:7px; font:550 13px Inter,sans-serif; } .ds-btn-secondary:hover { background:#f5f6f5; } .ds-btn-secondary:focus-visible { outline:2px solid #27953c; outline-offset:2px; }"
+    },
+    {
+      "name": "Active Navigation",
+      "kind": "nav",
+      "refersTo": "panel",
+      "description": "Indica la vista actual sin competir con la tarea.",
+      "html": "<button class=\"ds-nav-active\" aria-current=\"page\">Auditoría · 2</button>",
+      "css": ".ds-nav-active { background:#eef7ef; color:#1f7830; min-height:36px; padding:0 13px; border:1px solid #dfe3df; border-radius:7px; font:600 13px Inter,sans-serif; }"
+    },
+    {
+      "name": "Search Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Campo claro para filtrar la cola operativa.",
+      "html": "<input class=\"ds-input\" aria-label=\"Buscar llamadas\" placeholder=\"Buscar por archivo, agente o cliente\">",
+      "css": ".ds-input { background:#fff; color:#202220; min-height:36px; padding:0 11px; border:1px solid #c8cdc8; border-radius:7px; font:400 13px Inter,sans-serif; } .ds-input::placeholder { color:#656263; } .ds-input:focus { outline:2px solid #27953c; outline-offset:0; }"
+    },
+    {
+      "name": "Sensitive Chip",
+      "kind": "chip",
+      "refersTo": "panel",
+      "description": "Etiqueta textual de coincidencia sensible.",
+      "html": "<span class=\"ds-chip\">Demanda</span>",
+      "css": ".ds-chip { display:inline-block; background:#eef7ef; color:#1f7830; padding:2px 6px; border:1px solid #c8ddca; border-radius:5px; font:600 10px Inter,sans-serif; }"
+    },
+    {
+      "name": "Secret Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Credencial enmascarada con controles para mostrarla y validarla contra el proveedor seleccionado.",
+      "html": "<label>Clave API <span><input class=\"ds-input\" type=\"password\"><button class=\"ds-btn-secondary\" type=\"button\">Mostrar</button><button class=\"ds-btn-primary\" type=\"button\">Validar</button></span><small>Sin validar</small></label>",
+      "css": ".ds-input { background:#fff; color:#202220; min-height:36px; padding:0 11px; border:1px solid #c8cdc8; border-radius:7px; font:400 13px Inter,sans-serif; }"
+    },
+    {
+      "name": "Queue Row",
+      "kind": "list-item",
+      "refersTo": "panel",
+      "description": "Fila continua con agente, contexto, cliente y duración.",
+      "html": "<article class=\"ds-queue-row\"><strong>Juan Pérez</strong><p>…voy a presentar una demanda formal…</p></article>",
+      "css": ".ds-queue-row { background:#fff; color:#4f4c4c; min-height:100px; padding:11px 14px; border:0; border-bottom:1px solid #dfe3df; border-radius:0; font:400 13px Inter,sans-serif; } .ds-queue-row[aria-selected=true] { background:#eef7ef; border-left:1px solid #27953c; }"
+    },
+    {
+      "name": "Evidence Line",
+      "kind": "custom",
+      "refersTo": "panel",
+      "description": "Fragmento diarizado conectado con el momento sensible.",
+      "html": "<div class=\"ds-evidence\"><time>00:38</time><strong>Cliente</strong><span>Voy a presentar una demanda formal.</span></div>",
+      "css": ".ds-evidence { display:grid; grid-template-columns:42px 54px 1fr; gap:12px; background:#eef7ef; color:#202220; padding:10px 12px; border-left:2px solid #27953c; font:400 13px Inter,sans-serif; } .ds-evidence time { color:#1f7830; font-weight:600; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "La Mesa de Revisión Clara",
+    "overview": "Sentry se siente como una herramienta de escritorio serena y precisa. El blanco es el campo principal de trabajo; el gris organiza la información y el verde indica selección, evidencia o acción. La interfaz evita decorar la auditoría y deja que la llamada, el momento sensible y la transcripción construyan la jerarquía.",
+    "keyCharacteristics": [
+      "Superficies blancas y gris muy claro.",
+      "Una sola familia tipográfica, Inter, con pesos moderados.",
+      "Cola plana de llamadas, sin tarjetas flotantes.",
+      "Bordes finos y ausencia de sombras o gradientes.",
+      "Paleta corporativa usada como señal, no como fondo dominante."
+    ],
+    "rules": [
+      { "name": "The White Field Rule", "body": "El blanco ocupa la mayor parte de cada vista; una superficie solo cambia de tono cuando comunica agrupación o estado.", "section": "colors" },
+      { "name": "The Logo Palette Rule", "body": "Los colores corporativos son acentos funcionales hasta incorporar el logo; no se usan como grandes fondos decorativos.", "section": "colors" },
+      { "name": "The Accessible Green Rule", "body": "El texto y los indicadores funcionales usan verdes oscuros; el lima solo aparece en elementos pequeños acompañados de una etiqueta textual.", "section": "colors" },
+      { "name": "The One Family Rule", "body": "Toda la aplicación usa Inter; jerarquía y datos se distinguen por tamaño, peso, color y espaciado.", "section": "typography" },
+      { "name": "The Sentence Case Rule", "body": "Navegación, secciones y estados usan frase normal; las mayúsculas quedan limitadas a la marca SENTRY.", "section": "typography" },
+      { "name": "The Flat Separation Rule", "body": "Una región se distingue con espacio, un borde o un cambio tonal leve; nunca necesita los tres a la vez.", "section": "elevation" }
+    ],
+    "dos": [
+      "Do permitir que el blanco domine cada vista.",
+      "Do mantener una única acción primaria verde por contexto.",
+      "Do conectar una alerta con su marca temporal y su línea de transcripción.",
+      "Do usar separadores finos y espacio antes de añadir otro contenedor."
+    ],
+    "donts": [
+      "Don't convertir la paleta del logo en grandes bloques saturados.",
+      "Don't usar varios verdes intensos simultáneamente.",
+      "Don't añadir sombras, gradientes o tarjetas para cada fragmento de información.",
+      "Don't abusar de mayúsculas, tracking o pesos tipográficos altos."
+    ]
+  }
+}

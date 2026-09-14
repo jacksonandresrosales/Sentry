@@ -161,14 +161,16 @@ Para evitar falsas alarmas, el sistema ejecuta un proceso de validación en 2 fa
      * **Reproductor de audio integrado** con el botón estrella:  
        🎯 **`[Ir al segundo 00:38 ("demanda")]`** (posiciona el cursor de reproducción exactamente en el segundo donde se pronunció el término sensible).
      * **Transcripción diarizada:** Conversación organizada por interlocutor con la palabra sensible resaltada en rojo.
-     * Botones de acción: *Marcar como Auditada*, *Escalar a Supervisor*, *Exportar Excel*.
+     * Botones de acción: *Marcar como Auditada* y *Exportar Excel*.
 2. **Pantalla 2: Reportes y Métricas:**
    * Conteo acumulado mensual de llamadas analizadas y palabras sensibles detectadas.
    * Botón para exportar reporte consolidado a Excel (`.xlsx`).
 3. **Pantalla 3: Configuración:**
    * Selección y persistencia del directorio de grabaciones.
    * Lista editable de palabras sensibles a vigilar.
-   * Claves de API de Deepgram y Gemini (almacenadas localmente de forma segura).
+   * Proveedor, modelo y claves editables para los servicios de transcripción y análisis.
+   * Validación de la credencial únicamente contra el proveedor seleccionado y carga automática de los modelos disponibles.
+   * En el prototipo las claves permanecen en memoria durante la sesión; la persistencia se habilitará únicamente mediante almacenamiento local protegido.
 
 ---
 
