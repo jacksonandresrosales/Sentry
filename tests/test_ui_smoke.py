@@ -153,6 +153,46 @@ class SentryWindowSmokeTest(unittest.TestCase):
             self.assertTrue(badge.findChild(QLabel, "classificationText").text())
             self.assertFalse(badge.findChild(QLabel, "classificationIcon").pixmap().isNull())
 
+    def test_export_menu_offers_each_requested_scope(self) -> None:
+        self.assertEqual(
+            [action.text() for action in self.window.export_button.menu().actions()],
+            [
+                "Solo denuncias automáticas sin verificar",
+                "Solo denuncias verificadas",
+                "Todas las denuncias",
+                "Toda la base",
+            ],
+        )
+
+    def test_sensitive_call_can_be_verified_and_unverified_persistently(self) -> None:
+        path = Path(self.temp.name) / "q-000-0990000001-20260915-103000-1.wav"
+        path.touch()
+        detected = call_record_from_audio(path, 1)
+        self.window.database.register_calls([detected])
+        with self.window.database.connect() as connection:
+            connection.execute(
+                "UPDATE calls SET status='COMPLETADO',category='ALERTA',has_sensitive_keyword=1 "
+                "WHERE file_path=?",
+                (str(path.resolve()),),
+            )
+        call = call_record_from_row(self.window.database.call_rows([path])[0])
+        self.window.call_records = [call]
+        self.window.calls = {call.call_id: call}
+        self.window._populate_call_list()
+        self.window.call_list.setCurrentRow(0)
+
+        self.window._mark_reviewed()
+        self.assertTrue(self.window.current_call.reviewed)
+        self.assertEqual(self.window.reviewed_button.text(), "Quitar verificación")
+        self.assertEqual(self.window.database.call_rows([path])[0]["reviewed"], 1)
+        badge = self.window.call_cards[call.call_id].findChild(QLabel, "classificationText")
+        self.assertTrue(badge.text().startswith("Denuncia verificada"))
+
+        self.window._mark_reviewed()
+        self.assertFalse(self.window.current_call.reviewed)
+        self.assertEqual(self.window.reviewed_button.text(), "Marcar como verificada")
+        self.assertEqual(self.window.database.call_rows([path])[0]["reviewed"], 0)
+
     def test_api_keys_are_masked_and_escalation_action_is_removed(self) -> None:
         self.assertFalse(self.window.windowIcon().isNull())
         self.assertNotIn("ASESOR", [label.text() for label in self.window.findChildren(QLabel)])

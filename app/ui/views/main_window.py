@@ -6,7 +6,7 @@ import os
 import re
 import wave
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 import sqlite3
@@ -15,6 +15,7 @@ from app.database import Database, DEFAULT_DATABASE
 from app.secret_store import SecretStoreError, protect, unprotect
 from app.services.audio_analysis import analyze_file, assign_roles
 from app.services.base_conversion import BaseAudioIndex, load_hoja1_audio_index, normalize_phone_number
+from app.services.report_export import EXPORT_MODE_LABELS, export_audit_excel
 from app.services.winscp_client import (
     WinSCPError, download_remote_audio, scan_host_fingerprint, search_remote_audio, test_connection,
 )
@@ -200,6 +201,7 @@ class CallRecord:
     source_path: Path | None = None
     category_code: str = ""
     tags: tuple[str, ...] = ()
+    reviewed: bool = False
 
 
 def format_time(seconds: int) -> str:
@@ -347,6 +349,7 @@ def call_record_from_row(row: dict) -> CallRecord:
         transcript=tuple(segments) or (TranscriptLine(0, "Sistema", "Transcripción pendiente."),), source_path=path,
         category_code=category,
         tags=tuple(dict.fromkeys(str(hit["keyword"]) for hit in hits if hit.get("keyword"))),
+        reviewed=bool(row.get("reviewed")),
     )
 
 
@@ -420,6 +423,30 @@ class LocalScanWorker(QThread):
                 "records": records,
                 "source": self.source,
             })
+
+
+class ReportExportWorker(QThread):
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, output: Path, base_path: Path, automatic_phones: set[str],
+                 verified_phones: set[str], mode: str, parent=None):
+        super().__init__(parent)
+        self.output = Path(output)
+        self.base_path = Path(base_path)
+        self.automatic_phones = set(automatic_phones)
+        self.verified_phones = set(verified_phones)
+        self.mode = mode
+
+    def run(self):
+        try:
+            result = export_audit_excel(
+                self.output, self.base_path, self.automatic_phones, self.verified_phones, self.mode,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
 
 
 class WinSCPWorker(QThread):
@@ -729,11 +756,19 @@ class CallCard(QFrame):
             icon.setObjectName("classificationIcon")
             icon.setPixmap(category_pixmap(icon_name))
             badge_layout.addWidget(icon)
-        badge_text = QLabel(tag_text or classification_labels.get(classification, call.keyword.capitalize()))
+        if classification == "ALERTA":
+            complaint_label = "Denuncia verificada" if call.reviewed else "Denuncia automática"
+            badge_label = f"{complaint_label} · {tag_text}" if tag_text else complaint_label
+        else:
+            badge_label = tag_text or classification_labels.get(classification, call.keyword.capitalize())
+        badge_text = QLabel(badge_label)
         badge_text.setObjectName("classificationText")
         badge_layout.addWidget(badge_text)
-        if call.tags:
-            badge.setToolTip("Etiquetas encontradas: " + ", ".join(call.tags))
+        if call.reviewed:
+            evidence = ", ".join(call.tags) if call.tags else call.keyword
+            badge.setToolTip("Denuncia verificada manualmente" + (f" · Evidencia: {evidence}" if evidence else ""))
+        elif call.tags:
+            badge.setToolTip("Denuncia automática · Etiquetas encontradas: " + ", ".join(call.tags))
         else:
             badge.setToolTip("Clasificación: " + classification_labels.get(classification, call.category))
         top.addWidget(badge)
@@ -807,6 +842,7 @@ class SentryWindow(QMainWindow):
         self.winscp_worker: WinSCPWorker | None = None
         self.remote_search_worker: RemoteSearchWorker | None = None
         self.issabel_match_worker: IssabelMatchWorker | None = None
+        self.report_export_worker: ReportExportWorker | None = None
         self.close_after_analysis = False
 
         self.audio_output = QAudioOutput(self)
@@ -1045,7 +1081,17 @@ class SentryWindow(QMainWindow):
 
         self.export_button = QPushButton("Exportar Excel")
         self.export_button.setObjectName("secondaryButton")
-        self.export_button.clicked.connect(lambda: self._show_toast("La exportación se conectará en la siguiente etapa"))
+        self.export_button.setToolTip("Exportar denuncias o la base completa")
+        export_menu = QMenu(self.export_button)
+        for label, mode in (
+            ("Solo denuncias automáticas sin verificar", "automatic"),
+            ("Solo denuncias verificadas", "verified"),
+            ("Todas las denuncias", "complaints"),
+            ("Toda la base", "all"),
+        ):
+            action = export_menu.addAction(label)
+            action.triggered.connect(lambda _checked=False, value=mode: self._export_excel(value))
+        self.export_button.setMenu(export_menu)
         layout.addWidget(self.export_button)
         return bar
 
@@ -1402,8 +1448,9 @@ class SentryWindow(QMainWindow):
 
     def _build_detail_actions(self) -> QHBoxLayout:
         actions = QHBoxLayout()
-        self.reviewed_button = QPushButton("Marcar como revisada")
+        self.reviewed_button = QPushButton("Marcar como verificada")
         self.reviewed_button.setObjectName("secondaryButton")
+        self.reviewed_button.setToolTip("Confirma manualmente una denuncia detectada por términos sensibles")
         self.reviewed_button.clicked.connect(self._mark_reviewed)
         self.original_button = QPushButton("Abrir audio original")
         self.original_button.setObjectName("linkButton")
@@ -2399,7 +2446,9 @@ class SentryWindow(QMainWindow):
         )
         self.play_button.setEnabled(not locked and has_audio)
         self.original_button.setEnabled(not locked and has_audio)
-        self.reviewed_button.setEnabled(not locked and self.current_call is not None)
+        self.reviewed_button.setEnabled(
+            not locked and self.current_call is not None and self.current_call.sensitive
+        )
         self.jump_button.setEnabled(
             not locked and self.current_call is not None and self.current_call.hit_second is not None
         )
@@ -2420,7 +2469,10 @@ class SentryWindow(QMainWindow):
         has_audio = source is not None and source.is_file()
         self.play_button.setEnabled(has_audio)
         self.original_button.setEnabled(has_audio)
-        self.reviewed_button.setEnabled(True)
+        self.reviewed_button.setEnabled(call.sensitive)
+        self.reviewed_button.setText(
+            "Quitar verificación" if call.reviewed else "Marcar como verificada"
+        )
         self.media_player.setSource(QUrl.fromLocalFile(str(source)) if has_audio else QUrl())
         self.filename_label.setText(call.filename)
         badge_text = ("Etiquetas: " + ", ".join(call.tags)) if call.tags else (
@@ -3055,6 +3107,9 @@ class SentryWindow(QMainWindow):
 
     def _analysis_row_ready(self, row) -> None:
         updated = call_record_from_row(row)
+        self._replace_call_record(updated)
+
+    def _replace_call_record(self, updated: CallRecord) -> None:
         position = next(
             (index for index, call in enumerate(self.call_records) if call.source_path == updated.source_path),
             None,
@@ -3112,12 +3167,91 @@ class SentryWindow(QMainWindow):
         if self.current_call is None or self.current_call.source_path is None:
             self._show_toast("Selecciona una llamada antes de marcarla")
             return
+        if not self.current_call.sensitive:
+            self._show_toast("Solo las denuncias automáticas pueden verificarse")
+            return
+        reviewed = not self.current_call.reviewed
         try:
-            self.database.set_reviewed(self.current_call.source_path)
+            self.database.set_reviewed(self.current_call.source_path, reviewed)
         except sqlite3.Error as exc:
             self._show_toast(f"No se pudo guardar la revisión: {exc}")
             return
-        self._show_toast("Llamada marcada como revisada y guardada")
+        self._replace_call_record(replace(self.current_call, reviewed=reviewed))
+        self._show_toast(
+            "Denuncia marcada como verificada" if reviewed else "Se quitó la verificación de la denuncia"
+        )
+
+    def _export_phone_groups(self) -> tuple[set[str], set[str]]:
+        automatic: set[str] = set()
+        verified: set[str] = set()
+        for call in self.call_records:
+            if not call.sensitive or call.source_path is None:
+                continue
+            phone = audio_phone_from_filename(call.source_path)
+            if not phone:
+                continue
+            automatic.add(phone)
+            if call.reviewed:
+                verified.add(phone)
+        return automatic, verified
+
+    def _export_excel(self, mode: str) -> None:
+        if self.report_export_worker is not None:
+            self._show_toast("Ya hay una exportación en curso")
+            return
+        if mode not in EXPORT_MODE_LABELS:
+            self._show_toast("Opción de exportación desconocida")
+            return
+        if self.active_base_path is None or not self.active_base_path.is_file():
+            self._show_toast("Selecciona en Bases el Excel transformado que deseas exportar")
+            return
+        suffixes = {
+            "automatic": "denuncias_automaticas",
+            "verified": "denuncias_verificadas",
+            "complaints": "todas_las_denuncias",
+            "all": "base_completa",
+        }
+        default = self.active_base_path.with_name(
+            f"{self.active_base_path.stem}_{suffixes[mode]}.xlsx"
+        )
+        filename, _filter = QFileDialog.getSaveFileName(
+            self,
+            f"Exportar {EXPORT_MODE_LABELS[mode]}",
+            str(default),
+            "Libro de Excel (*.xlsx)",
+        )
+        if not filename:
+            return
+        output = Path(filename)
+        if output.suffix.casefold() != ".xlsx":
+            output = output.with_suffix(".xlsx")
+        automatic, verified = self._export_phone_groups()
+        self.export_button.setEnabled(False)
+        self.export_button.setText("Exportando…")
+        self.report_export_worker = ReportExportWorker(
+            output, self.active_base_path, automatic, verified, mode, self,
+        )
+        self.report_export_worker.succeeded.connect(self._export_succeeded)
+        self.report_export_worker.failed.connect(self._export_failed)
+        self.report_export_worker.start()
+
+    def _finish_export(self) -> None:
+        worker = self.report_export_worker
+        self.report_export_worker = None
+        self.export_button.setEnabled(True)
+        self.export_button.setText("Excel" if self.width() < 1240 else "Exportar Excel")
+        if worker is not None:
+            worker.deleteLater()
+
+    def _export_succeeded(self, result) -> None:
+        self._finish_export()
+        self._show_toast(
+            f"Excel guardado · {result.row_count:,} registros · {result.output.name}"
+        )
+
+    def _export_failed(self, message: str) -> None:
+        self._finish_export()
+        self._show_toast(f"No se pudo exportar: {message}")
 
     def _show_toast(self, message: str) -> None:
         self.toast.setText(message)
@@ -3167,6 +3301,10 @@ class SentryWindow(QMainWindow):
             return
         if self.issabel_match_worker is not None:
             self._show_toast("Espera a que termine el emparejamiento y la descarga desde Issabel")
+            event.ignore()
+            return
+        if self.report_export_worker is not None:
+            self._show_toast("Espera a que termine la exportación de Excel antes de cerrar Sentry")
             event.ignore()
             return
         try:

@@ -69,6 +69,8 @@ Se guarda cada llamada apenas termina; al reiniciar se recuperan lista, transcri
 
 Para reducir consumo, Sentry calcula una huella SHA-256 y conserva cachés separadas de transcripción y análisis: repetir el botón con el mismo audio, modelos y términos no vuelve a llamar a las APIs. Si no hay términos sensibles, la clasificación normal se hace localmente y no consume la API contextual; esta solo recibe fragmentos cercanos a posibles coincidencias. Un audio sin conversación o con un único hablante detectado se clasifica como buzón.
 
+Las alertas detectadas por términos sensibles aparecen como denuncias automáticas. El botón **Marcar como verificada** confirma o revierte esa clasificación manual sin perderla al cerrar la aplicación. Desde **Exportar Excel** se pueden generar archivos de denuncias automáticas pendientes, denuncias verificadas, todas las denuncias o toda la base activa. La salida contiene únicamente número de celular, nombre del cliente, ID y estado; las denuncias se resaltan en rojo y los demás registros en verde.
+
 En **Configuración** se cambian proveedor, modelo y claves. **Validar** comprueba la credencial y carga modelos. Al guardar ajustes, al validar o al cerrar Sentry, las claves se cifran mediante la protección DPAPI de Windows y se almacenan en SQLite; no quedan en texto plano y solo el mismo usuario de Windows puede recuperarlas. También pueden suministrarse mediante `DEEPGRAM_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY` u `OPENAI_API_KEY`.
 
 En **Configuración → Apariencia** se puede alternar inmediatamente entre el tema claro y **Oscuro · Zinc / Noche**. La selección queda guardada para el siguiente inicio y Sentry mantiene una paleta propia, independiente del modo de Windows.
