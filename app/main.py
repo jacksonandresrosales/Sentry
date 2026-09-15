@@ -20,8 +20,9 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Sentry")
     app.setOrganizationName("Ecuaconexión")
-    icon_path = Path(__file__).resolve().parent / "ui" / "assets" / "sentry-app-icon.png"
-    app.setWindowIcon(QIcon(str(icon_path)))
+    icon_path = Path(__file__).resolve().parent / "ui" / "assets" / "sentry-app-icon.ico"
+    window_icon = QIcon(str(icon_path))
+    app.setWindowIcon(window_icon)
     app.setStyle("Fusion")
     install_ui_font(app)
 
@@ -31,7 +32,8 @@ def main() -> int:
         QMessageBox.critical(None, "No se pudo iniciar Sentry",
                              f"No se pudo preparar la base de datos local. Revisa permisos y espacio en disco.\n\n{exc}")
         return 1
-    window.show()
+    window.setWindowIcon(window_icon)
+    window.showMaximized()
     return app.exec()
 
 
