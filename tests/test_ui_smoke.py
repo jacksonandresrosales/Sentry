@@ -4,13 +4,14 @@ import os
 import unittest
 import wave
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QUrl
-from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton
+from PySide6.QtWidgets import QApplication, QFrame, QLabel, QLineEdit, QPushButton
 
-from app.ui.views.main_window import SentryWindow, install_ui_font, scan_audio_files
+from app.ui.views.main_window import AudioAnalysisJob, SentryWindow, _infer_speaker_roles, install_ui_font, scan_audio_files
 
 
 class SentryWindowSmokeTest(unittest.TestCase):
@@ -44,6 +45,9 @@ class SentryWindowSmokeTest(unittest.TestCase):
         self.assertIn("00:38", self.window.time_display.text())
 
     def test_api_keys_are_masked_and_escalation_action_is_removed(self) -> None:
+        self.assertFalse(self.window.windowIcon().isNull())
+        identity = self.window.findChild(QFrame, "contentPanel")
+        self.assertNotIn("AGENTE", [label.text() for label in identity.findChildren(QLabel)])
         logo = self.window.findChild(QLabel, "brandLogo")
         self.assertIsNotNone(logo)
         self.assertFalse(logo.pixmap().isNull())
@@ -85,6 +89,31 @@ class SentryWindowSmokeTest(unittest.TestCase):
         self.assertEqual(self.window._extract_models("gemini", "analysis", gemini), ["gemini-flash"])
         self.assertEqual(self.window._extract_models("openai", "transcription", openai), ["gpt-audio-transcribe"])
 
+    def test_gemini_is_skipped_for_calls_without_sensitive_terms(self) -> None:
+        summaries = []
+        with patch("app.ui.views.main_window._transcription_request", return_value=(
+            [{"second": 0, "speaker": "Cliente", "text": "Consulta de saldo"}],
+            "Consulta de saldo",
+        )), patch("app.ui.views.main_window._summary_request", side_effect=lambda *args: summaries.append(args) or "Resumen"):
+            normal = AudioAnalysisJob(1, Path("normal.wav"), ("deepgram", "nova-3", "stt"), ("gemini", "gemini-2.5-flash-lite", "gemini"), ("demanda", "abogado"))
+            normal.run()
+        self.assertEqual(summaries, [])
+
+    def test_speaker_roles_use_dialogue_instead_of_speaker_order(self) -> None:
+        utterances = [
+            {"speaker": 0, "transcript": "Hola, llamo porque me cobraron dos veces."},
+            {"speaker": 1, "transcript": "Buenos días, le atiende Ana. ¿En qué puedo ayudarle?"},
+            {"speaker": 0, "transcript": "Quiero reclamar el valor de mi factura."},
+            {"speaker": 1, "transcript": "Permítame validar su número de caso."},
+        ]
+        self.assertEqual(_infer_speaker_roles(utterances), {"0": "Cliente", "1": "Asesor"})
+
+        uncertain = [
+            {"speaker": 0, "transcript": "Buenos días."},
+            {"speaker": 1, "transcript": "Buenos días."},
+        ]
+        self.assertEqual(_infer_speaker_roles(uncertain), {"0": "Participante 1", "1": "Participante 2"})
+
     def test_directory_scan_finds_supported_audio_recursively(self) -> None:
         root = Path.cwd() / ".tmp" / "scan-audio-test"
         nested = root / "septiembre"
@@ -105,6 +134,8 @@ class SentryWindowSmokeTest(unittest.TestCase):
             media_source = self.window.media_player.source().toLocalFile()
             play_enabled = self.window.play_button.isEnabled()
             original_enabled = self.window.original_button.isEnabled()
+            customer_heading = self.window.call_cards[1].findChild(QLabel, "callCustomer")
+            footer_texts = [label.text() for label in self.window.call_cards[1].findChildren(QLabel, "monoMuted")]
         finally:
             self.window.media_player.stop()
             self.window.media_player.setSource(QUrl())
@@ -118,9 +149,12 @@ class SentryWindowSmokeTest(unittest.TestCase):
         self.assertEqual(displayed_names, ["llamada.wav", "LLAMADA.MP3"])
         self.assertEqual(self.window.call_list.count(), 2)
         self.assertEqual(self.window.files_metric.text(), "2")
+        self.assertEqual(self.window.call_records[0].agent, "")
         self.assertEqual(Path(media_source), files[0])
         self.assertTrue(play_enabled)
         self.assertTrue(original_enabled)
+        self.assertEqual(customer_heading.text(), "Sin identificar")
+        self.assertNotIn("Sin identificar", footer_texts)
 
 
 if __name__ == "__main__":

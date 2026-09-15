@@ -19,13 +19,15 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Sentry")
     app.setOrganizationName("Ecuaconexión")
-    icon_path = Path(__file__).resolve().parent / "ui" / "assets" / "sentry-app-icon.png"
-    app.setWindowIcon(QIcon(str(icon_path)))
+    icon_path = Path(__file__).resolve().parent / "ui" / "assets" / "sentry-app-icon.ico"
+    window_icon = QIcon(str(icon_path))
+    app.setWindowIcon(window_icon)
     app.setStyle("Fusion")
     install_ui_font(app)
 
     window = SentryWindow()
-    window.show()
+    window.setWindowIcon(window_icon)
+    window.showMaximized()
     return app.exec()
 
 

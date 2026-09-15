@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import html
 import json
+import mimetypes
 import os
+import unicodedata
+import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QByteArray, QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
@@ -57,6 +63,36 @@ PALETTE = {
 }
 
 AUDIO_SUFFIXES = {".mp3", ".wav"}
+TRANSCRIPTION_LANGUAGE = "es-419"
+
+ADVISOR_SIGNALS = (
+    ("le atiende", 4),
+    ("en que puedo ayudar", 4),
+    ("como puedo ayudar", 4),
+    ("gracias por comunicarse", 4),
+    ("gracias por llamar", 4),
+    ("bienvenido a", 3),
+    ("servicio al cliente", 3),
+    ("voy a validar", 2),
+    ("permita validar", 2),
+    ("voy a revisar", 2),
+    ("me confirma", 2),
+    ("numero de caso", 2),
+)
+
+CUSTOMER_SIGNALS = (
+    ("llamo porque", 4),
+    ("llamo por", 3),
+    ("quiero cancelar", 3),
+    ("quiero dar de baja", 3),
+    ("tengo un problema", 3),
+    ("me cobraron", 3),
+    ("me estan cobrando", 3),
+    ("mi factura", 2),
+    ("mi servicio", 2),
+    ("necesito ayuda", 2),
+    ("quiero reclamar", 2),
+)
 
 
 def scan_audio_files(directory: Path) -> tuple[Path, ...]:
@@ -125,10 +161,10 @@ DEMO_CALLS = (
         "El cliente reclama por un cobro duplicado de $45. Advierte que, si no se acredita el saldo hoy, presentará una demanda formal con su abogado.",
         "…si hoy no me acreditan el dinero voy a presentar una demanda formal…",
         (
-            TranscriptLine(3, "Agente", "Buenas tardes, atención al cliente le atiende Juan. ¿Con quién tengo el gusto?"),
+            TranscriptLine(3, "Asesor", "Buenas tardes, atención al cliente le atiende Juan. ¿Con quién tengo el gusto?"),
             TranscriptLine(10, "Cliente", "Llevo tres días esperando que me devuelvan los 45 dólares que me cobraron doble en mi tarjeta terminada en [DATOS_PROTEGIDOS]."),
             TranscriptLine(38, "Cliente", "¡Si hoy no me acreditan mi dinero voy a presentar una DEMANDA formal con mi abogado!", True),
-            TranscriptLine(47, "Agente", "Comprendo. En este instante escalo el caso con supervisión para darle seguimiento."),
+            TranscriptLine(47, "Asesor", "Comprendo. En este instante escalo el caso con supervisión para darle seguimiento."),
         ),
     ),
     CallRecord(
@@ -146,10 +182,10 @@ DEMO_CALLS = (
         "La clienta reporta interrupciones recurrentes. Solicita una solución inmediata y comunica que consultará a su abogado para presentar una denuncia.",
         "…voy a llamar a mi abogado para denunciar las interrupciones…",
         (
-            TranscriptLine(2, "Agente", "Gracias por comunicarse. Le atiende María, ¿en qué puedo ayudarle?"),
+            TranscriptLine(2, "Asesor", "Gracias por comunicarse. Le atiende María, ¿en qué puedo ayudarle?"),
             TranscriptLine(9, "Cliente", "El servicio se corta cada noche y ya registré tres reclamos sin respuesta."),
             TranscriptLine(31, "Cliente", "Voy a llamar a mi ABOGADO para denunciar esto si hoy no lo solucionan.", True),
-            TranscriptLine(40, "Agente", "Voy a validar la incidencia y escalarla al área técnica de prioridad."),
+            TranscriptLine(40, "Asesor", "Voy a validar la incidencia y escalarla al área técnica de prioridad."),
         ),
     ),
     CallRecord(
@@ -167,9 +203,9 @@ DEMO_CALLS = (
         "El cliente desea cancelar el servicio por fallas recurrentes. El agente inicia el procedimiento de retención y revisión técnica.",
         "Quiero dar de baja el servicio; estoy teniendo fallas…",
         (
-            TranscriptLine(4, "Agente", "Buenos días, le atiende Carlos. ¿Cómo puedo ayudarle?"),
+            TranscriptLine(4, "Asesor", "Buenos días, le atiende Carlos. ¿Cómo puedo ayudarle?"),
             TranscriptLine(12, "Cliente", "Quiero dar de baja el servicio porque sigo teniendo fallas."),
-            TranscriptLine(27, "Agente", "Antes de cancelar, puedo solicitar una revisión prioritaria sin costo."),
+            TranscriptLine(27, "Asesor", "Antes de cancelar, puedo solicitar una revisión prioritaria sin costo."),
         ),
     ),
     CallRecord(
@@ -187,9 +223,9 @@ DEMO_CALLS = (
         "La clienta consulta el saldo de su plan. La información fue confirmada y la llamada terminó sin incidencias.",
         "Muchas gracias por confirmarme el saldo de mi plan…",
         (
-            TranscriptLine(3, "Agente", "Buenos días, le atiende Sofía. ¿En qué puedo ayudarle?"),
+            TranscriptLine(3, "Asesor", "Buenos días, le atiende Sofía. ¿En qué puedo ayudarle?"),
             TranscriptLine(8, "Cliente", "Quisiera confirmar el saldo y la fecha de corte de mi plan."),
-            TranscriptLine(24, "Agente", "Su saldo está al día y la siguiente fecha de corte es el 28 de septiembre."),
+            TranscriptLine(24, "Asesor", "Su saldo está al día y la siguiente fecha de corte es el 28 de septiembre."),
             TranscriptLine(34, "Cliente", "Perfecto, muchas gracias por la ayuda."),
         ),
     ),
@@ -199,6 +235,43 @@ DEMO_CALLS = (
 def format_time(seconds: int) -> str:
     minutes, remaining = divmod(max(0, seconds), 60)
     return f"{minutes:02d}:{remaining:02d}"
+
+
+def _infer_speaker_roles(utterances: list[object]) -> dict[str, str]:
+    samples: dict[str, list[str]] = {}
+    for item in utterances:
+        if not isinstance(item, dict) or not str(item.get("transcript", "")).strip():
+            continue
+        speaker = str(item.get("speaker", 0))
+        samples.setdefault(speaker, []).append(str(item["transcript"]))
+
+    speakers = list(samples)
+    roles = {speaker: f"Participante {index}" for index, speaker in enumerate(speakers, 1)}
+    if not speakers:
+        return roles
+
+    def score(texts: list[str], signals: tuple[tuple[str, int], ...]) -> int:
+        text = " ".join(texts)
+        text = "".join(character for character in unicodedata.normalize("NFD", text.casefold()) if not unicodedata.combining(character))
+        return sum(weight for phrase, weight in signals if phrase in text)
+
+    def winner(scores: dict[str, int]) -> str | None:
+        ranked = sorted(scores, key=scores.get, reverse=True)
+        return ranked[0] if scores[ranked[0]] >= 3 and (len(ranked) == 1 or scores[ranked[0]] - scores[ranked[1]] >= 2) else None
+
+    advisor = winner({speaker: score(samples[speaker], ADVISOR_SIGNALS) for speaker in speakers})
+    customer = winner({speaker: score(samples[speaker], CUSTOMER_SIGNALS) for speaker in speakers})
+
+    if advisor:
+        roles[advisor] = "Asesor"
+    if customer and customer != advisor:
+        roles[customer] = "Cliente"
+    if len(speakers) == 2:
+        if advisor and not customer:
+            roles[next(speaker for speaker in speakers if speaker != advisor)] = "Cliente"
+        elif customer and not advisor:
+            roles[next(speaker for speaker in speakers if speaker != customer)] = "Asesor"
+    return roles
 
 
 def call_record_from_audio(path: Path, call_id: int) -> CallRecord:
@@ -226,7 +299,7 @@ def call_record_from_audio(path: Path, call_id: int) -> CallRecord:
     return CallRecord(
         call_id=call_id,
         filename=path.name,
-        agent="Agente sin identificar",
+        agent="",
         customer=customer,
         clock=clock,
         duration=duration,
@@ -240,6 +313,143 @@ def call_record_from_audio(path: Path, call_id: int) -> CallRecord:
         transcript=(TranscriptLine(0, "Sistema", "Transcripción pendiente."),),
         source_path=path,
     )
+
+
+class AnalysisSignals(QObject):
+    finished = Signal(int, object)
+    failed = Signal(int, str)
+
+
+def _request_json(url: str, method: str, headers: dict[str, str], payload: object) -> object:
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
+    with urllib.request.urlopen(request, timeout=120) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _transcription_request(path: Path, provider: str, model: str, key: str) -> tuple[list[dict[str, object]], str]:
+    audio = path.read_bytes()
+    content_type = mimetypes.guess_type(path.name)[0] or "audio/wav"
+    if provider == "deepgram":
+        endpoint = "https://api.deepgram.com/v1/listen?" + urllib.parse.urlencode({
+            "model": model or "nova-3",
+            "language": TRANSCRIPTION_LANGUAGE,
+            "smart_format": "true",
+            "diarize": "true",
+            "utterances": "true",
+        })
+        payload = _request_bytes(endpoint, audio, {
+            "Authorization": f"Token {key}",
+            "Content-Type": content_type,
+        })
+        results = payload.get("results", {}) if isinstance(payload, dict) else {}
+        utterances = results.get("utterances", []) if isinstance(results, dict) else []
+        speaker_roles = _infer_speaker_roles(utterances)
+        lines = [
+            {
+                "second": round(float(item.get("start", 0))),
+                "speaker": speaker_roles.get(str(item.get("speaker", 0)), "Participante"),
+                "text": str(item.get("transcript", "")).strip(),
+            }
+            for item in utterances
+            if isinstance(item, dict) and str(item.get("transcript", "")).strip()
+        ]
+        channels = results.get("channels", []) if isinstance(results, dict) else []
+        transcript = ""
+        if channels and isinstance(channels[0], dict):
+            alternatives = channels[0].get("alternatives", [])
+            if alternatives and isinstance(alternatives[0], dict):
+                transcript = str(alternatives[0].get("transcript", "")).strip()
+        return lines or [{"second": 0, "speaker": "Transcripción", "text": transcript}], transcript
+
+    boundary = f"----Sentry{uuid.uuid4().hex}"
+    chunks = [
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model or 'gpt-4o-mini-transcribe'}\r\n".encode(),
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{path.name}\"\r\nContent-Type: {content_type}\r\n\r\n".encode(),
+        audio,
+        f"\r\n--{boundary}--\r\n".encode(),
+    ]
+    payload = _request_bytes("https://api.openai.com/v1/audio/transcriptions", b"".join(chunks), {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+    })
+    transcript = str(payload.get("text", "")).strip() if isinstance(payload, dict) else ""
+    return [{"second": 0, "speaker": "Transcripción", "text": transcript}], transcript
+
+
+def _request_bytes(url: str, body: bytes, headers: dict[str, str]) -> object:
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(request, timeout=180) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _summary_request(provider: str, model: str, key: str, transcript: str) -> str:
+    if len(transcript) > 4000:
+        transcript = transcript[:3000] + "\n[transcripción recortada]\n" + transcript[-1000:]
+    prompt = (
+        "Resume esta llamada en español en máximo 2 frases. Indica solo motivo, resultado "
+        "y riesgo. No inventes datos.\n\n" + transcript
+    )
+    if provider == "gemini":
+        generation_config = {"temperature": 0.1, "candidateCount": 1, "maxOutputTokens": 100}
+        if (model or "").startswith("gemini-2.5-flash"):
+            generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+        payload = _request_json(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model or 'gemini-2.5-flash-lite'}:generateContent?key={key}",
+            "POST",
+            {"Content-Type": "application/json"},
+            {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": generation_config},
+        )
+        candidates = payload.get("candidates", []) if isinstance(payload, dict) else []
+        parts = candidates[0].get("content", {}).get("parts", []) if candidates and isinstance(candidates[0], dict) else []
+        return str(parts[0].get("text", "")).strip() if parts and isinstance(parts[0], dict) else ""
+
+    payload = _request_json(
+        "https://api.openai.com/v1/chat/completions",
+        "POST",
+        {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        {"model": model or "gpt-4o-mini", "temperature": 0.1, "messages": [{"role": "user", "content": prompt}]},
+    )
+    choices = payload.get("choices", []) if isinstance(payload, dict) else []
+    message = choices[0].get("message", {}) if choices and isinstance(choices[0], dict) else {}
+    return str(message.get("content", "")).strip() if isinstance(message, dict) else ""
+
+
+class AudioAnalysisJob(QRunnable):
+    def __init__(self, call_id: int, path: Path, transcription: tuple[str, str, str], analysis: tuple[str, str, str], keywords: tuple[str, ...]) -> None:
+        super().__init__()
+        self.call_id = call_id
+        self.path = path
+        self.transcription = transcription
+        self.analysis = analysis
+        self.keywords = keywords
+        self.signals = AnalysisSignals()
+
+    def run(self) -> None:
+        try:
+            lines, transcript = _transcription_request(self.path, *self.transcription)
+            lowered = transcript.casefold()
+            matches = [word for word in self.keywords if word.casefold() in lowered]
+            keyword = matches[0] if matches else "Sin alertas"
+            hit_second = next((int(line["second"]) for line in lines if any(word.casefold() in str(line["text"]).casefold() for word in matches)), None)
+            summary = ""
+            use_gemini = self.analysis[0] == "gemini"
+            if self.analysis[2].strip() and transcript and (not use_gemini or matches):
+                try:
+                    summary = _summary_request(*self.analysis, transcript)
+                except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                    summary = ""
+            if not summary:
+                summary = "Transcripción completada. " + ("Se detectaron términos sensibles." if matches else "No se detectaron términos sensibles.")
+            self.signals.finished.emit(self.call_id, {
+                "lines": lines,
+                "summary": summary,
+                "matches": matches,
+                "keyword": keyword,
+                "hit_second": hit_second,
+            })
+        except (OSError, ValueError, KeyError, json.JSONDecodeError, urllib.error.URLError) as error:
+            self.signals.failed.emit(self.call_id, str(error))
 
 
 class AudioTimeline(QWidget):
@@ -328,9 +538,10 @@ class CallCard(QFrame):
         dot.setObjectName("alertDot" if call.sensitive else "normalDot")
         top.addWidget(dot)
 
-        name = QLabel(call.agent)
-        name.setObjectName("callAgent")
-        top.addWidget(name)
+        customer = QLabel(call.customer)
+        customer.setObjectName("callCustomer")
+        customer.setToolTip(call.customer)
+        top.addWidget(customer)
 
         badge = QLabel(call.keyword.capitalize())
         badge.setObjectName("sensitiveBadge" if call.sensitive else "neutralBadge")
@@ -348,11 +559,8 @@ class CallCard(QFrame):
         layout.addWidget(snippet)
 
         meta = QHBoxLayout()
-        customer = QLabel(call.customer)
-        customer.setObjectName("monoMuted")
         duration = QLabel(f"{format_time(call.duration)} min")
         duration.setObjectName("monoMuted")
-        meta.addWidget(customer)
         meta.addStretch()
         meta.addWidget(duration)
         layout.addLayout(meta)
@@ -372,6 +580,7 @@ class SentryWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Sentry · Auditoría de grabaciones")
+        self.setWindowIcon(QIcon(str(Path(__file__).resolve().parents[1] / "assets" / "sentry-app-icon.ico")))
         self.resize(1440, 860)
         self.setMinimumSize(1080, 680)
 
@@ -385,6 +594,9 @@ class SentryWindow(QMainWindow):
         self.nav_buttons: dict[str, QPushButton] = {}
         self.critical_line: QWidget | None = None
         self.network = QNetworkAccessManager(self)
+        self.analysis_pool = QThreadPool(self)
+        self.analysis_queue: list[int] = []
+        self.analysis_running = False
 
         self.audio_output = QAudioOutput(self)
         self.audio_output.setVolume(1.0)
@@ -676,7 +888,11 @@ class SentryWindow(QMainWindow):
 
         meta = QGridLayout()
         meta.setHorizontalSpacing(26)
-        self.agent_value = self._add_meta(meta, 0, "AGENTE")
+        agent_space = QWidget()
+        agent_space.setMinimumWidth(120)
+        meta.addWidget(agent_space, 0, 0, 2, 1)
+        self.agent_value = QLabel(frame)
+        self.agent_value.hide()
         self.customer_value = self._add_meta(meta, 1, "CLIENTE")
         self.time_value = self._add_meta(meta, 2, "HORA")
         self.risk_value = self._add_meta(meta, 3, "RIESGO")
@@ -979,7 +1195,7 @@ class SentryWindow(QMainWindow):
         self._select_provider(self.analysis_provider, os.getenv("SENTRY_ANALYSIS_PROVIDER", "gemini"))
         self.analysis_model = QComboBox()
         self.analysis_model.setEditable(True)
-        self.analysis_model.addItem(os.getenv("SENTRY_ANALYSIS_MODEL", "gemini-1.5-flash"))
+        self.analysis_model.addItem(os.getenv("SENTRY_ANALYSIS_MODEL", "gemini-2.5-flash-lite"))
         analysis_key = (
             os.getenv("OPENAI_API_KEY", "")
             if self.analysis_provider.currentData() == "openai"
@@ -1085,7 +1301,7 @@ class SentryWindow(QMainWindow):
         defaults = {
             ("transcription", "deepgram"): "nova-3",
             ("transcription", "openai"): "gpt-4o-mini-transcribe",
-            ("analysis", "gemini"): "gemini-1.5-flash",
+            ("analysis", "gemini"): "gemini-2.5-flash-lite",
             ("analysis", "openai"): "gpt-4o-mini",
         }
         model.clear()
@@ -1511,9 +1727,90 @@ class SentryWindow(QMainWindow):
             self._filter_calls()
             noun = "audio encontrado" if count == 1 else "audios encontrados"
             message = f"Escaneo completado · {count} {noun}"
+            self._start_automatic_analysis()
         self.scan_button.setEnabled(True)
         self.scan_button.setToolTip("Escanear carpeta")
         self._show_toast(message)
+
+    def _start_automatic_analysis(self) -> None:
+        transcription_key = self.transcription_api_key.text().strip()
+        if not transcription_key:
+            return
+        self.analysis_queue = [call.call_id for call in self.call_records if call.source_path is not None]
+        if self.analysis_queue:
+            self.analysis_running = True
+            self._analyze_next_call()
+
+    def _analyze_next_call(self) -> None:
+        if not self.analysis_queue:
+            self.analysis_running = False
+            self._show_toast("Análisis automático completado")
+            return
+        call_id = self.analysis_queue.pop(0)
+        call = self.calls.get(call_id)
+        if call is None or call.source_path is None:
+            self._analyze_next_call()
+            return
+        self._show_toast(f"Analizando {call.filename}…")
+        transcription = (
+            str(self.transcription_provider.currentData()),
+            self.transcription_model.currentText().strip(),
+            self.transcription_api_key.text().strip(),
+        )
+        analysis = (
+            str(self.analysis_provider.currentData()),
+            self.analysis_model.currentText().strip(),
+            self.analysis_api_key.text().strip(),
+        )
+        keywords = tuple(word.strip() for word in self.keywords_input.text().split(",") if word.strip())
+        job = AudioAnalysisJob(call_id, call.source_path, transcription, analysis, keywords)
+        job.signals.finished.connect(self._finish_automatic_analysis)
+        job.signals.failed.connect(self._fail_automatic_analysis)
+        self.analysis_pool.start(job)
+
+    def _finish_automatic_analysis(self, call_id: int, result: object) -> None:
+        call = self.calls.get(call_id)
+        if call is None or not isinstance(result, dict):
+            self._analyze_next_call()
+            return
+        lines = tuple(
+            TranscriptLine(int(line.get("second", 0)), str(line.get("speaker", "Participante")), str(line.get("text", "")))
+            for line in result.get("lines", [])
+            if isinstance(line, dict) and str(line.get("text", "")).strip()
+        )
+        matches = [str(match) for match in result.get("matches", [])]
+        updated = replace(
+            call,
+            sensitive=bool(matches),
+            keyword=matches[0] if matches else "Sin alertas",
+            hit_second=result.get("hit_second"),
+            risk="Crítica" if matches else "Baja",
+            category="Alerta sensible" if matches else "Sin novedad",
+            summary=str(result.get("summary", "Transcripción completada.")),
+            snippet=(lines[0].text if lines else "Sin texto transcrito")[:150],
+            transcript=lines or (TranscriptLine(0, "Transcripción", "No se recibió texto."),),
+        )
+        self.calls[call_id] = updated
+        self.call_records = [updated if item.call_id == call_id else item for item in self.call_records]
+        selected_id = self.current_call.call_id
+        self._populate_call_list()
+        self._filter_calls()
+        self._select_call_by_id(selected_id if selected_id == call_id else call_id)
+        self.sensitive_metric.setText(str(sum(item.sensitive for item in self.call_records)))
+        self.normal_metric.setText(str(sum(not item.sensitive for item in self.call_records)))
+        self.normal_metric_label.setText("Sin novedad")
+        self._analyze_next_call()
+
+    def _fail_automatic_analysis(self, call_id: int, error: str) -> None:
+        call = self.calls.get(call_id)
+        if call is not None:
+            updated = replace(call, risk="Error", summary="No se pudo analizar este audio. Revisa la API y vuelve a escanear.")
+            self.calls[call_id] = updated
+            self.call_records = [updated if item.call_id == call_id else item for item in self.call_records]
+            self._populate_call_list()
+            self._filter_calls()
+        self._show_toast(f"Error al analizar {call.filename if call else 'el audio'}")
+        self._analyze_next_call()
 
     def _show_toast(self, message: str) -> None:
         self.toast.setText(message)
@@ -1676,6 +1973,7 @@ class SentryWindow(QMainWindow):
             QFrame#alertDot {{ background: {PALETTE['green_lime']}; border-radius: 4px; }}
             QFrame#normalDot {{ background: {PALETTE['border_strong']}; border-radius: 4px; }}
             QLabel#callAgent {{ color: {PALETTE['text']}; font-weight: 600; }}
+            QLabel#callCustomer {{ color: {PALETTE['text']}; font-weight: 600; }}
             QLabel#sensitiveBadge, QLabel#riskBadge[sensitive="true"] {{
                 color: {PALETTE['green_accessible']};
                 background: {PALETTE['green_soft']};
