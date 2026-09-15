@@ -7,12 +7,16 @@ import re
 import wave
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sqlite3
 
 from app.database import Database, DEFAULT_DATABASE
 from app.secret_store import SecretStoreError, protect, unprotect
 from app.services.audio_analysis import analyze_file, assign_roles
+from app.services.base_conversion import BaseAudioIndex, load_hoja1_audio_index, normalize_phone_number
+from app.services.winscp_client import (
+    WinSCPError, download_remote_audio, scan_host_fingerprint, search_remote_audio, test_connection,
+)
 from app.ui.views.bases_page import BasesPage
 
 from PySide6.QtCore import QByteArray, QSize, Qt, QThread, QTimer, QUrl, Signal
@@ -66,18 +70,97 @@ PALETTE = {
 AUDIO_SUFFIXES = {".mp3", ".wav"}
 
 
-def scan_audio_files(directory: Path) -> tuple[Path, ...]:
+def audio_phone_from_filename(path: Path) -> str | None:
+    parts = path.stem.split("-")
+    if len(parts) < 3 or parts[0].casefold() != "q" or not parts[1].isdigit() or len(parts[1]) != 3:
+        return None
+    phone = normalize_phone_number(parts[2])
+    return phone or None
+
+
+def audio_key_from_filename(path: Path) -> tuple[str, str] | None:
+    parts = path.stem.split("-")
+    phone = audio_phone_from_filename(path)
+    if phone is None or len(parts) < 4 or not re.fullmatch(r"20\d{6}", parts[3]):
+        return None
+    try:
+        datetime.strptime(parts[3], "%Y%m%d")
+    except ValueError:
+        return None
+    return phone, parts[3]
+
+
+def audio_matches_index(path: Path, index: BaseAudioIndex) -> bool:
+    key = audio_key_from_filename(path)
+    if key is None or key[0] not in index.phone_dates:
+        return False
+    expected_dates = index.phone_dates[key[0]]
+    return not expected_dates or key[1] in expected_dates
+
+
+def scan_audio_files(
+    directory: Path,
+    allowed_phones: set[str] | None = None,
+    phone_dates: dict[str, frozenset[str]] | None = None,
+) -> tuple[Path, ...]:
     if not directory.exists():
         raise FileNotFoundError(directory)
     if not directory.is_dir():
         raise NotADirectoryError(directory)
 
+    normalized_phones = (
+        {phone for value in allowed_phones if (phone := normalize_phone_number(value))}
+        if allowed_phones is not None else None
+    )
     return tuple(
         sorted(
-            (path for path in directory.rglob("*") if path.is_file() and path.suffix.casefold() in AUDIO_SUFFIXES),
+            (
+                path for path in directory.rglob("*")
+                if path.is_file()
+                and path.suffix.casefold() in AUDIO_SUFFIXES
+                and (
+                    phone_dates is None and (
+                        normalized_phones is None or audio_phone_from_filename(path) in normalized_phones
+                    )
+                    or phone_dates is not None and (
+                        (key := audio_key_from_filename(path)) is not None
+                        and key[0] in phone_dates
+                        and (not phone_dates[key[0]] or key[1] in phone_dates[key[0]])
+                    )
+                )
+            ),
             key=lambda path: str(path).casefold(),
         )
     )
+
+
+def issabel_directories(remote_root: str, dates: set[str]) -> list[str]:
+    root = PurePosixPath(remote_root or "/var/spool/asterisk/monitor")
+    directories = []
+    for value in sorted(dates):
+        if not re.fullmatch(r"20\d{6}", value):
+            continue
+        year, month, day = value[:4], value[4:6], value[6:8]
+        if re.fullmatch(r"20\d{2}", root.name):
+            base = root if root.name == year else root.parent / year
+        else:
+            base = root / year
+        directories.append(f"{base / month / day}/")
+    return directories
+
+
+def dated_local_directories(root: Path, dates: set[str]) -> tuple[Path, ...]:
+    """Reduce un árbol local/NAS a las carpetas de fecha cuando existen."""
+    root = Path(root)
+    found: set[Path] = set()
+    for value in dates:
+        if not re.fullmatch(r"20\d{6}", value):
+            continue
+        year, month, day = value[:4], value[4:6], value[6:8]
+        for candidate in (root / year / month / day, root / month / day, root / day):
+            if candidate.is_dir():
+                found.add(candidate)
+    return tuple(sorted(found, key=lambda path: str(path).casefold())) or (root,)
 
 
 def install_ui_font(app: QApplication) -> str:
@@ -124,19 +207,28 @@ def format_time(seconds: int) -> str:
     return f"{minutes:02d}:{remaining:02d}"
 
 
-def call_record_from_audio(path: Path, call_id: int) -> CallRecord:
+def audio_filename_metadata(path: Path) -> tuple[str, str]:
+    """Obtiene teléfono anonimizado y hora desde q-000-teléfono-AAAAMMDD-HHMMSS."""
     parts = path.stem.split("-")
-    customer = "Sin identificar"
+    raw_phone = audio_phone_from_filename(path)
+    customer = f"{raw_phone[:3]}***{raw_phone[-4:]}" if raw_phone else "Sin identificar"
     try:
-        clock = datetime.fromtimestamp(path.stat().st_mtime).strftime("%H:%M")
+        clock = datetime.fromtimestamp(path.stat().st_mtime).strftime("%H:%M:%S")
     except OSError:
-        clock = "--:--"
-    if len(parts) >= 5:
-        phone, raw_time = parts[2], parts[4]
-        if phone.isdigit() and len(phone) >= 7:
-            customer = f"{phone[:3]}***{phone[-4:]}"
-        if raw_time.isdigit() and len(raw_time) == 6:
-            clock = f"{raw_time[:2]}:{raw_time[2:4]}"
+        clock = "--:--:--"
+    if len(parts) >= 5 and parts[0].casefold() == "q" and parts[1].isdigit() and len(parts[1]) == 3:
+        _phone, raw_date, raw_time = parts[2:5]
+        try:
+            parsed = datetime.strptime(raw_date + raw_time, "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
+        else:
+            clock = parsed.strftime("%H:%M:%S")
+    return customer, clock
+
+
+def call_record_from_audio(path: Path, call_id: int) -> CallRecord:
+    customer, clock = audio_filename_metadata(path)
 
     duration = 0
     if path.suffix.casefold() == ".wav":
@@ -191,16 +283,13 @@ def call_record_from_row(row: dict) -> CallRecord:
         segments.append(TranscriptLine(round(float(item.get("second", 0))), str(item.get("speaker", "Hablante")),
                                        str(item.get("text", "")), critical, word_seconds))
     path = Path(row["file_path"])
-    customer = "Sin identificar"
-    parts = path.stem.split("-")
-    if len(parts) >= 3 and parts[2].isdigit() and len(parts[2]) >= 7:
-        customer = f"{parts[2][:3]}***{parts[2][-4:]}"
+    customer, clock = audio_filename_metadata(path)
     risk = row.get("risk_level") or ("Pendiente" if category == "PENDIENTE" else "Bajo")
     labels = {"ALERTA": "Alerta sensible", "BUZON": "Buzón / sin conversación",
               "NORMAL": "Llamada normal", "PENDIENTE": "Pendiente", "ERROR": "Error"}
     return CallRecord(
         call_id=int(row["id"]), filename=row["filename"], agent="",
-        customer=customer, clock="--:--", duration=int(row.get("duration_seconds") or 0),
+        customer=customer, clock=clock, duration=int(row.get("duration_seconds") or 0),
         category=labels.get(category, category.title()), sensitive=category == "ALERTA",
         keyword=hits[0]["keyword"] if hits else ("Sin analizar" if category == "PENDIENTE" else labels.get(category, category)),
         hit_second=round(float(hits[0]["timestamp_seconds"])) if hits else None,
@@ -243,6 +332,87 @@ class AnalysisWorker(QThread):
                 completed += 1
                 self.row_ready.emit(row)
         self.completed.emit(completed, failures, self._stop)
+
+
+class WinSCPWorker(QThread):
+    succeeded = Signal(str, str)
+    failed = Signal(str)
+
+    def __init__(self, mode: str, config: dict, parent=None):
+        super().__init__(parent)
+        self.mode = mode
+        self.config = dict(config)
+
+    def run(self):
+        try:
+            if self.mode == "fingerprint":
+                result = scan_host_fingerprint(self.config)
+            elif self.mode == "connect":
+                result = scan_host_fingerprint(self.config)
+                self.config["fingerprint"] = result
+                test_connection(self.config)
+            else:
+                test_connection(self.config)
+                result = ""
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(self.mode, result)
+
+
+class RemoteSearchWorker(QThread):
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, config: dict, query: str, parent=None):
+        super().__init__(parent)
+        self.config = dict(config)
+        self.query = query
+
+    def run(self):
+        try:
+            result = search_remote_audio(self.config, self.query)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
+
+
+class IssabelMatchWorker(QThread):
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, config: dict, index: BaseAudioIndex, destination: Path, parent=None):
+        super().__init__(parent)
+        self.config = dict(config)
+        self.index = index
+        self.destination = Path(destination)
+
+    def run(self):
+        try:
+            directories = issabel_directories(self.config.get("remote_path", ""), self.index.dates)
+            if not directories:
+                raise ValueError("La base activa no contiene fechas válidas para localizar los audios en Issabel.")
+            request = dict(self.config)
+            request["remote_paths"] = directories
+            request["recursive"] = False
+            request["phones"] = sorted(self.index.phones)
+            candidates = search_remote_audio(request, "q-", limit=5000)
+            matches = []
+            for item in candidates:
+                remote_path = str(item.get("path", ""))
+                if audio_matches_index(Path(remote_path), self.index):
+                    matches.append(remote_path)
+            paths = download_remote_audio(request, matches, self.destination)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit({
+                "paths": paths,
+                "candidate_count": len(candidates),
+                "match_count": len(matches),
+                "directories": directories,
+            })
 
 
 class AudioTimeline(QWidget):
@@ -446,8 +616,14 @@ class SentryWindow(QMainWindow):
         self.active_transcript_index = -1
         self.sort_mode = "original"
         self.sort_label = "original"
+        self.active_base_path: Path | None = None
+        self.active_base_phones: set[str] = set()
+        self.active_base_index = BaseAudioIndex({})
         self.network = QNetworkAccessManager(self)
         self.analysis_worker: AnalysisWorker | None = None
+        self.winscp_worker: WinSCPWorker | None = None
+        self.remote_search_worker: RemoteSearchWorker | None = None
+        self.issabel_match_worker: IssabelMatchWorker | None = None
         self.close_after_analysis = False
 
         self.audio_output = QAudioOutput(self)
@@ -468,11 +644,23 @@ class SentryWindow(QMainWindow):
         settings = self.database.settings()
         if "audio_directory" in settings:
             self.config_directory.setText(settings["audio_directory"])
-            self._set_directory_display(settings["audio_directory"])
+        if "nas_directory" in settings:
+            self.nas_directory.setText(settings["nas_directory"])
+        if "audio_source" in settings:
+            source_index = self.audio_source.findData(settings["audio_source"])
+            if source_index >= 0:
+                self.audio_source.setCurrentIndex(source_index)
+        self._source_changed()
         if "keywords" in settings:
             self.keywords_input.setText(settings["keywords"])
         self._restore_credentials()
+        self._restore_remote_connection()
         persisted = self.database.call_rows()
+        if self.active_base_path is not None:
+            persisted = [
+                row for row in persisted
+                if audio_matches_index(Path(row["file_path"]), self.active_base_index)
+            ]
         if persisted:
             self.call_records = [call_record_from_row(row) for row in persisted]
             self.calls = {call.call_id: call for call in self.call_records}
@@ -497,6 +685,14 @@ class SentryWindow(QMainWindow):
         self.pages.addWidget(self._build_reports_page())
         self.pages.addWidget(self._build_config_page())
         self.bases_page = BasesPage(self.database)
+        self.active_base_path = self.bases_page.active_base_path
+        self.active_base_phones = set(self.bases_page.active_phones)
+        if self.active_base_path is not None:
+            try:
+                self.active_base_index = load_hoja1_audio_index(self.active_base_path)
+            except (OSError, ValueError, KeyError):
+                self.active_base_index = BaseAudioIndex({phone: frozenset() for phone in self.active_base_phones})
+        self.bases_page.base_selected.connect(self._activate_audio_base)
         self.pages.addWidget(self.bases_page)
         root_layout.addWidget(self.pages, 1)
         self.setCentralWidget(root)
@@ -1077,20 +1273,184 @@ class SentryWindow(QMainWindow):
         directory_layout.setSpacing(8)
         directory_title = QLabel("Directorio de grabaciones")
         directory_title.setObjectName("formTitle")
-        directory_help = QLabel("Puede ser una carpeta local, una unidad compartida o una ruta NAS.")
+        directory_help = QLabel(
+            "Elige dónde buscar. Local y NAS leen la carpeta directamente; Issabel consulta solo "
+            "los días y teléfonos de la base activa."
+        )
         directory_help.setObjectName("pageSubtitle")
-        directory_row = QHBoxLayout()
-        self.config_directory = QLineEdit(r"C:\Grabaciones\Llamadas_Entrantes")
+        directory_help.setWordWrap(True)
+        source_row = QHBoxLayout()
+        source_label = QLabel("ORIGEN")
+        source_label.setObjectName("fieldLabel")
+        self.audio_source = QComboBox()
+        self.audio_source.addItem("Carpeta local", "local")
+        self.audio_source.addItem("NAS / carpeta compartida", "nas")
+        self.audio_source.addItem("Issabel / SFTP", "issabel")
+        saved_source = self.database.settings().get("audio_source", "local")
+        source_index = self.audio_source.findData(saved_source)
+        self.audio_source.setCurrentIndex(max(0, source_index))
+        source_label.setBuddy(self.audio_source)
+        source_row.addWidget(source_label)
+        source_row.addWidget(self.audio_source, 1)
+
+        self.local_directory_row = QWidget()
+        directory_row = QHBoxLayout(self.local_directory_row)
+        directory_row.setContentsMargins(0, 0, 0, 0)
+        self.config_directory = QLineEdit(
+            self.database.settings().get("audio_directory", "")
+        )
+        self.config_directory.setPlaceholderText(r"C:\Grabaciones\Llamadas_Entrantes")
         directory_title.setBuddy(self.config_directory)
-        choose = QPushButton("Examinar…")
+        choose = QPushButton("Examinar local…")
         choose.setObjectName("secondaryButton")
-        choose.clicked.connect(self._choose_directory)
+        choose.clicked.connect(lambda: self._choose_source_directory("local"))
         directory_row.addWidget(self.config_directory, 1)
         directory_row.addWidget(choose)
+
+        self.nas_directory_row = QWidget()
+        nas_row = QHBoxLayout(self.nas_directory_row)
+        nas_row.setContentsMargins(0, 0, 0, 0)
+        self.nas_directory = QLineEdit(self.database.settings().get("nas_directory", ""))
+        self.nas_directory.setPlaceholderText(r"\\servidor\grabaciones o una unidad de red")
+        self.nas_directory.setAccessibleName("Carpeta de grabaciones del NAS")
+        nas_choose = QPushButton("Examinar NAS…")
+        nas_choose.setObjectName("secondaryButton")
+        nas_choose.clicked.connect(lambda: self._choose_source_directory("nas"))
+        nas_row.addWidget(self.nas_directory, 1)
+        nas_row.addWidget(nas_choose)
+
+        self.issabel_source_note = QLabel(
+            "Se descargan únicamente los audios que coinciden por teléfono y fecha con Hoja1."
+        )
+        self.issabel_source_note.setObjectName("apiStatus")
+        self.issabel_source_note.setWordWrap(True)
         directory_layout.addWidget(directory_title)
         directory_layout.addWidget(directory_help)
-        directory_layout.addLayout(directory_row)
+        directory_layout.addLayout(source_row)
+        directory_layout.addWidget(self.local_directory_row)
+        directory_layout.addWidget(self.nas_directory_row)
+        directory_layout.addWidget(self.issabel_source_note)
+        self.audio_source.currentIndexChanged.connect(self._source_changed)
+        self._source_changed()
         outer.addWidget(directory)
+
+        remote = QFrame()
+        remote.setObjectName("contentPanel")
+        remote_layout = QVBoxLayout(remote)
+        remote_layout.setContentsMargins(20, 18, 20, 18)
+        remote_layout.setSpacing(10)
+        remote_title = QLabel("Servidor de grabaciones (WinSCP / SFTP)")
+        remote_title.setObjectName("formTitle")
+        remote_help = QLabel(
+            "Usa los mismos tres datos con los que inicias sesión en WinSCP. Sentry utilizará "
+            "el puerto estándar 22, abrirá la carpeta inicial y validará la huella SSH automáticamente."
+        )
+        remote_help.setObjectName("pageSubtitle")
+        remote_help.setWordWrap(True)
+        remote_layout.addWidget(remote_title)
+        remote_layout.addWidget(remote_help)
+
+        remote_fields = QGridLayout()
+        remote_fields.setHorizontalSpacing(12)
+        remote_fields.setVerticalSpacing(7)
+        self.remote_host = QLineEdit()
+        self.remote_host.setPlaceholderText("IP del servidor")
+        self.remote_host.setAccessibleName("IP o servidor SFTP")
+        self.remote_port = QLineEdit("22")
+        self.remote_port.setAccessibleName("Puerto SFTP")
+        self.remote_username = QLineEdit()
+        self.remote_username.setText("root")
+        self.remote_username.setPlaceholderText("root")
+        self.remote_username.setAccessibleName("Usuario de WinSCP")
+        self.remote_password = QLineEdit()
+        self.remote_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.remote_password.setPlaceholderText("Contraseña")
+        self.remote_password.setAccessibleName("Contraseña de WinSCP")
+        self.remote_path = QLineEdit("/var/spool/asterisk/monitor/2026/")
+        self.remote_path.setPlaceholderText("/grabaciones")
+        self.remote_path.setAccessibleName("Carpeta remota")
+        self.remote_fingerprint = QLineEdit()
+        self.remote_fingerprint.setAccessibleName("Huella SSH del servidor")
+
+        for column, (label_text, field) in enumerate(
+            (("IP DEL SERVIDOR", self.remote_host), ("USUARIO", self.remote_username))
+        ):
+            label = QLabel(label_text)
+            label.setObjectName("fieldLabel")
+            label.setBuddy(field)
+            remote_fields.addWidget(label, 0, column)
+            remote_fields.addWidget(field, 1, column)
+        password_label = QLabel("CONTRASEÑA")
+        password_label.setObjectName("fieldLabel")
+        password_label.setBuddy(self.remote_password)
+        remote_fields.addWidget(password_label, 2, 0, 1, 2)
+        password_row = QHBoxLayout()
+        password_row.setSpacing(7)
+        password_row.addWidget(self.remote_password, 1)
+        self.remote_password_toggle = QPushButton("Mostrar")
+        self.remote_password_toggle.setObjectName("secondaryButton")
+        self.remote_password_toggle.setCheckable(True)
+        self.remote_password_toggle.toggled.connect(
+            lambda visible: self._set_secret_visibility(
+                self.remote_password, self.remote_password_toggle, visible
+            )
+        )
+        password_row.addWidget(self.remote_password_toggle)
+        remote_fields.addLayout(password_row, 3, 0, 1, 2)
+
+        connect_row = QHBoxLayout()
+        connect_row.addStretch()
+        self.remote_test_button = QPushButton("Conectar servidor")
+        self.remote_test_button.setObjectName("validateButton")
+        self.remote_test_button.clicked.connect(lambda: self._start_winscp_action("connect"))
+        connect_row.addWidget(self.remote_test_button)
+        remote_fields.addLayout(connect_row, 4, 0, 1, 2)
+        remote_fields.setColumnStretch(0, 1)
+        remote_fields.setColumnStretch(1, 1)
+        remote_layout.addLayout(remote_fields)
+        self.remote_status = QLabel("Sin configurar")
+        self.remote_status.setObjectName("apiStatus")
+        self.remote_status.setProperty("state", "idle")
+        self.remote_status.setWordWrap(True)
+        remote_layout.addWidget(self.remote_status)
+
+        remote_search_label = QLabel("BUSCAR AUDIOS EN ISSABEL")
+        remote_search_label.setObjectName("fieldLabel")
+        self.remote_search_input = QLineEdit()
+        self.remote_search_input.setPlaceholderText("Número de teléfono o parte del nombre del archivo")
+        self.remote_search_input.setAccessibleName("Buscar audios en Issabel")
+        remote_search_label.setBuddy(self.remote_search_input)
+        remote_search_row = QHBoxLayout()
+        remote_search_row.setSpacing(7)
+        remote_search_row.addWidget(self.remote_search_input, 1)
+        self.remote_search_button = QPushButton("Buscar")
+        self.remote_search_button.setObjectName("secondaryButton")
+        self.remote_search_button.setEnabled(False)
+        self.remote_search_button.clicked.connect(self._start_remote_search)
+        self.remote_search_input.returnPressed.connect(self._start_remote_search)
+        remote_search_row.addWidget(self.remote_search_button)
+        remote_layout.addWidget(remote_search_label)
+        remote_layout.addLayout(remote_search_row)
+        self.remote_results = QListWidget()
+        self.remote_results.setObjectName("remoteResults")
+        self.remote_results.setAccessibleName("Archivos encontrados en Issabel")
+        self.remote_results.setMinimumHeight(105)
+        self.remote_results.setMaximumHeight(190)
+        self.remote_results.setAlternatingRowColors(True)
+        self.remote_results.itemClicked.connect(
+            lambda item: self._show_toast(f"Ubicación: {item.data(Qt.ItemDataRole.UserRole)}")
+        )
+        remote_layout.addWidget(self.remote_results)
+        self.remote_search_status = QLabel("Conecta el servidor para buscar dentro de sus carpetas.")
+        self.remote_search_status.setObjectName("apiStatus")
+        self.remote_search_status.setProperty("state", "idle")
+        self.remote_search_status.setWordWrap(True)
+        remote_layout.addWidget(self.remote_search_status)
+        for field in (
+            self.remote_host, self.remote_username, self.remote_password,
+        ):
+            field.textChanged.connect(self._mark_remote_dirty)
+        outer.addWidget(remote)
 
         keywords = QFrame()
         keywords.setObjectName("contentPanel")
@@ -1316,6 +1676,215 @@ class SentryWindow(QMainWindow):
             saved += 1
         return saved
 
+    def _remote_config(self) -> dict[str, str]:
+        return {
+            "host": self.remote_host.text().strip(),
+            "port": self.remote_port.text().strip() or "22",
+            "username": self.remote_username.text().strip(),
+            "password": self.remote_password.text(),
+            "remote_path": self.remote_path.text().strip() or "/",
+            "fingerprint": self.remote_fingerprint.text().strip(),
+        }
+
+    def _restore_remote_connection(self) -> None:
+        try:
+            saved = self.database.remote_connection()
+            if not saved:
+                return
+            fields = (
+                (self.remote_host, saved["host"]),
+                (self.remote_port, str(saved["port"])),
+                (self.remote_username, saved["username"]),
+                (self.remote_password, unprotect(saved["encrypted_password"])),
+                (self.remote_path, saved["remote_path"]),
+                (self.remote_fingerprint, saved["host_fingerprint"]),
+            )
+            for field, value in fields:
+                field.blockSignals(True)
+                field.setText(value)
+                field.blockSignals(False)
+            self._set_api_status(
+                self.remote_status,
+                "Configuración cifrada recuperada · prueba la conexión antes de buscar grabaciones.",
+                "idle",
+            )
+            self.remote_search_button.setEnabled(True)
+            self._set_api_status(
+                self.remote_search_status,
+                f"Busca recursivamente en {saved['remote_path']}",
+                "idle",
+            )
+        except (SecretStoreError, sqlite3.Error, OSError, KeyError) as exc:
+            self._set_api_status(self.remote_status, f"No se pudo recuperar la conexión: {exc}", "error")
+
+    def _persist_remote_connection(self) -> int:
+        config = self._remote_config()
+        identifying = (config["host"], config["password"], config["fingerprint"])
+        if not any(identifying):
+            return 0
+        missing = [
+            label for label, value in (
+                ("IP o servidor", config["host"]),
+                ("usuario", config["username"]),
+                ("contraseña", config["password"]),
+                ("huella SSH", config["fingerprint"]),
+            ) if not value
+        ]
+        if missing == ["huella SSH"]:
+            raise ValueError("Pulsa Conectar servidor antes de guardar la conexión WinSCP.")
+        if missing:
+            raise ValueError(f"Completa la conexión WinSCP: {', '.join(missing)}.")
+        try:
+            port = int(config["port"])
+        except ValueError as exc:
+            raise ValueError("El puerto SFTP debe ser un número entre 1 y 65535.") from exc
+        if not 1 <= port <= 65535:
+            raise ValueError("El puerto SFTP debe estar entre 1 y 65535.")
+        self.database.save_remote_connection(
+            config["host"], port, config["username"], protect(config["password"]),
+            config["remote_path"], config["fingerprint"],
+        )
+        return 1
+
+    def _mark_remote_dirty(self) -> None:
+        if self.winscp_worker is None and hasattr(self, "remote_status"):
+            self._set_api_status(self.remote_status, "Cambios pendientes de probar y guardar", "idle")
+
+    def _set_winscp_busy(self, busy: bool) -> None:
+        for control in (
+            self.remote_host, self.remote_username, self.remote_password,
+            self.remote_password_toggle, self.remote_test_button,
+        ):
+            control.setEnabled(not busy)
+
+    def _start_winscp_action(self, mode: str) -> None:
+        if self.winscp_worker is not None:
+            return
+        config = self._remote_config()
+        self._set_winscp_busy(True)
+        action = "Obteniendo la huella SSH" if mode == "fingerprint" else "Conectando con WinSCP"
+        self._set_api_status(self.remote_status, f"{action}…", "loading")
+        self.winscp_worker = WinSCPWorker(mode, config, self)
+        self.winscp_worker.succeeded.connect(self._winscp_succeeded)
+        self.winscp_worker.failed.connect(self._winscp_failed)
+        self.winscp_worker.finished.connect(self._winscp_finished)
+        self.winscp_worker.start()
+
+    def _winscp_succeeded(self, mode: str, result: str) -> None:
+        if mode == "fingerprint":
+            self.remote_fingerprint.setText(result)
+            self._set_api_status(
+                self.remote_status,
+                "Huella obtenida. Verifícala con el administrador del servidor y luego prueba la conexión.",
+                "valid",
+            )
+            self._show_toast("Huella SSH obtenida; verifícala antes de conectar")
+            return
+        if mode == "connect":
+            self.remote_fingerprint.blockSignals(True)
+            self.remote_fingerprint.setText(result)
+            self.remote_fingerprint.blockSignals(False)
+        try:
+            self._persist_remote_connection()
+        except (ValueError, SecretStoreError, sqlite3.Error, OSError) as exc:
+            self._set_api_status(self.remote_status, f"Conectó, pero no se pudo guardar: {exc}", "error")
+            return
+        self._set_api_status(
+            self.remote_status,
+            f"Conexión correcta · credenciales cifradas · huella {self.remote_fingerprint.text()}",
+            "valid",
+        )
+        self.remote_search_button.setEnabled(True)
+        self._set_api_status(
+            self.remote_search_status,
+            f"Listo para buscar recursivamente en {self.remote_path.text()}",
+            "valid",
+        )
+        self._show_toast("Servidor WinSCP conectado y guardado de forma segura")
+
+    def _winscp_failed(self, error: str) -> None:
+        self._set_api_status(self.remote_status, f"No se pudo conectar: {error}", "error")
+        self._show_toast(f"WinSCP: {error}")
+
+    def _winscp_finished(self) -> None:
+        worker = self.winscp_worker
+        self.winscp_worker = None
+        self._set_winscp_busy(False)
+        if worker is not None:
+            worker.deleteLater()
+
+    def _start_remote_search(self) -> None:
+        if self.remote_search_worker is not None:
+            return
+        query = self.remote_search_input.text().strip()
+        if len(query) < 3:
+            self._set_api_status(
+                self.remote_search_status,
+                "Escribe al menos 3 caracteres del teléfono o del nombre del archivo.",
+                "error",
+            )
+            self.remote_search_input.setFocus()
+            return
+        config = self._remote_config()
+        try:
+            if not config["fingerprint"]:
+                raise ValueError("Conecta primero el servidor de Issabel.")
+        except ValueError as exc:
+            self._set_api_status(self.remote_search_status, str(exc), "error")
+            return
+        directories = issabel_directories(config["remote_path"], self.active_base_index.dates)
+        if directories:
+            config["remote_paths"] = directories
+            config["recursive"] = False
+        self.remote_search_input.setEnabled(False)
+        self.remote_search_button.setEnabled(False)
+        self.remote_results.clear()
+        self._set_api_status(
+            self.remote_search_status,
+            (
+                f"Buscando “{query}” en {len(directories)} carpeta(s) correspondientes a las fechas de la base…"
+                if directories else f"Buscando “{query}” en todas las carpetas de Issabel…"
+            ),
+            "loading",
+        )
+        self.remote_search_worker = RemoteSearchWorker(config, query, self)
+        self.remote_search_worker.succeeded.connect(self._remote_search_succeeded)
+        self.remote_search_worker.failed.connect(self._remote_search_failed)
+        self.remote_search_worker.finished.connect(self._remote_search_finished)
+        self.remote_search_worker.start()
+
+    def _remote_search_succeeded(self, results: object) -> None:
+        files = results if isinstance(results, list) else []
+        for result in files:
+            if not isinstance(result, dict):
+                continue
+            path = str(result.get("path", ""))
+            size = int(result.get("size", 0) or 0)
+            modified = str(result.get("modified", ""))
+            item = QListWidgetItem(f"{Path(path).name}  ·  {size / 1024:.1f} KB  ·  {modified}")
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setToolTip(path)
+            self.remote_results.addItem(item)
+        count = self.remote_results.count()
+        message = (
+            f"{count} archivo{'s' if count != 1 else ''} encontrado{'s' if count != 1 else ''}. "
+            "Selecciona uno para ver su ubicación completa."
+            if count else "No se encontraron audios con ese número o nombre."
+        )
+        self._set_api_status(self.remote_search_status, message, "valid" if count else "idle")
+
+    def _remote_search_failed(self, error: str) -> None:
+        self._set_api_status(self.remote_search_status, f"No se pudo buscar: {error}", "error")
+        self._show_toast(f"Issabel: {error}")
+
+    def _remote_search_finished(self) -> None:
+        worker = self.remote_search_worker
+        self.remote_search_worker = None
+        self.remote_search_input.setEnabled(True)
+        self.remote_search_button.setEnabled(bool(self.remote_fingerprint.text().strip()))
+        if worker is not None:
+            worker.deleteLater()
+
     def _mark_api_dirty(self, service: str) -> None:
         _provider, _model, _key, button, status = self._api_controls(service)
         if button.isEnabled():
@@ -1473,6 +2042,28 @@ class SentryWindow(QMainWindow):
         self.pages.setCurrentIndex(page_index)
         for name, button in self.nav_buttons.items():
             button.setChecked(name == key)
+
+    def _activate_audio_base(self, path: str, phones: object) -> None:
+        self.active_base_path = Path(path).resolve()
+        try:
+            self.active_base_index = load_hoja1_audio_index(self.active_base_path)
+        except (OSError, ValueError, KeyError) as exc:
+            self._show_toast(f"No se pudo leer teléfono y fecha de Hoja1: {exc}")
+            return
+        self.active_base_phones = self.active_base_index.phones
+        if not self.active_base_phones:
+            self._show_toast("La base seleccionada no contiene teléfonos en Hoja1")
+            return
+        if self._source_key() != "issabel" and not self._selected_directory():
+            self._show_toast("Base seleccionada. Configura ahora la carpeta del origen elegido")
+            self._switch_page("config")
+            (self.nas_directory if self._source_key() == "nas" else self.config_directory).setFocus()
+            return
+        self._switch_page("audit")
+        self._show_toast(
+            f"Buscando {len(self.active_base_phones):,} teléfonos en {len(self.active_base_index.dates):,} fecha(s)"
+        )
+        self._scan_directory()
 
     def _filter_calls(self) -> None:
         query = self.search_input.text().strip().casefold()
@@ -1791,44 +2382,100 @@ class SentryWindow(QMainWindow):
         self._show_toast(f"Evidencia localizada en {format_time(self.current_call.hit_second)}")
 
     def _choose_directory(self) -> None:
-        selected = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta de grabaciones", self.config_directory.text())
+        source = self._source_key()
+        if source == "issabel":
+            self._switch_page("config")
+            self.remote_search_input.setFocus()
+            self._show_toast("Issabel usa la conexión SFTP configurada")
+            return
+        self._choose_source_directory(source)
+
+    def _source_key(self) -> str:
+        return str(self.audio_source.currentData()) if hasattr(self, "audio_source") else "local"
+
+    def _selected_directory(self) -> str:
+        return self.nas_directory.text().strip() if self._source_key() == "nas" else self.config_directory.text().strip()
+
+    def _choose_source_directory(self, source: str) -> None:
+        field = self.nas_directory if source == "nas" else self.config_directory
+        caption = "Seleccionar carpeta del NAS" if source == "nas" else "Seleccionar carpeta local"
+        selected = QFileDialog.getExistingDirectory(self, caption, field.text())
         if not selected:
             return
         normalized = selected.replace("/", "\\")
-        self.config_directory.setText(normalized)
+        field.setText(normalized)
         self._set_directory_display(normalized)
-        self._show_toast("Directorio actualizado")
+        self._show_toast("Carpeta del NAS actualizada" if source == "nas" else "Carpeta local actualizada")
+
+    def _source_changed(self) -> None:
+        source = self._source_key()
+        self.local_directory_row.setVisible(source == "local")
+        self.nas_directory_row.setVisible(source == "nas")
+        self.issabel_source_note.setVisible(source == "issabel")
+        if source == "issabel":
+            self._set_directory_display("Issabel")
+            if hasattr(self, "scan_button"):
+                self.scan_button.setToolTip("Buscar y descargar coincidencias desde Issabel")
+                self.scan_button.setAccessibleName("Buscar audios en Issabel")
+        else:
+            self._set_directory_display(self._selected_directory())
+            if hasattr(self, "scan_button"):
+                label = "Escanear NAS" if source == "nas" else "Escanear carpeta local"
+                self.scan_button.setToolTip(label)
+                self.scan_button.setAccessibleName(label)
 
     def _set_directory_display(self, directory: str) -> None:
-        self.directory_label.setText(Path(directory).name if directory else "Sin directorio")
+        source = self._source_key()
+        if source == "issabel":
+            self.directory_label.setText("Issabel")
+            self.directory_label.setToolTip("/var/spool/asterisk/monitor/2026/")
+            return
+        label = "NAS" if source == "nas" and directory else Path(directory).name if directory else "Sin directorio"
+        self.directory_label.setText(label)
         self.directory_label.setToolTip(directory or "No se ha configurado una carpeta")
 
     def _save_settings(self) -> None:
-        directory = self.config_directory.text().strip()
+        source = self._source_key()
+        directory = self._selected_directory()
         keywords = [word.strip() for word in self.keywords_input.text().split(",") if word.strip()]
-        if not directory:
-            self._show_toast("Selecciona un directorio antes de guardar")
-            self.config_directory.setFocus()
+        if source != "issabel" and not directory:
+            self._show_toast("Selecciona una carpeta para el origen elegido")
+            (self.nas_directory if source == "nas" else self.config_directory).setFocus()
             return
         if not keywords:
             self._show_toast("Agrega al menos un término sensible")
             self.keywords_input.setFocus()
             return
-        self._set_directory_display(directory)
+        self._set_directory_display(directory if source != "issabel" else "Issabel")
         try:
-            self.database.save_settings({"audio_directory": directory, "keywords": ", ".join(keywords)})
+            self.database.save_settings({
+                "audio_directory": self.config_directory.text().strip(),
+                "nas_directory": self.nas_directory.text().strip(),
+                "audio_source": source,
+                "keywords": ", ".join(keywords),
+            })
             api_count = self._persist_credentials()
-        except (SecretStoreError, sqlite3.Error, OSError) as exc:
+            remote_count = self._persist_remote_connection()
+        except (ValueError, SecretStoreError, sqlite3.Error, OSError) as exc:
             self._show_toast(f"No se pudieron guardar los ajustes: {exc}")
             return
-        self._show_toast(f"Ajustes guardados · {api_count}/2 claves protegidas por Windows")
+        remote_note = " · WinSCP protegido" if remote_count else ""
+        self._show_toast(f"Ajustes guardados · {api_count}/2 claves API protegidas{remote_note}")
 
     def _scan_directory(self) -> None:
-        directory_text = self.config_directory.text().strip()
+        if self.active_base_path is None or not self.active_base_phones:
+            self._show_toast("Selecciona primero en Bases el Excel transformado que deseas relacionar")
+            self._switch_page("bases")
+            return
+        source = self._source_key()
+        if source == "issabel":
+            self._start_issabel_match()
+            return
+        directory_text = self._selected_directory()
         if not directory_text:
-            self._show_toast("Selecciona un directorio antes de escanear")
+            self._show_toast("Selecciona una carpeta antes de escanear")
             self._switch_page("config")
-            self.config_directory.setFocus()
+            (self.nas_directory if source == "nas" else self.config_directory).setFocus()
             return
 
         self.scan_button.setEnabled(False)
@@ -1837,9 +2484,73 @@ class SentryWindow(QMainWindow):
         # ponytail: el escaneo síncrono basta para esta etapa; mover a un hilo si un NAS grande bloquea la interfaz.
         QTimer.singleShot(0, lambda: self._finish_scan(directory))
 
+    def _start_issabel_match(self) -> None:
+        if self.issabel_match_worker is not None:
+            return
+        config = self._remote_config()
+        if not config["fingerprint"] or not config["password"]:
+            self._show_toast("Conecta primero Issabel desde Configuración")
+            self._switch_page("config")
+            return
+        if not self.active_base_index.dates:
+            self._show_toast("La base activa no contiene fechas válidas en Hoja1")
+            return
+        base_name = re.sub(r"[^A-Za-z0-9._-]+", "_", self.active_base_path.stem)[:80]
+        destination = Path(__file__).resolve().parents[3] / "data" / "remote_audio" / base_name
+        self.scan_button.setEnabled(False)
+        self.analyze_button.setEnabled(False)
+        self.scan_button.setToolTip("Buscando por teléfono y fecha en Issabel…")
+        self._show_toast(
+            f"Issabel: revisando {len(self.active_base_index.dates)} carpeta(s) de fecha, no todo el año"
+        )
+        self.issabel_match_worker = IssabelMatchWorker(
+            config, self.active_base_index, destination, self
+        )
+        self.issabel_match_worker.succeeded.connect(self._issabel_match_succeeded)
+        self.issabel_match_worker.failed.connect(self._issabel_match_failed)
+        self.issabel_match_worker.finished.connect(self._issabel_match_finished)
+        self.issabel_match_worker.start()
+
+    def _issabel_match_succeeded(self, result: object) -> None:
+        payload = result if isinstance(result, dict) else {}
+        paths = [Path(path) for path in payload.get("paths", [])]
+        if not paths:
+            checked = int(payload.get("candidate_count", 0) or 0)
+            self._show_toast(
+                f"Issabel: se revisaron {checked} audios en las fechas de la base y no hubo teléfonos coincidentes"
+            )
+            self._show_empty_state(
+                "No se encontraron coincidencias en Issabel",
+                "Se buscaron teléfono y fecha exactos de Hoja1 dentro de las carpetas correspondientes.",
+            )
+            return
+        self._finish_scan(paths[0].parent)
+
+    def _issabel_match_failed(self, error: str) -> None:
+        self._show_toast(f"No se pudo emparejar con Issabel: {error}")
+
+    def _issabel_match_finished(self) -> None:
+        worker = self.issabel_match_worker
+        self.issabel_match_worker = None
+        self.scan_button.setEnabled(True)
+        self.analyze_button.setEnabled(True)
+        self._source_changed()
+        if worker is not None:
+            worker.deleteLater()
+
     def _finish_scan(self, directory: Path) -> None:
         try:
-            self.detected_audio_files = scan_audio_files(directory)
+            roots = dated_local_directories(directory, self.active_base_index.dates)
+            detected = {
+                path
+                for root in roots
+                for path in scan_audio_files(
+                    root,
+                    self.active_base_phones if self.active_base_path is not None else None,
+                    self.active_base_index.phone_dates if self.active_base_path is not None else None,
+                )
+            }
+            self.detected_audio_files = tuple(sorted(detected, key=lambda path: str(path).casefold()))
         except FileNotFoundError:
             message = "La carpeta seleccionada no existe"
         except NotADirectoryError:
@@ -1851,7 +2562,10 @@ class SentryWindow(QMainWindow):
             records = [call_record_from_audio(path, index) for index, path in enumerate(self.detected_audio_files, 1)]
             try:
                 self.database.register_calls(records)
-                self.database.save_settings({"audio_directory": str(directory)})
+                if self._source_key() == "local":
+                    self.database.save_settings({"audio_directory": str(directory)})
+                elif self._source_key() == "nas":
+                    self.database.save_settings({"nas_directory": str(directory)})
             except (sqlite3.Error, OSError) as exc:
                 self.scan_button.setEnabled(True)
                 self.scan_button.setToolTip("Escanear carpeta")
@@ -1869,12 +2583,14 @@ class SentryWindow(QMainWindow):
                 self.call_list.setCurrentRow(0)
             else:
                 self._show_empty_state(
-                    "No se encontraron audios",
-                    "La carpeta no contiene archivos WAV o MP3. Elige otra carpeta o vuelve a escanear.",
+                    "No se encontraron coincidencias",
+                    "No hay audios q- cuyo teléfono aparezca en Hoja1 de la base seleccionada.",
                 )
             self._filter_calls()
             noun = "audio encontrado" if count == 1 else "audios encontrados"
-            message = f"Escaneo completado · {count} {noun}"
+            base_note = f" · base {self.active_base_path.name}" if self.active_base_path else ""
+            source_label = {"local": "local", "nas": "NAS", "issabel": "Issabel"}.get(self._source_key(), "")
+            message = f"Escaneo {source_label} completado · {count} {noun}{base_note}"
         self.scan_button.setEnabled(True)
         self.scan_button.setToolTip("Escanear carpeta")
         self._show_toast(message)
@@ -2045,13 +2761,31 @@ class SentryWindow(QMainWindow):
         self._position_toast()
 
     def closeEvent(self, event) -> None:
+        if self.winscp_worker is not None:
+            self._show_toast("Espera a que termine la prueba de conexión antes de cerrar Sentry")
+            event.ignore()
+            return
+        if self.remote_search_worker is not None:
+            self._show_toast("Espera a que termine la búsqueda en Issabel antes de cerrar Sentry")
+            event.ignore()
+            return
+        if self.issabel_match_worker is not None:
+            self._show_toast("Espera a que termine el emparejamiento y la descarga desde Issabel")
+            event.ignore()
+            return
         try:
             directory = self.config_directory.text().strip()
             keywords = self.keywords_input.text().strip()
             if directory and keywords:
-                self.database.save_settings({"audio_directory": directory, "keywords": keywords})
+                self.database.save_settings({
+                    "audio_directory": directory,
+                    "nas_directory": self.nas_directory.text().strip(),
+                    "audio_source": self._source_key(),
+                    "keywords": keywords,
+                })
             self._persist_credentials()
-        except (SecretStoreError, sqlite3.Error, OSError):
+            self._persist_remote_connection()
+        except (ValueError, SecretStoreError, sqlite3.Error, OSError):
             pass
         if hasattr(self, "bases_page") and self.bases_page.busy:
             self._show_toast("Espera a que termine el procesamiento de bases antes de cerrar Sentry")

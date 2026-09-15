@@ -36,6 +36,13 @@ CREATE TABLE IF NOT EXISTS api_credentials (
     provider TEXT NOT NULL, model TEXT NOT NULL, encrypted_key TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS remote_connection (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    host TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 22,
+    username TEXT NOT NULL, encrypted_password TEXT NOT NULL,
+    remote_path TEXT NOT NULL DEFAULT '/', host_fingerprint TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS transcription_cache (
     cache_key TEXT PRIMARY KEY, transcript_json TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -74,7 +81,7 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version > 2:
+            if version > 3:
                 raise RuntimeError("La base de datos pertenece a una versión más nueva de Sentry.")
             connection.executescript(SCHEMA)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(calls)")}
@@ -91,7 +98,7 @@ class Database:
             connection.execute("UPDATE calls SET status='ERROR', analysis_error="
                                "'El análisis fue interrumpido al cerrar la aplicación.' "
                                "WHERE status IN ('TRANSFIRIENDO','ANALIZANDO')")
-            connection.execute("PRAGMA user_version=2")
+            connection.execute("PRAGMA user_version=3")
 
     @contextmanager
     def connect(self):
@@ -109,7 +116,10 @@ class Database:
             return dict(connection.execute("SELECT key,value FROM app_settings").fetchall())
 
     def save_settings(self, values: dict[str, str]):
-        allowed = {"audio_directory", "keywords", "base_output_folder"}
+        allowed = {
+            "audio_directory", "nas_directory", "audio_source", "keywords",
+            "base_output_folder", "audio_filter_base",
+        }
         if set(values) - allowed:
             raise ValueError("Solo se permiten ajustes locales sin credenciales.")
         with self.connect() as connection:
@@ -137,6 +147,22 @@ class Database:
     def credentials(self):
         with self.connect() as connection:
             return {row["service"]: dict(row) for row in connection.execute("SELECT * FROM api_credentials")}
+
+    def save_remote_connection(self, host: str, port: int, username: str, encrypted_password: str,
+                               remote_path: str, host_fingerprint: str):
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT INTO remote_connection(id,host,port,username,encrypted_password,remote_path,host_fingerprint) "
+                "VALUES (1,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET host=excluded.host,port=excluded.port,"
+                "username=excluded.username,encrypted_password=excluded.encrypted_password,"
+                "remote_path=excluded.remote_path,host_fingerprint=excluded.host_fingerprint,updated_at=CURRENT_TIMESTAMP",
+                (host, int(port), username, encrypted_password, remote_path, host_fingerprint),
+            )
+
+    def remote_connection(self):
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM remote_connection WHERE id=1").fetchone()
+            return dict(row) if row else None
 
     def call_rows(self, paths=None):
         with self.connect() as connection:

@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.database import Database
-from app.services.base_conversion import process_bases
+from app.services.base_conversion import load_hoja1_phones, process_bases
 from scripts.transformar_base import BaseError, DEFAULT_STATE, default_output, normalize_base_number
 
 
@@ -34,6 +34,8 @@ class ConversionWorker(QThread):
 
 class BasesPage(QWidget):
     """Vista nativa: no lanza Tkinter ni duplica las reglas del transformador."""
+    base_selected = Signal(str, object)
+
     def __init__(self, database: Database, parent=None):
         super().__init__(parent)
         self.database = database
@@ -41,6 +43,8 @@ class BasesPage(QWidget):
         self.worker = None
         self.busy = False
         self.result_path = None
+        self.active_base_path: Path | None = None
+        self.active_phones: set[str] = set()
         self.setObjectName("basesPage")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -145,13 +149,21 @@ class BasesPage(QWidget):
         self.status.setTextFormat(Qt.TextFormat.PlainText)
         self.status.setWordWrap(True)
         form.addWidget(self.status)
+        self.active_base = QLabel("Base activa para grabaciones: ninguna")
+        self.active_base.setObjectName("pageSubtitle")
+        self.active_base.setWordWrap(True)
+        self.active_base.setTextFormat(Qt.TextFormat.PlainText)
+        form.addWidget(self.active_base)
         actions = QHBoxLayout()
         self.process_button = self.button("Procesar y guardar Excel", self.start_conversion, "primaryButton")
+        self.use_base_button = self.button("Usar base para buscar audios", self.use_result_for_audio)
         self.open_button = self.button("Abrir resultado", self.open_result)
         self.open_folder_button = self.button("Abrir carpeta", self.open_folder)
+        self.use_base_button.setEnabled(False)
         self.open_button.setEnabled(False)
         self.open_folder_button.setEnabled(False)
         actions.addWidget(self.process_button)
+        actions.addWidget(self.use_base_button)
         actions.addStretch()
         actions.addWidget(self.open_button)
         actions.addWidget(self.open_folder_button)
@@ -191,6 +203,7 @@ class BasesPage(QWidget):
         self.base_number.textChanged.connect(self.preview_name)
         self.output_folder.textChanged.connect(self.preview_name)
         self.refresh_history()
+        self.restore_active_base()
 
     @staticmethod
     def button(text, callback, style="secondaryButton"):
@@ -214,6 +227,7 @@ class BasesPage(QWidget):
             self.files_list.addItem(path.name)
             self.files_list.item(self.files_list.count() - 1).setToolTip(str(path))
         self.result_path = None
+        self.use_base_button.setEnabled(False)
         self.open_button.setEnabled(False)
         self.open_folder_button.setEnabled(False)
         self.preview_name()
@@ -263,6 +277,7 @@ class BasesPage(QWidget):
             control.setEnabled(False)
         self.open_button.setEnabled(False)
         self.open_folder_button.setEnabled(False)
+        self.use_base_button.setEnabled(False)
         self.progress.show()
         self.status.setText("Procesando bases… Puedes seguir trabajando en Auditoría.")
         self.worker = ConversionWorker(self.database, list(self.paths), folder, options, self)
@@ -291,6 +306,7 @@ class BasesPage(QWidget):
             control.setEnabled(True)
         self.refresh_history()
         exists = self.result_path is not None and self.result_path.is_file()
+        self.use_base_button.setEnabled(exists)
         self.open_button.setEnabled(exists)
         self.open_folder_button.setEnabled(exists)
         self.worker.deleteLater()
@@ -320,8 +336,48 @@ class BasesPage(QWidget):
             path = self.jobs[row]["output_path"]
             self.result_path = Path(path) if path else None
             exists = self.result_path is not None and self.result_path.is_file()
+            self.use_base_button.setEnabled(exists)
             self.open_button.setEnabled(exists)
             self.open_folder_button.setEnabled(exists)
+
+    def restore_active_base(self):
+        selected = self.database.settings().get("audio_filter_base", "")
+        if not selected:
+            return
+        path = Path(selected)
+        try:
+            phones = load_hoja1_phones(path)
+        except (OSError, ValueError, KeyError):
+            self.active_base.setText("Base activa para grabaciones: no disponible")
+            self.active_base.setToolTip(str(path))
+            return
+        self._set_active_base(path, phones)
+
+    def use_result_for_audio(self):
+        if self.result_path is None:
+            self.status.setText("Selecciona primero un resultado generado o una fila del historial.")
+            return
+        try:
+            phones = load_hoja1_phones(self.result_path)
+            if not phones:
+                raise ValueError("Hoja1 no contiene teléfonos para relacionar con grabaciones.")
+            self.database.save_settings({"audio_filter_base": str(self.result_path.resolve())})
+        except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
+            self.status.setText(f"No se pudo usar la base para buscar audios: {exc}")
+            return
+        self._set_active_base(self.result_path, phones)
+        self.status.setText(
+            f"Base seleccionada · {len(phones):,} teléfonos únicos. Buscando coincidencias en la carpeta de grabaciones…"
+        )
+        self.base_selected.emit(str(self.active_base_path), set(self.active_phones))
+
+    def _set_active_base(self, path: Path, phones: set[str]):
+        self.active_base_path = Path(path).resolve()
+        self.active_phones = set(phones)
+        self.active_base.setText(
+            f"Base activa para grabaciones: {self.active_base_path.name} · {len(self.active_phones):,} teléfonos"
+        )
+        self.active_base.setToolTip(str(self.active_base_path))
 
     def open_result(self):
         if self.result_path is not None:

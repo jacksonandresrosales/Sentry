@@ -198,12 +198,15 @@ Los paneles usan radios de 8–10px; campos y botones, 7px; chips, 5px. Las fila
 - El foco usa un borde verde oscuro visible; los placeholders mantienen contraste legible.
 - Las credenciales usan campos enmascarados con una acción textual Mostrar/Ocultar y no se persisten sin un almacén protegido.
 - La validación conserva el formulario estable, deshabilita temporalmente sus controles y comunica carga, éxito o recuperación junto al campo correspondiente.
+- La conexión WinSCP/SFTP se presenta como un panel de Configuración reducido a IP, usuario y contraseña enmascarada, con una sola acción **Conectar servidor**. Puerto 22, carpeta inicial y huella SSH se resuelven internamente; el éxito siempre se comunica con texto y la contraseña se persiste únicamente cifrada con DPAPI.
+- El mismo panel ofrece una búsqueda remota por teléfono o nombre. Los resultados mantienen una lista compacta con nombre, tamaño y fecha; la ruta completa aparece como ayuda y al seleccionar el archivo, sin introducir una navegación de carpetas separada.
+- El origen de grabaciones es una selección explícita entre Local, NAS e Issabel. El control mantiene una sola acción de escaneo en la cabecera; su etiqueta accesible y ayuda cambian con el origen. El emparejamiento siempre usa teléfono y fecha de `Hoja1`, y el origen Issabel informa que descarga únicamente coincidencias.
 
 ### Navigation
 
 La navegación es una fila compacta. La vista activa usa fondo verde suave y texto verde oscuro; las vistas inactivas permanecen blancas con texto gris.
 
-El acceso **Bases** vive inmediatamente al lado del directorio en la cabecera, con el mismo control de navegación y estado seleccionado. Su vista mantiene paneles planos, una sola acción primaria, opciones avanzadas desplegables e historial tabular. El progreso solo aparece durante una conversión; el estado inicial no muestra una barra activa.
+El acceso **Bases** vive inmediatamente al lado del directorio en la cabecera, con el mismo control de navegación y estado seleccionado. Su vista mantiene paneles planos, una sola acción primaria, opciones avanzadas desplegables e historial tabular. El progreso solo aparece durante una conversión; el estado inicial no muestra una barra activa. El resultado o una ejecución del historial puede activarse para relacionar `Hoja1` con las grabaciones; la vista comunica el nombre de la base activa y la cantidad de teléfonos cargados.
 
 ### Línea de tiempo de evidencia
 

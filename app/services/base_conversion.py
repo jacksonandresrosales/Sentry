@@ -1,9 +1,93 @@
 """El mismo motor del script, con registro transaccional de sus resultados."""
+from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
+import re
+from xml.etree.ElementTree import ParseError
+from zipfile import BadZipFile
 import openpyxl
+from openpyxl.utils.exceptions import InvalidFileException
 
 from app.database import Database
-from scripts.transformar_base import convert_files
+from scripts.transformar_base import cell_text, convert_files, normalize
+
+
+def normalize_phone_number(value) -> str:
+    digits = re.sub(r"\D", "", cell_text(value))
+    if digits.startswith("593") and len(digits) == 12:
+        digits = "0" + digits[3:]
+    elif len(digits) == 9 and digits.startswith("9"):
+        digits = "0" + digits
+    return digits
+
+
+def normalize_call_date(value) -> str:
+    """Convierte la fecha de Hoja1 a AAAAMMDD, como aparece en el audio."""
+    if isinstance(value, datetime):
+        return value.strftime("%Y%m%d")
+    if isinstance(value, date):
+        return value.strftime("%Y%m%d")
+    text = cell_text(value).strip()
+    for pattern in (
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y",
+        "%Y%m%d%H%M%S", "%Y%m%d",
+    ):
+        try:
+            return datetime.strptime(text, pattern).strftime("%Y%m%d")
+        except ValueError:
+            continue
+    match = re.search(r"\b(20\d{2})[-/]?(0[1-9]|1[0-2])[-/]?([0-2]\d|3[01])\b", text)
+    return "".join(match.groups()) if match else ""
+
+
+@dataclass(frozen=True)
+class BaseAudioIndex:
+    phone_dates: dict[str, frozenset[str]]
+
+    @property
+    def phones(self) -> set[str]:
+        return set(self.phone_dates)
+
+    @property
+    def dates(self) -> set[str]:
+        return {day for days in self.phone_dates.values() for day in days}
+
+
+def load_hoja1_audio_index(path: Path) -> BaseAudioIndex:
+    """Lee teléfonos y fechas de Hoja1 para emparejar teléfono + día."""
+    path = Path(path).resolve()
+    if not path.is_file() or path.suffix.casefold() != ".xlsx":
+        raise ValueError("Selecciona un Excel transformado que todavía exista.")
+    try:
+        book = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    except (OSError, BadZipFile, InvalidFileException, ParseError) as exc:
+        raise ValueError(f"No se pudo leer el Excel transformado: {exc}") from exc
+    try:
+        if "Hoja1" not in book.sheetnames:
+            raise ValueError("El Excel seleccionado no contiene la hoja Hoja1.")
+        sheet = book["Hoja1"]
+        if normalize(sheet.cell(1, 1).value) != "telefono":
+            raise ValueError("Hoja1 no tiene la columna Teléfono en la primera posición.")
+        phone_dates: dict[str, set[str]] = {}
+        for phone_value, _state, _agent, date_value in sheet.iter_rows(
+            min_row=2, min_col=1, max_col=4, values_only=True
+        ):
+            phone = normalize_phone_number(phone_value)
+            if not phone:
+                continue
+            phone_dates.setdefault(phone, set())
+            day = normalize_call_date(date_value)
+            if day:
+                phone_dates[phone].add(day)
+        return BaseAudioIndex({phone: frozenset(days) for phone, days in phone_dates.items()})
+    finally:
+        book.close()
+
+
+def load_hoja1_phones(path: Path) -> set[str]:
+    """Lee como identificadores los teléfonos únicos de Hoja1."""
+    return load_hoja1_audio_index(path).phones
 
 
 def process_bases(database: Database, paths: list[Path], output_folder: Path, **options):

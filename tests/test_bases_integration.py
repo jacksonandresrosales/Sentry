@@ -7,12 +7,13 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+import openpyxl
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 from app.database import Database
-from app.services.base_conversion import process_bases
+from app.services.base_conversion import load_hoja1_audio_index, load_hoja1_phones, normalize_phone_number, process_bases
 from app.ui.views.main_window import SentryWindow
 from scripts.transformar_base import DEFAULT_STATE
 
@@ -37,6 +38,11 @@ class DatabaseTests(unittest.TestCase):
             make_csv(source)
             result = process_bases(database, [source], folder)
             self.assertEqual((result.filtered, result.unique), (2, 1))
+            self.assertEqual(load_hoja1_phones(result.output), {"0990000001"})
+            audio_index = load_hoja1_audio_index(result.output)
+            self.assertEqual(audio_index.phone_dates, {"0990000001": frozenset({"20260701"})})
+            self.assertEqual(audio_index.dates, {"20260701"})
+            self.assertEqual(normalize_phone_number("+593 990 000 001"), "0990000001")
             database = Database(database.path)
             self.assertEqual(database.jobs()[0]["status"], "COMPLETADO")
             self.assertEqual(database.jobs()[0]["read_count"], 2)
@@ -77,6 +83,16 @@ class DatabaseTests(unittest.TestCase):
             result = process_bases(database, [source], folder, state="NO COINCIDE")
             self.assertEqual(result.unique, 0)
             self.assertEqual(database.jobs()[0]["status"], "COMPLETADO")
+
+    def test_audio_base_requires_hoja1(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "sin-hoja1.xlsx"
+            book = openpyxl.Workbook()
+            book.active.title = "Datos"
+            book.save(path)
+            book.close()
+            with self.assertRaisesRegex(ValueError, "Hoja1"):
+                load_hoja1_phones(path)
 
     def test_history_failure_keeps_generated_excel(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -141,6 +157,11 @@ class BasesUiTests(unittest.TestCase):
                 self.assertEqual(first.name, "base_DB_delete_B1.xlsx")
                 self.assertIn("2 filtrados", page.status.text())
                 self.assertEqual(page.history.rowCount(), 1)
+                self.assertTrue(page.use_base_button.isEnabled())
+                page.use_result_for_audio()
+                self.assertEqual(page.active_phones, {"0990000001"})
+                self.assertEqual(window.active_base_phones, {"0990000001"})
+                self.assertEqual(window.database.settings()["audio_filter_base"], str(first))
                 page.start_conversion()
                 self.wait_for_conversion(page)
                 self.assertEqual(page.result_path.name, "base_DB_delete_B2.xlsx")
@@ -161,6 +182,7 @@ class BasesUiTests(unittest.TestCase):
             try:
                 self.assertEqual(reopened.bases_page.history.rowCount(), 2)
                 self.assertEqual(reopened.bases_page.output_folder.text(), str(folder))
+                self.assertEqual(reopened.active_base_phones, {"0990000001"})
                 reopened.bases_page.history.selectRow(1)
                 self.assertEqual(reopened.bases_page.result_path, first)
             finally:

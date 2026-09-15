@@ -12,7 +12,11 @@ from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import QApplication, QFrame, QLabel, QLineEdit, QPushButton
 
 from app.services.audio_analysis import assign_roles
-from app.ui.views.main_window import CallRecord, SentryWindow, TranscriptLine, install_ui_font, scan_audio_files
+from app.secret_store import unprotect
+from app.ui.views.main_window import (
+    CallRecord, SentryWindow, TranscriptLine, audio_filename_metadata, audio_phone_from_filename, call_record_from_audio,
+    call_record_from_row, dated_local_directories, install_ui_font, issabel_directories, scan_audio_files,
+)
 
 
 class SentryWindowSmokeTest(unittest.TestCase):
@@ -120,7 +124,7 @@ class SentryWindowSmokeTest(unittest.TestCase):
         self.assertEqual(self.window.nav_buttons["config"].text(), "")
         self.assertEqual(self.window.nav_buttons["config"].accessibleName(), "Configuración")
         self.assertEqual(self.window.scan_button.text(), "")
-        self.assertEqual(self.window.scan_button.accessibleName(), "Escanear carpeta")
+        self.assertEqual(self.window.scan_button.accessibleName(), "Escanear carpeta local")
         self.assertEqual(self.window.directory_label.text(), "Sin directorio")
         self.assertEqual(self.window.directory_label.toolTip(), "No se ha configurado una carpeta")
         self.assertIn("QComboBox::down-arrow", self.window.styleSheet())
@@ -140,6 +144,37 @@ class SentryWindowSmokeTest(unittest.TestCase):
 
         button_labels = {button.text() for button in self.window.findChildren(QPushButton)}
         self.assertNotIn("Escalar a supervisión", button_labels)
+
+    def test_winscp_connection_is_masked_encrypted_and_restored(self) -> None:
+        self.assertEqual(self.window.remote_password.echoMode(), QLineEdit.EchoMode.Password)
+        self.window.remote_host.setText("192.0.2.10")
+        self.window.remote_port.setText("22")
+        self.window.remote_username.setText("jeremy")
+        self.window.remote_password.setText("secreto-local")
+        self.window.remote_path.setText("/grabaciones")
+        self.window.remote_fingerprint.setText("ssh-ed25519 255 SHA256:huella-prueba")
+
+        self.assertEqual(self.window._persist_remote_connection(), 1)
+        stored = self.window.database.remote_connection()
+        self.assertIsNotNone(stored)
+        self.assertNotEqual(stored["encrypted_password"], "secreto-local")
+        self.assertEqual(unprotect(stored["encrypted_password"]), "secreto-local")
+
+        self.window.remote_password.clear()
+        self.window._restore_remote_connection()
+        self.assertEqual(self.window.remote_password.text(), "secreto-local")
+        self.assertIn("Configuración cifrada recuperada", self.window.remote_status.text())
+        self.assertTrue(self.window.remote_search_button.isEnabled())
+
+        self.window._remote_search_succeeded([{
+            "path": "/var/spool/asterisk/monitor/2026/09/q-000-0990000001.wav",
+            "name": "q-000-0990000001.wav",
+            "size": 16000,
+            "modified": "2026-09-15 10:30:00",
+        }])
+        self.assertEqual(self.window.remote_results.count(), 1)
+        self.assertIn("q-000-0990000001.wav", self.window.remote_results.item(0).text())
+        self.assertIn("1 archivo encontrado", self.window.remote_search_status.text())
 
     def test_model_catalogs_are_normalized(self) -> None:
         deepgram = {"stt": [{"name": "general", "canonical_name": "nova-3-general"}]}
@@ -164,6 +199,55 @@ class SentryWindowSmokeTest(unittest.TestCase):
         ]}
         speakers = [item["speaker"] for item in assign_roles(transcript)["segments"]]
         self.assertEqual(speakers, ["Cliente", "Asesor", "Cliente", "Asesor"])
+
+    def test_filename_date_and_time_are_restored_from_sqlite(self) -> None:
+        path = Path(self.temp.name) / "q-000-0964220551-20260528-162746-1780003653.920447.wav"
+        with wave.open(str(path), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(8000)
+            audio.writeframes(b"\0\0" * 8000)
+
+        self.assertEqual(audio_filename_metadata(path), ("096***0551", "16:27:46"))
+        detected = call_record_from_audio(path, 1)
+        self.assertEqual(detected.clock, "16:27:46")
+        self.window.database.register_calls([detected])
+        restored = call_record_from_row(self.window.database.call_rows([path])[0])
+        self.assertEqual(restored.clock, "16:27:46")
+        self.assertEqual(restored.customer, "096***0551")
+
+    def test_base_phone_filter_accepts_only_matching_q_audio(self) -> None:
+        folder = Path(self.temp.name) / "audios"
+        folder.mkdir()
+        matching = folder / "q-000-0990000001-20260528-162746-1.wav"
+        other_phone = folder / "q-000-0990000002-20260528-162746-2.wav"
+        wrong_prefix = folder / "x-000-0990000001-20260528-162746-3.wav"
+        for path in (matching, other_phone, wrong_prefix):
+            path.touch()
+
+        self.assertEqual(audio_phone_from_filename(matching), "0990000001")
+        self.assertIsNone(audio_phone_from_filename(wrong_prefix))
+        self.assertEqual(scan_audio_files(folder, {"0990000001"}), (matching,))
+        self.assertEqual(
+            scan_audio_files(folder, phone_dates={"0990000001": frozenset({"20260528"})}),
+            (matching,),
+        )
+        self.assertEqual(scan_audio_files(folder, phone_dates={"0990000001": frozenset({"20260529"})}), ())
+
+    def test_local_nas_and_issabel_sources_use_date_folders(self) -> None:
+        root = Path(self.temp.name) / "recordings"
+        expected = root / "2026" / "07" / "06"
+        expected.mkdir(parents=True)
+        self.assertEqual(dated_local_directories(root, {"20260706"}), (expected,))
+        self.assertEqual(
+            issabel_directories("/var/spool/asterisk/monitor/2026/", {"20260706"}),
+            ["/var/spool/asterisk/monitor/2026/07/06/"],
+        )
+        self.assertEqual(self.window.audio_source.count(), 3)
+        self.assertEqual(
+            [self.window.audio_source.itemData(index) for index in range(self.window.audio_source.count())],
+            ["local", "nas", "issabel"],
+        )
 
     def test_directory_scan_finds_supported_audio_recursively(self) -> None:
         root = Path.cwd() / ".tmp" / "scan-audio-test"

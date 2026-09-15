@@ -24,7 +24,7 @@ También puedes abrirla desde PowerShell:
 En este equipo Windows puedes ejecutar el lanzador desde la carpeta del proyecto. Utiliza Python y las dependencias incluidas con Codex si están disponibles:
 
 ```powershell
-.\scripts\transformar_base.cmd "C:\Users\JEREMY GODOY\Downloads\CAMP26 MC JUL S2 B1.csv"
+.\scripts\transformar_base.cmd "C:\Bases\CAMP26 MC JUL S2 B1.csv"
 ```
 
 Sin argumentos abre la mini aplicación:
@@ -42,7 +42,7 @@ python -m pip install -r scripts/requirements.txt
 Convierte una base:
 
 ```powershell
-python scripts/transformar_base.py "C:\Users\JEREMY GODOY\Downloads\CAMP26 MC JUL S2 B1.csv"
+python scripts/transformar_base.py "C:\Bases\CAMP26 MC JUL S2 B1.csv"
 ```
 
 Sin argumentos abre una ventana para seleccionar uno o varios CSV/Excel:
