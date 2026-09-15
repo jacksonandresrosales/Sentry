@@ -5,6 +5,7 @@ import json
 import os
 import re
 import wave
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -23,7 +24,10 @@ from app.ui.theme import (
 )
 from app.ui.views.bases_page import BasesPage
 
-from PySide6.QtCore import QByteArray, QEasingCurve, QRectF, QSize, Qt, QThread, QTimer, QUrl, QVariantAnimation, Signal
+from PySide6.QtCore import (
+    QByteArray, QEasingCurve, QPoint, QRectF, QSize, Qt, QThread, QTimer, QUrl,
+    QVariantAnimation, Signal,
+)
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
@@ -54,6 +58,16 @@ from PySide6.QtWidgets import (
 PALETTE = dict(theme_colors(DEFAULT_THEME))
 
 AUDIO_SUFFIXES = {".mp3", ".wav"}
+_CATEGORY_PIXMAPS: dict[str, QPixmap] = {}
+
+
+def category_pixmap(name: str) -> QPixmap:
+    pixmap = _CATEGORY_PIXMAPS.get(name)
+    if pixmap is None:
+        path = Path(__file__).resolve().parents[1] / "assets" / name
+        pixmap = QIcon(str(path)).pixmap(14, 14)
+        _CATEGORY_PIXMAPS[name] = pixmap
+    return pixmap
 
 
 def audio_phone_from_filename(path: Path) -> str | None:
@@ -193,15 +207,11 @@ def format_time(seconds: int) -> str:
     return f"{minutes:02d}:{remaining:02d}"
 
 
-def audio_filename_metadata(path: Path) -> tuple[str, str]:
+def audio_filename_metadata(path: Path, stat_fallback: bool = True) -> tuple[str, str]:
     """Obtiene teléfono anonimizado y hora desde q-000-teléfono-AAAAMMDD-HHMMSS."""
     parts = path.stem.split("-")
     raw_phone = audio_phone_from_filename(path)
     customer = f"{raw_phone[:3]}***{raw_phone[-4:]}" if raw_phone else "Sin identificar"
-    try:
-        clock = datetime.fromtimestamp(path.stat().st_mtime).strftime("%H:%M:%S")
-    except OSError:
-        clock = "--:--:--"
     if len(parts) >= 5 and parts[0].casefold() == "q" and parts[1].isdigit() and len(parts[1]) == 3:
         _phone, raw_date, raw_time = parts[2:5]
         try:
@@ -209,8 +219,25 @@ def audio_filename_metadata(path: Path) -> tuple[str, str]:
         except ValueError:
             pass
         else:
-            clock = parsed.strftime("%H:%M:%S")
-    return customer, clock
+            return customer, parsed.strftime("%H:%M:%S")
+    if not stat_fallback:
+        return customer, "--:--:--"
+    try:
+        return customer, datetime.fromtimestamp(path.stat().st_mtime).strftime("%H:%M:%S")
+    except OSError:
+        return customer, "--:--:--"
+
+
+def audio_sort_timestamp(path: Path | None) -> float:
+    if path is None:
+        return 0
+    parts = path.stem.split("-")
+    if len(parts) >= 5:
+        try:
+            return datetime.strptime(parts[3] + parts[4], "%Y%m%d%H%M%S").timestamp()
+        except ValueError:
+            pass
+    return 0
 
 
 def call_record_from_audio(path: Path, call_id: int) -> CallRecord:
@@ -244,6 +271,37 @@ def call_record_from_audio(path: Path, call_id: int) -> CallRecord:
     )
 
 
+def collect_audio_records(
+    directory: Path,
+    index: BaseAudioIndex | None = None,
+    preselected_paths: list[Path] | tuple[Path, ...] | None = None,
+) -> tuple[tuple[Path, ...], list[CallRecord]]:
+    """Localiza y lee metadatos sin tocar widgets; es seguro ejecutarlo en segundo plano."""
+    directory = Path(directory)
+    if preselected_paths is None:
+        roots = dated_local_directories(directory, index.dates if index is not None else set())
+        detected = {
+            path
+            for root in roots
+            for path in scan_audio_files(
+                root,
+                index.phones if index is not None else None,
+                index.phone_dates if index is not None else None,
+            )
+        }
+    else:
+        detected = {
+            Path(path)
+            for path in preselected_paths
+            if Path(path).is_file()
+            and Path(path).suffix.casefold() in AUDIO_SUFFIXES
+            and (index is None or audio_matches_index(Path(path), index))
+        }
+    paths = tuple(sorted(detected, key=lambda path: str(path).casefold()))
+    records = [call_record_from_audio(path, position) for position, path in enumerate(paths, 1)]
+    return paths, records
+
+
 def call_record_from_row(row: dict) -> CallRecord:
     category = row.get("category") or "PENDIENTE"
     if row.get("status") == "ERROR":
@@ -269,7 +327,12 @@ def call_record_from_row(row: dict) -> CallRecord:
         segments.append(TranscriptLine(round(float(item.get("second", 0))), str(item.get("speaker", "Hablante")),
                                        str(item.get("text", "")), critical, word_seconds))
     path = Path(row["file_path"])
-    customer, clock = audio_filename_metadata(path)
+    customer, clock = audio_filename_metadata(path, stat_fallback=False)
+    if clock == "--:--:--":
+        try:
+            clock = datetime.fromisoformat(str(row.get("created_at", ""))).strftime("%H:%M:%S")
+        except ValueError:
+            pass
     risk = row.get("risk_level") or ("Pendiente" if category == "PENDIENTE" else "Bajo")
     labels = {"ALERTA": "Alerta sensible", "BUZON": "Buzón / sin conversación",
               "NORMAL": "Llamada normal", "PENDIENTE": "Pendiente", "ERROR": "Error"}
@@ -319,6 +382,44 @@ class AnalysisWorker(QThread):
             finally:
                 self.progress.emit(index, len(self.paths), Path(path).name)
         self.completed.emit(completed, failures, self._stop)
+
+
+class LocalScanWorker(QThread):
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        directory: Path,
+        index: BaseAudioIndex | None,
+        source: str,
+        preselected_paths: list[Path] | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.directory = Path(directory)
+        self.index = index
+        self.source = source
+        self.preselected_paths = list(preselected_paths) if preselected_paths is not None else None
+
+    def run(self):
+        try:
+            paths, records = collect_audio_records(self.directory, self.index, self.preselected_paths)
+        except FileNotFoundError:
+            self.failed.emit("La carpeta seleccionada no existe.")
+        except NotADirectoryError:
+            self.failed.emit("La ruta seleccionada no es una carpeta.")
+        except OSError as exc:
+            self.failed.emit(f"No se pudo leer la carpeta seleccionada: {exc}")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit({
+                "directory": self.directory,
+                "paths": paths,
+                "records": records,
+                "source": self.source,
+            })
 
 
 class WinSCPWorker(QThread):
@@ -626,7 +727,7 @@ class CallCard(QFrame):
         if icon_name:
             icon = QLabel()
             icon.setObjectName("classificationIcon")
-            icon.setPixmap(QIcon(str(Path(__file__).resolve().parents[1] / "assets" / icon_name)).pixmap(14, 14))
+            icon.setPixmap(category_pixmap(icon_name))
             badge_layout.addWidget(icon)
         badge_text = QLabel(tag_text or classification_labels.get(classification, call.keyword.capitalize()))
         badge_text.setObjectName("classificationText")
@@ -687,10 +788,14 @@ class SentryWindow(QMainWindow):
         self.current_second = 0
         self.current_duration = 0
         self.call_cards: dict[int, CallCard] = {}
+        self.call_items: dict[int, QListWidgetItem] = {}
+        self.call_search_cache: dict[int, str] = {}
+        self.selected_call_id: int | None = None
         self.nav_buttons: dict[str, QPushButton] = {}
         self.critical_line: QWidget | None = None
         self.transcript_rows: list[tuple[TranscriptLine, TranscriptRow, QLabel]] = []
         self.active_transcript_index = -1
+        self.active_heard_words = -1
         self.sort_mode = "original"
         self.sort_label = "original"
         self.active_base_path: Path | None = None
@@ -698,6 +803,7 @@ class SentryWindow(QMainWindow):
         self.active_base_index = BaseAudioIndex({})
         self.network = QNetworkAccessManager(self)
         self.analysis_worker: AnalysisWorker | None = None
+        self.local_scan_worker: LocalScanWorker | None = None
         self.winscp_worker: WinSCPWorker | None = None
         self.remote_search_worker: RemoteSearchWorker | None = None
         self.issabel_match_worker: IssabelMatchWorker | None = None
@@ -763,11 +869,7 @@ class SentryWindow(QMainWindow):
         self.bases_page = BasesPage(self.database)
         self.active_base_path = self.bases_page.active_base_path
         self.active_base_phones = set(self.bases_page.active_phones)
-        if self.active_base_path is not None:
-            try:
-                self.active_base_index = load_hoja1_audio_index(self.active_base_path)
-            except (OSError, ValueError, KeyError):
-                self.active_base_index = BaseAudioIndex({phone: frozenset() for phone in self.active_base_phones})
+        self.active_base_index = self.bases_page.active_index
         self.bases_page.base_selected.connect(self._activate_audio_base)
         self.pages.addWidget(self.bases_page)
         root_layout.addWidget(self.pages, 1)
@@ -992,9 +1094,11 @@ class SentryWindow(QMainWindow):
         self.call_list.setObjectName("callList")
         self.call_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.call_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.call_list.setUniformItemSizes(True)
         self.call_list.setSpacing(0)
         self.call_list.setContentsMargins(0, 0, 0, 0)
         self.call_list.currentItemChanged.connect(self._on_call_selected)
+        self.call_list.verticalScrollBar().valueChanged.connect(self._materialize_visible_cards)
         self._populate_call_list()
         layout.addWidget(self.call_list, 1)
         return panel
@@ -1002,30 +1106,82 @@ class SentryWindow(QMainWindow):
     def _populate_call_list(self) -> None:
         self._apply_call_sort()
         self.call_list.blockSignals(True)
+        self.call_list.setUpdatesEnabled(False)
         try:
             self.call_list.clear()
             self.call_cards.clear()
+            self.call_items.clear()
+            self.call_search_cache = {
+                call.call_id: self._searchable_call_text(call) for call in self.call_records
+            }
             for call in self.call_records:
                 item = QListWidgetItem()
                 item.setData(Qt.ItemDataRole.UserRole, call.call_id)
-                card = CallCard(call)
+                item.setText(call.filename)
                 item.setSizeHint(QSize(0, 100))
-                card.clicked.connect(self._select_call_by_id)
-                self.call_cards[call.call_id] = card
                 self.call_list.addItem(item)
-                self.call_list.setItemWidget(item, card)
+                self.call_items[call.call_id] = item
+            for row in range(min(60, len(self.call_records))):
+                self._materialize_call_card(row)
         finally:
             self.call_list.blockSignals(False)
+            self.call_list.setUpdatesEnabled(True)
         count = len(self.call_records)
         self.call_count.setText(f"{count} {'llamada' if count == 1 else 'llamadas'}")
+        QTimer.singleShot(0, self._materialize_visible_cards)
+
+    def _materialize_call_card(self, row: int) -> CallCard | None:
+        if row < 0 or row >= self.call_list.count():
+            return None
+        item = self.call_list.item(row)
+        call_id = item.data(Qt.ItemDataRole.UserRole)
+        existing = self.call_cards.get(call_id)
+        if existing is not None:
+            return existing
+        call = self.calls.get(call_id)
+        if call is None:
+            call = next((record for record in self.call_records if record.call_id == call_id), None)
+        if call is None:
+            return None
+        card = CallCard(call)
+        card.clicked.connect(self._select_call_by_id)
+        card.set_selected(call_id == self.selected_call_id)
+        self.call_cards[call_id] = card
+        self.call_list.setItemWidget(item, card)
+        return card
+
+    def _materialize_visible_cards(self, _value: int | None = None) -> None:
+        if not hasattr(self, "call_list") or not self.call_list.count():
+            return
+        first = self.call_list.indexAt(QPoint(2, 2)).row()
+        last = self.call_list.indexAt(QPoint(2, max(2, self.call_list.viewport().height() - 2))).row()
+        if first < 0:
+            first = 0
+        if last < first:
+            last = min(self.call_list.count() - 1, first + 20)
+        kept_ids: set[int] = set()
+        for row in range(max(0, first - 5), min(self.call_list.count(), last + 11)):
+            if not self.call_list.item(row).isHidden():
+                self._materialize_call_card(row)
+                kept_ids.add(self.call_list.item(row).data(Qt.ItemDataRole.UserRole))
+        if self.selected_call_id is not None:
+            kept_ids.add(self.selected_call_id)
+        for call_id, card in tuple(self.call_cards.items()):
+            if call_id in kept_ids:
+                continue
+            item = self.call_items.get(call_id)
+            if item is not None:
+                self.call_list.removeItemWidget(item)
+            card.deleteLater()
+            self.call_cards.pop(call_id, None)
+
+    @staticmethod
+    def _searchable_call_text(call: CallRecord) -> str:
+        return (
+            f"{call.filename} {call.customer} {call.keyword} {' '.join(call.tags)} {call.snippet}"
+        ).casefold()
 
     def _apply_call_sort(self) -> None:
-        def modified(call: CallRecord) -> float:
-            try:
-                return call.source_path.stat().st_mtime if call.source_path else 0
-            except OSError:
-                return 0
-
         if self.sort_mode == "priority":
             priorities = {
                 term.strip().casefold(): index
@@ -1045,9 +1201,9 @@ class SentryWindow(QMainWindow):
         elif self.sort_mode == "duration_asc":
             self.call_records.sort(key=lambda call: (call.duration, call.call_id))
         elif self.sort_mode == "newest":
-            self.call_records.sort(key=lambda call: (-modified(call), call.call_id))
+            self.call_records.sort(key=lambda call: (-audio_sort_timestamp(call.source_path), call.call_id))
         elif self.sort_mode == "oldest":
-            self.call_records.sort(key=lambda call: (modified(call), call.call_id))
+            self.call_records.sort(key=lambda call: (audio_sort_timestamp(call.source_path), call.call_id))
         elif self.sort_mode == "name":
             self.call_records.sort(key=lambda call: (call.filename.casefold(), call.call_id))
         else:
@@ -1457,7 +1613,7 @@ class SentryWindow(QMainWindow):
         self.remote_password.setEchoMode(QLineEdit.EchoMode.Password)
         self.remote_password.setPlaceholderText("Contraseña")
         self.remote_password.setAccessibleName("Contraseña de WinSCP")
-        self.remote_path = QLineEdit("/var/spool/asterisk/monitor/2026/")
+        self.remote_path = QLineEdit("/var/spool/asterisk/monitor/")
         self.remote_path.setPlaceholderText("/grabaciones")
         self.remote_path.setAccessibleName("Carpeta remota")
         self.remote_fingerprint = QLineEdit()
@@ -1802,7 +1958,7 @@ class SentryWindow(QMainWindow):
             self.remote_search_button.setEnabled(True)
             self._set_api_status(
                 self.remote_search_status,
-                f"Busca recursivamente en {saved['remote_path']}",
+                f"Servidor listo en {saved['remote_path']} · con una base activa se consultan solo sus fechas",
                 "idle",
             )
         except (SecretStoreError, sqlite3.Error, OSError, KeyError) as exc:
@@ -1888,7 +2044,7 @@ class SentryWindow(QMainWindow):
         self.remote_search_button.setEnabled(True)
         self._set_api_status(
             self.remote_search_status,
-            f"Listo para buscar recursivamente en {self.remote_path.text()}",
+            f"Servidor listo en {self.remote_path.text()} · con una base activa se consultan solo sus fechas",
             "valid",
         )
         self._show_toast("Servidor WinSCP conectado y guardado de forma segura")
@@ -2134,13 +2290,16 @@ class SentryWindow(QMainWindow):
         for name, button in self.nav_buttons.items():
             button.setChecked(name == key)
 
-    def _activate_audio_base(self, path: str, phones: object) -> None:
+    def _activate_audio_base(self, path: str, index_payload: object) -> None:
         self.active_base_path = Path(path).resolve()
-        try:
-            self.active_base_index = load_hoja1_audio_index(self.active_base_path)
-        except (OSError, ValueError, KeyError) as exc:
-            self._show_toast(f"No se pudo leer teléfono y fecha de Hoja1: {exc}")
-            return
+        if isinstance(index_payload, BaseAudioIndex):
+            self.active_base_index = index_payload
+        else:
+            try:
+                self.active_base_index = load_hoja1_audio_index(self.active_base_path)
+            except (OSError, ValueError, KeyError) as exc:
+                self._show_toast(f"No se pudo leer teléfono y fecha de Hoja1: {exc}")
+                return
         self.active_base_phones = self.active_base_index.phones
         if not self.active_base_phones:
             self._show_toast("La base seleccionada no contiene teléfonos en Hoja1")
@@ -2162,7 +2321,10 @@ class SentryWindow(QMainWindow):
         visible = 0
         first_visible: QListWidgetItem | None = None
         for row, call in enumerate(self.call_records):
-            searchable = f"{call.filename} {call.customer} {call.keyword} {' '.join(call.tags)} {call.snippet}".casefold()
+            searchable = self.call_search_cache.get(call.call_id)
+            if searchable is None:
+                searchable = self._searchable_call_text(call)
+                self.call_search_cache[call.call_id] = searchable
             matches_query = not query or query in searchable
             matches_status = (
                 status == "all"
@@ -2181,14 +2343,21 @@ class SentryWindow(QMainWindow):
         current = self.call_list.currentItem()
         if (current is None or current.isHidden()) and first_visible is not None:
             self.call_list.setCurrentItem(first_visible)
+        QTimer.singleShot(0, self._materialize_visible_cards)
 
     def _on_call_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
-        for card in self.call_cards.values():
-            card.set_selected(False)
+        previous_id = _previous.data(Qt.ItemDataRole.UserRole) if _previous is not None else self.selected_call_id
+        previous_card = self.call_cards.get(previous_id)
+        if previous_card is not None:
+            previous_card.set_selected(False)
         if current is None:
+            self.selected_call_id = None
             return
         call_id = current.data(Qt.ItemDataRole.UserRole)
-        self.call_cards[call_id].set_selected(True)
+        self.selected_call_id = call_id
+        card = self.call_cards.get(call_id) or self._materialize_call_card(self.call_list.row(current))
+        if card is not None:
+            card.set_selected(True)
         self._show_call(self.calls[call_id])
 
     def _select_call_by_id(self, call_id: int) -> None:
@@ -2217,6 +2386,7 @@ class SentryWindow(QMainWindow):
         self.jump_button.setEnabled(False)
         self.transcript_rows.clear()
         self.active_transcript_index = -1
+        self.active_heard_words = -1
         self._update_category_metrics()
 
     def _set_analysis_controls_locked(self, locked: bool) -> None:
@@ -2245,6 +2415,7 @@ class SentryWindow(QMainWindow):
         self.current_duration = call.duration
         self.transcript_rows = []
         self.active_transcript_index = -1
+        self.active_heard_words = -1
         source = call.source_path
         has_audio = source is not None and source.is_file()
         self.play_button.setEnabled(has_audio)
@@ -2286,6 +2457,7 @@ class SentryWindow(QMainWindow):
         self.critical_line = None
         self.transcript_rows = []
         self.active_transcript_index = -1
+        self.active_heard_words = -1
         sensitive_terms = tuple(term for term in call.tags if term.strip()) if call.sensitive else ()
         if call.sensitive and not sensitive_terms and call.keyword.strip():
             sensitive_terms = (call.keyword,)
@@ -2350,24 +2522,38 @@ class SentryWindow(QMainWindow):
             terms = tuple(term for term in self.current_call.tags if term.strip())
             if not terms and self.current_call.keyword.strip():
                 terms = (self.current_call.keyword,)
-        for index, (line, row, text_label) in enumerate(self.transcript_rows):
+        active_changed = active != self.active_transcript_index
+        if active >= 0:
+            heard_words = self._heard_word_count(active, position_seconds)
+        else:
+            heard_words = 0
+        if not active_changed and heard_words == self.active_heard_words:
+            if scroll and active >= 0:
+                self.transcript_scroll.ensureWidgetVisible(self.transcript_rows[active][1], 0, 50)
+            return
+        indexes = range(len(self.transcript_rows)) if active_changed else (active,)
+        for index in indexes:
+            if index < 0:
+                continue
+            line, row, text_label = self.transcript_rows[index]
             state = "played" if index < active else "active" if index == active else "upcoming"
             if row.property("playbackState") != state:
                 row.setProperty("playbackState", state)
                 row.style().unpolish(row)
                 row.style().polish(row)
             word_count = len(line.text.split())
-            heard_words = (
+            row_heard_words = (
                 word_count if state == "played"
-                else self._heard_word_count(index, position_seconds) if state == "active"
+                else heard_words if state == "active"
                 else 0
             )
-            progress_html = self._transcript_progress_html(line, heard_words, terms)
+            progress_html = self._transcript_progress_html(line, row_heard_words, terms)
             if text_label.text() != progress_html:
                 text_label.setText(progress_html)
         if scroll and active >= 0 and active != self.active_transcript_index:
             self.transcript_scroll.ensureWidgetVisible(self.transcript_rows[active][1], 0, 50)
         self.active_transcript_index = active
+        self.active_heard_words = heard_words
 
     def _heard_word_count(self, index: int, position_seconds: float) -> int:
         line = self.transcript_rows[index][0]
@@ -2375,7 +2561,7 @@ class SentryWindow(QMainWindow):
         if not word_count:
             return 0
         if line.word_seconds:
-            return min(word_count, sum(timestamp <= position_seconds for timestamp in line.word_seconds))
+            return min(word_count, bisect_right(line.word_seconds, position_seconds))
         next_second = (
             self.transcript_rows[index + 1][0].second
             if index + 1 < len(self.transcript_rows)
@@ -2533,7 +2719,8 @@ class SentryWindow(QMainWindow):
         source = self._source_key()
         if source == "issabel":
             self.directory_label.setText("Issabel")
-            self.directory_label.setToolTip("/var/spool/asterisk/monitor/2026/")
+            remote_path = self.remote_path.text().strip() if hasattr(self, "remote_path") else ""
+            self.directory_label.setToolTip(remote_path or "/var/spool/asterisk/monitor/")
             return
         label = "NAS" if source == "nas" and directory else Path(directory).name if directory else "Sin directorio"
         self.directory_label.setText(label)
@@ -2622,8 +2809,54 @@ class SentryWindow(QMainWindow):
             return
 
         directory = Path(directory_text).expanduser()
-        # ponytail: el escaneo síncrono basta para esta etapa; mover a un hilo si un NAS grande bloquea la interfaz.
-        QTimer.singleShot(0, lambda: self._finish_scan(directory))
+        self._start_local_scan(directory, source=source)
+
+    def _set_scan_busy(self, busy: bool, message: str = "") -> None:
+        self.scan_button.setEnabled(not busy)
+        self.analyze_button.setEnabled(not busy)
+        self.audio_source.setEnabled(not busy)
+        if busy:
+            self.scan_button.setToolTip(message or "Escaneando audios en segundo plano…")
+        else:
+            self._source_changed()
+
+    def _start_local_scan(
+        self,
+        directory: Path,
+        source: str,
+        preselected_paths: list[Path] | None = None,
+    ) -> None:
+        if self.local_scan_worker is not None:
+            return
+        self._set_scan_busy(True, "Leyendo carpetas y metadatos en segundo plano…")
+        source_label = "NAS" if source == "nas" else "Issabel" if source == "issabel" else "carpeta local"
+        self._show_toast(f"Escaneando {source_label} sin bloquear la aplicación…")
+        self.local_scan_worker = LocalScanWorker(
+            directory,
+            self.active_base_index if self.active_base_path is not None else None,
+            source,
+            preselected_paths,
+            self,
+        )
+        self.local_scan_worker.succeeded.connect(self._local_scan_succeeded)
+        self.local_scan_worker.failed.connect(self._local_scan_failed)
+        self.local_scan_worker.finished.connect(self._local_scan_finished)
+        self.local_scan_worker.start()
+
+    def _local_scan_succeeded(self, result: object) -> None:
+        if isinstance(result, dict):
+            self._apply_scan_result(result)
+
+    def _local_scan_failed(self, error: str) -> None:
+        self._show_toast(f"No se pudo completar el escaneo: {error}")
+
+    def _local_scan_finished(self) -> None:
+        worker = self.local_scan_worker
+        self.local_scan_worker = None
+        if self.issabel_match_worker is None:
+            self._set_scan_busy(False)
+        if worker is not None:
+            worker.deleteLater()
 
     def _start_issabel_match(self) -> None:
         if self.issabel_match_worker is not None:
@@ -2638,7 +2871,7 @@ class SentryWindow(QMainWindow):
             return
         base_name = re.sub(r"[^A-Za-z0-9._-]+", "_", self.active_base_path.stem)[:80]
         destination = Path(__file__).resolve().parents[3] / "data" / "remote_audio" / base_name
-        self.analyze_button.setEnabled(False)
+        self._set_scan_busy(True, "Buscando por teléfono y fecha en Issabel…")
         self._show_toast(
             f"Issabel: revisando {len(self.active_base_index.dates)} carpeta(s) de fecha, no todo el año"
         )
@@ -2663,7 +2896,7 @@ class SentryWindow(QMainWindow):
                 "Se buscaron teléfono y fecha exactos de Hoja1 dentro de las carpetas correspondientes.",
             )
             return
-        self._finish_scan(paths[0].parent)
+        self._start_local_scan(paths[0].parent, source="issabel", preselected_paths=paths)
 
     def _issabel_match_failed(self, error: str) -> None:
         self._show_toast(f"No se pudo emparejar con Issabel: {error}")
@@ -2671,24 +2904,18 @@ class SentryWindow(QMainWindow):
     def _issabel_match_finished(self) -> None:
         worker = self.issabel_match_worker
         self.issabel_match_worker = None
-        self.analyze_button.setEnabled(True)
-        self._source_changed()
+        if self.local_scan_worker is None:
+            self._set_scan_busy(False)
         if worker is not None:
             worker.deleteLater()
 
     def _finish_scan(self, directory: Path) -> None:
+        """Ruta síncrona conservada para pruebas y carpetas pequeñas internas."""
         try:
-            roots = dated_local_directories(directory, self.active_base_index.dates)
-            detected = {
-                path
-                for root in roots
-                for path in scan_audio_files(
-                    root,
-                    self.active_base_phones if self.active_base_path is not None else None,
-                    self.active_base_index.phone_dates if self.active_base_path is not None else None,
-                )
-            }
-            self.detected_audio_files = tuple(sorted(detected, key=lambda path: str(path).casefold()))
+            paths, records = collect_audio_records(
+                directory,
+                self.active_base_index if self.active_base_path is not None else None,
+            )
         except FileNotFoundError:
             message = "La carpeta seleccionada no existe"
         except NotADirectoryError:
@@ -2696,38 +2923,51 @@ class SentryWindow(QMainWindow):
         except OSError:
             message = "No se pudo leer la carpeta seleccionada"
         else:
-            count = len(self.detected_audio_files)
-            records = [call_record_from_audio(path, index) for index, path in enumerate(self.detected_audio_files, 1)]
-            try:
-                self.database.register_calls(records)
-                if self._source_key() == "local":
-                    self.database.save_settings({"audio_directory": str(directory)})
-                elif self._source_key() == "nas":
-                    self.database.save_settings({"nas_directory": str(directory)})
-            except (sqlite3.Error, OSError) as exc:
-                self._show_toast(f"No se pudo guardar el escaneo: {exc}")
-                return
-            self.call_records = records
-            stored = self.database.call_rows(self.detected_audio_files)
-            self.call_records = [call_record_from_row(row) for row in stored]
-            self.calls = {call.call_id: call for call in self.call_records}
-            self._populate_call_list()
-            self.search_input.clear()
-            self.status_filter.setCurrentIndex(0)
-            self._update_category_metrics()
-            if self.call_records:
-                self.call_list.setCurrentRow(0)
-            else:
-                self._show_empty_state(
-                    "No se encontraron coincidencias",
-                    "No hay audios q- cuyo teléfono aparezca en Hoja1 de la base seleccionada.",
-                )
-            self._filter_calls()
-            noun = "audio encontrado" if count == 1 else "audios encontrados"
-            base_note = f" · base {self.active_base_path.name}" if self.active_base_path else ""
-            source_label = {"local": "local", "nas": "NAS", "issabel": "Issabel"}.get(self._source_key(), "")
-            message = f"Escaneo {source_label} completado · {count} {noun}{base_note}"
+            self._apply_scan_result({
+                "directory": Path(directory),
+                "paths": paths,
+                "records": records,
+                "source": self._source_key(),
+            })
+            return
+        self.scan_button.setEnabled(True)
+        self.scan_button.setToolTip("Escanear carpeta")
         self._show_toast(message)
+
+    def _apply_scan_result(self, result: dict) -> None:
+        directory = Path(result["directory"])
+        source = str(result.get("source", self._source_key()))
+        self.detected_audio_files = tuple(Path(path) for path in result.get("paths", ()))
+        records = list(result.get("records", ()))
+        try:
+            self.database.register_calls(records)
+            if source == "local":
+                self.database.save_settings({"audio_directory": str(directory)})
+            elif source == "nas":
+                self.database.save_settings({"nas_directory": str(directory)})
+            stored = self.database.call_rows(self.detected_audio_files)
+        except (sqlite3.Error, OSError) as exc:
+            self._show_toast(f"No se pudo guardar el escaneo: {exc}")
+            return
+        self.call_records = [call_record_from_row(row) for row in stored]
+        self.calls = {call.call_id: call for call in self.call_records}
+        self._populate_call_list()
+        self.search_input.clear()
+        self.status_filter.setCurrentIndex(0)
+        self._update_category_metrics()
+        if self.call_records:
+            self.call_list.setCurrentRow(0)
+        else:
+            self._show_empty_state(
+                "No se encontraron coincidencias",
+                "No hay audios q- cuyo teléfono y fecha aparezcan en Hoja1 de la base seleccionada.",
+            )
+        self._filter_calls()
+        count = len(self.detected_audio_files)
+        noun = "audio encontrado" if count == 1 else "audios encontrados"
+        base_note = f" · base {self.active_base_path.name}" if self.active_base_path else ""
+        source_label = {"local": "local", "nas": "NAS", "issabel": "Issabel"}.get(source, "")
+        self._show_toast(f"Escaneo {source_label} completado · {count} {noun}{base_note}")
 
     def _update_category_metrics(self) -> None:
         counts = {name: sum(call.category_code == name for call in self.call_records)
@@ -2789,8 +3029,7 @@ class SentryWindow(QMainWindow):
             self.analyze_button.setText("Deteniendo…")
             self.analyze_button.setAccessibleName("Deteniendo análisis")
             return
-        paths = [call.source_path for call in self.call_records
-                 if call.source_path is not None and call.source_path.is_file()]
+        paths = [call.source_path for call in self.call_records if call.source_path is not None]
         if not paths:
             self._show_toast("Escanea primero una carpeta con audios")
             return
@@ -2816,15 +3055,29 @@ class SentryWindow(QMainWindow):
 
     def _analysis_row_ready(self, row) -> None:
         updated = call_record_from_row(row)
-        self.call_records = [updated if call.source_path == updated.source_path else call for call in self.call_records]
-        self.calls = {call.call_id: call for call in self.call_records}
-        selected_path = self.current_call.source_path if self.current_call else None
-        self._populate_call_list()
+        position = next(
+            (index for index, call in enumerate(self.call_records) if call.source_path == updated.source_path),
+            None,
+        )
+        if position is None:
+            return
+        self.call_records[position] = updated
+        self.calls[updated.call_id] = updated
+        self.call_search_cache[updated.call_id] = self._searchable_call_text(updated)
+        item = self.call_list.item(position)
+        selected = item is self.call_list.currentItem()
+        previous_card = self.call_list.itemWidget(item)
+        if previous_card is not None:
+            self.call_list.removeItemWidget(item)
+            previous_card.deleteLater()
+            self.call_cards.pop(updated.call_id, None)
+        if previous_card is not None or selected:
+            card = self._materialize_call_card(position)
+            if card is not None:
+                card.set_selected(selected)
         self._update_category_metrics()
-        if selected_path:
-            selected = next((call.call_id for call in self.call_records if call.source_path == selected_path), None)
-            if selected is not None:
-                self._select_call_by_id(selected)
+        if selected:
+            self._show_call(updated)
         self._filter_calls()
 
     def _analysis_complete(self, completed: int, failures: int, stopped: bool) -> None:
@@ -2900,6 +3153,10 @@ class SentryWindow(QMainWindow):
         self._position_toast()
 
     def closeEvent(self, event) -> None:
+        if self.local_scan_worker is not None:
+            self._show_toast("Espera a que termine el escaneo local o del NAS antes de cerrar Sentry")
+            event.ignore()
+            return
         if self.winscp_worker is not None:
             self._show_toast("Espera a que termine la prueba de conexión antes de cerrar Sentry")
             event.ignore()

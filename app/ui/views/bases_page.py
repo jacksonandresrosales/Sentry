@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.database import Database
-from app.services.base_conversion import load_hoja1_phones, process_bases
+from app.services.base_conversion import BaseAudioIndex, load_hoja1_audio_index, process_bases
 from scripts.transformar_base import BaseError, DEFAULT_STATE, default_output, normalize_base_number
 
 
@@ -45,6 +45,7 @@ class BasesPage(QWidget):
         self.result_path = None
         self.active_base_path: Path | None = None
         self.active_phones: set[str] = set()
+        self.active_index = BaseAudioIndex({})
         self.setObjectName("basesPage")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -346,34 +347,35 @@ class BasesPage(QWidget):
             return
         path = Path(selected)
         try:
-            phones = load_hoja1_phones(path)
+            index = load_hoja1_audio_index(path)
         except (OSError, ValueError, KeyError):
             self.active_base.setText("Base activa para grabaciones: no disponible")
             self.active_base.setToolTip(str(path))
             return
-        self._set_active_base(path, phones)
+        self._set_active_base(path, index)
 
     def use_result_for_audio(self):
         if self.result_path is None:
             self.status.setText("Selecciona primero un resultado generado o una fila del historial.")
             return
         try:
-            phones = load_hoja1_phones(self.result_path)
-            if not phones:
+            index = load_hoja1_audio_index(self.result_path)
+            if not index.phones:
                 raise ValueError("Hoja1 no contiene teléfonos para relacionar con grabaciones.")
             self.database.save_settings({"audio_filter_base": str(self.result_path.resolve())})
         except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
             self.status.setText(f"No se pudo usar la base para buscar audios: {exc}")
             return
-        self._set_active_base(self.result_path, phones)
+        self._set_active_base(self.result_path, index)
         self.status.setText(
-            f"Base seleccionada · {len(phones):,} teléfonos únicos. Buscando coincidencias en la carpeta de grabaciones…"
+            f"Base seleccionada · {len(index.phones):,} teléfonos únicos. Buscando coincidencias en la carpeta de grabaciones…"
         )
-        self.base_selected.emit(str(self.active_base_path), set(self.active_phones))
+        self.base_selected.emit(str(self.active_base_path), self.active_index)
 
-    def _set_active_base(self, path: Path, phones: set[str]):
+    def _set_active_base(self, path: Path, index: BaseAudioIndex):
         self.active_base_path = Path(path).resolve()
-        self.active_phones = set(phones)
+        self.active_index = index
+        self.active_phones = index.phones
         self.active_base.setText(
             f"Base activa para grabaciones: {self.active_base_path.name} · {len(self.active_phones):,} teléfonos"
         )

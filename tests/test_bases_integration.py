@@ -118,6 +118,25 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual((result.filtered, result.unique), (4, 1))
             self.assertEqual(database.jobs()[0]["read_count"], 4)
 
+    def test_call_rows_supports_large_batches_and_groups_keyword_hits(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            database = Database(folder / "audit.db")
+            paths = [folder / f"audio-{index}.wav" for index in range(1_205)]
+            with database.connect() as connection:
+                connection.executemany(
+                    "INSERT INTO calls(filename,file_path,status,category) VALUES (?,?,'COMPLETADO','ALERTA')",
+                    ((path.name, str(path.resolve())) for path in paths),
+                )
+                call_ids = [row[0] for row in connection.execute("SELECT id FROM calls ORDER BY id")]
+                connection.executemany(
+                    "INSERT INTO keyword_hits(call_id,keyword,timestamp_seconds) VALUES (?,'demanda',5)",
+                    ((call_id,) for call_id in call_ids),
+                )
+            rows = database.call_rows(paths)
+            self.assertEqual(len(rows), len(paths))
+            self.assertTrue(all(row["hits"][0]["keyword"] == "demanda" for row in rows))
+
 
 class BasesUiTests(unittest.TestCase):
     @classmethod

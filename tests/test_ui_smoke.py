@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import wave
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -13,6 +14,7 @@ from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QFrame, QLabel, QLineEdit, QPushButton
 
 from app.services.audio_analysis import assign_roles
+from app.services.base_conversion import BaseAudioIndex
 from app.secret_store import unprotect
 from app.ui.theme import apply_app_theme
 from app.ui.views.main_window import (
@@ -279,6 +281,11 @@ class SentryWindowSmokeTest(unittest.TestCase):
             issabel_directories("/var/spool/asterisk/monitor/2026/", {"20260706"}),
             ["/var/spool/asterisk/monitor/2026/07/06/"],
         )
+        self.assertEqual(
+            issabel_directories("/var/spool/asterisk/monitor/2026/", {"20270102"}),
+            ["/var/spool/asterisk/monitor/2027/01/02/"],
+        )
+        self.assertEqual(self.window.remote_path.text(), "/var/spool/asterisk/monitor/")
         self.assertEqual(self.window.audio_source.count(), 3)
         self.assertEqual(
             [self.window.audio_source.itemData(index) for index in range(self.window.audio_source.count())],
@@ -326,6 +333,32 @@ class SentryWindowSmokeTest(unittest.TestCase):
         self.assertTrue(original_enabled)
         self.assertEqual(customer_heading.text(), "Sin identificar")
         self.assertNotIn("Sin identificar", footer_texts)
+
+    def test_large_call_list_materializes_cards_only_when_visible(self) -> None:
+        line = TranscriptLine(0, "Asesor", "Texto de prueba")
+        self.window.call_records = [
+            CallRecord(
+                index, f"llamada-{index}.wav", "", "099***0000", "12:00:00", 30,
+                "Normal", False, "Normal", None, "Bajo", "Resumen", "Fragmento", (line,),
+                category_code="NORMAL",
+            )
+            for index in range(1, 201)
+        ]
+        self.window.calls = {call.call_id: call for call in self.window.call_records}
+        self.window._populate_call_list()
+        self.assertEqual(self.window.call_list.count(), 200)
+        self.assertLess(len(self.window.call_cards), 200)
+        self.window.call_list.setCurrentRow(150)
+        self.assertIn(151, self.window.call_cards)
+
+    def test_local_scan_is_dispatched_to_background_worker(self) -> None:
+        self.window.active_base_path = Path(self.temp.name) / "base.xlsx"
+        self.window.active_base_index = BaseAudioIndex({"0990000001": frozenset({"20260706"})})
+        self.window.active_base_phones = self.window.active_base_index.phones
+        self.window.config_directory.setText(self.temp.name)
+        with patch.object(self.window, "_start_local_scan") as start:
+            self.window._scan_directory()
+        start.assert_called_once_with(Path(self.temp.name), source="local")
 
 
 if __name__ == "__main__":

@@ -210,7 +210,7 @@ def test_connection(config: dict) -> None:
 
 
 def search_remote_audio(config: dict, query: str = "", limit: int = 250) -> list[dict]:
-    """Busca WAV/MP3 recursivamente desde la carpeta remota configurada."""
+    """Busca WAV/MP3 en las rutas y con la profundidad indicadas por el flujo activo."""
     request = dict(config)
     request["query"] = query.strip()
     request["limit"] = max(1, min(5000, int(limit)))

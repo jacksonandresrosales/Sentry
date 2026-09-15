@@ -32,6 +32,17 @@ def file_hash(path: Path) -> str:
 def _request(method, url, *, retries=3, **kwargs):
     last = None
     for attempt in range(retries):
+        data = kwargs.get("data")
+        if hasattr(data, "seek"):
+            data.seek(0)
+        files = kwargs.get("files")
+        if isinstance(files, dict):
+            for value in files.values():
+                candidates = value if isinstance(value, tuple) else (value,)
+                for stream in candidates:
+                    if hasattr(stream, "seek"):
+                        stream.seek(0)
+                        break
         try:
             response = requests.request(method, url, timeout=(15, 300), **kwargs)
         except requests.RequestException as exc:
@@ -63,10 +74,11 @@ def _deepgram_transcript(path: Path, key: str, model: str, keywords: list[str]):
     params = [("model", model), ("language", "es-419"), ("smart_format", "true"),
               ("utterances", "true"), ("diarize_model", "latest"), ("mip_opt_out", "true")]
     params.extend(("keyterm", word) for word in keywords)
-    payload = _request("POST", "https://api.deepgram.com/v1/listen", params=params,
-                       headers={"Authorization": f"Token {key}",
-                                "Content-Type": mimetypes.guess_type(path.name)[0] or "application/octet-stream"},
-                       data=path.read_bytes())
+    with path.open("rb") as stream:
+        payload = _request("POST", "https://api.deepgram.com/v1/listen", params=params,
+                           headers={"Authorization": f"Token {key}",
+                                    "Content-Type": mimetypes.guess_type(path.name)[0] or "application/octet-stream"},
+                           data=stream)
     results = payload.get("results", {})
     utterances = results.get("utterances") or []
     segments = [{"second": float(item.get("start", 0)), "speaker": f"Hablante {int(item.get('speaker', 0)) + 1}",
@@ -174,14 +186,19 @@ def assign_roles(transcript: dict) -> dict:
 
 def detected_keyword_hits(transcript: dict, keywords: list[str], validated=()):
     validated_set = {_normalized(str(value)) for value in validated}
+    normalized_text = _normalized(str(transcript.get("text", "")))
+    normalized_segments = [
+        (item, _normalized(str(item.get("text", ""))))
+        for item in transcript.get("segments", [])
+        if isinstance(item, dict)
+    ]
     hits = []
     for keyword in keywords:
         needle = _normalized(keyword.strip())
         if not needle:
             continue
-        segment = next((item for item in transcript.get("segments", [])
-                        if needle in _normalized(str(item.get("text", "")))), None)
-        if segment is None and needle not in _normalized(str(transcript.get("text", ""))):
+        segment = next((item for item, normalized in normalized_segments if needle in normalized), None)
+        if segment is None and needle not in normalized_text:
             continue
         hits.append({"keyword": keyword.strip(), "speaker": segment.get("speaker") if segment else None,
                      "second": segment.get("second", 0) if segment else 0,
@@ -265,14 +282,22 @@ def contextual_analysis(transcript, keywords: list[str], provider: str, key: str
     if result.get("category") not in {"ALERTA", "NORMAL"}:
         raise AnalysisError("La API devolvió una categoría inválida.")
     validated = {str(word).casefold() for word in result.get("validated_keywords", [])}
-    result["hits"] = detected_keyword_hits(transcript, candidates,
-                                              validated or (candidates if result["category"] == "ALERTA" else ()))
+    accepted = validated or ({word.casefold() for word in candidates} if result["category"] == "ALERTA" else set())
+    accepted_normalized = {_normalized(word) for word in accepted}
+    result["hits"] = [
+        {**hit, "validated": _normalized(hit["keyword"]) in accepted_normalized}
+        for hit in detected
+    ]
     return result
 
 
 def analyze_file(database, path: Path, config: dict):
     path = Path(path).resolve(strict=True)
-    digest = file_hash(path)
+    stat = path.stat()
+    digest = database.cached_file_digest(path, stat.st_size, stat.st_mtime_ns)
+    if digest is None:
+        digest = file_hash(path)
+        database.save_file_digest(path, stat.st_size, stat.st_mtime_ns, digest)
     keywords = [word.strip() for word in config["keywords"] if word.strip()]
     transcript_key = hashlib.sha256(
         f"{TRANSCRIPTION_VERSION}|{digest}|{config['transcription_provider']}|{config['transcription_model']}".encode()).hexdigest()

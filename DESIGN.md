@@ -188,6 +188,7 @@ Los paneles usan radios de 8–10px; campos y botones, 7px; chips, 5px. Las fila
 - Fondo blanco, separador inferior y 100px de alto.
 - La selección usa fondo verde suave y una línea verde de un píxel a la izquierda.
 - No usan sombra, margen exterior ni borde redondeado.
+- En colas extensas, las filas se materializan conforme entran en el área visible para conservar el desplazamiento fluido sin alterar el orden ni los filtros.
 
 ### Panels
 

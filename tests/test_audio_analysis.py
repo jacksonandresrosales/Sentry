@@ -21,7 +21,7 @@ from app.secret_store import protect, unprotect
 from app.services.audio_analysis import (
     RESULT_SCHEMA,
     _deepgram_transcript, _gemini_analysis, _openai_analysis, _openai_transcript, analyze_file, assign_roles,
-    contextual_analysis, detected_keyword_hits,
+    contextual_analysis, detected_keyword_hits, file_hash,
 )
 from app.ui.views.main_window import SentryWindow
 
@@ -94,6 +94,7 @@ class AnalysisPersistenceTests(unittest.TestCase):
             with patch("app.services.audio_analysis._request", return_value=response) as request:
                 transcript = _deepgram_transcript(path, "clave", "nova-3", ["demanda"])
             params = request.call_args.kwargs["params"]
+            self.assertNotIsInstance(request.call_args.kwargs["data"], bytes)
             self.assertIn(("diarize_model", "latest"), params)
             self.assertNotIn(("diarize", "true"), params)
             self.assertIn(("keyterm", "demanda"), params)
@@ -136,10 +137,12 @@ class AnalysisPersistenceTests(unittest.TestCase):
             audio(path)
             database = Database(folder / "audit.db")
             register(database, path)
-            with patch("app.services.audio_analysis.transcribe", return_value=TRANSCRIPT) as transcription, \
+            with patch("app.services.audio_analysis.file_hash", wraps=file_hash) as hashing, \
+                 patch("app.services.audio_analysis.transcribe", return_value=TRANSCRIPT) as transcription, \
                  patch("app.services.audio_analysis.contextual_analysis", return_value=ALERT) as analysis:
                 first = analyze_file(database, path, config())
                 second = analyze_file(database, path, config())
+            self.assertEqual(hashing.call_count, 1)
             self.assertEqual(transcription.call_count, 1)
             self.assertEqual(analysis.call_count, 1)
             self.assertEqual(first["category"], "ALERTA")

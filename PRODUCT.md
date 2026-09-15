@@ -28,7 +28,7 @@ Uso interno en escritorio, con grabaciones almacenadas en carpetas locales, unid
 
 ## Capabilities and Constraints
 
-- Audio desde carpeta local, NAS o Issabel con reproducción y análisis bajo demanda. El flujo relaciona teléfono y fecha de `Hoja1` con archivos WAV/MP3 de nombre `q-<cola>-<teléfono>-<AAAAMMDD>-...`. En Issabel consulta directamente las carpetas de día, filtra por teléfonos en el servidor y descarga solo coincidencias; transcribe, clasifica en alerta, buzón o normal, sincroniza el texto con la reproducción, guarda cada resultado en SQLite y reutiliza cachés por huella/configuración para evitar consumos repetidos. La lista admite filtros y orden por prioridad, duración, fecha o nombre. La vista Bases integra la transformación CSV/Excel al modelo NO. La auditoría y los reportes no muestran datos ficticios.
+- Audio desde carpeta local, NAS o Issabel con reproducción y análisis bajo demanda. El flujo relaciona teléfono y fecha de `Hoja1` con archivos WAV/MP3 de nombre `q-<cola>-<teléfono>-<AAAAMMDD>-...`. En Issabel consulta directamente las carpetas de día, filtra por teléfonos en el servidor y descarga solo coincidencias; transcribe, clasifica en alerta, buzón o normal, sincroniza el texto con la reproducción, guarda cada resultado en SQLite y reutiliza cachés por huella/configuración para evitar consumos repetidos. El escaneo local/NAS trabaja en segundo plano, las consultas SQLite se agrupan y la lista extensa materializa solo las filas visibles. La lista admite filtros y orden por prioridad, duración, fecha o nombre. La vista Bases integra la transformación CSV/Excel al modelo NO. La auditoría y los reportes no muestran datos ficticios.
 - La configuración permite sustituir proveedor, modelo y claves de transcripción y análisis, además de preparar un acceso WinSCP/SFTP simplificado a IP, usuario y contraseña; puerto 22, carpeta inicial y huella SSH se gestionan automáticamente. La búsqueda remota recorre las carpetas de Issabel y localiza WAV/MP3 por teléfono o parte del nombre. Las claves y la contraseña guardadas se cifran mediante DPAPI y solo el mismo usuario de Windows puede recuperarlas; nunca se almacenan en texto plano.
 - Estructura de referencia: barra superior, navegación entre Auditoría, Reportes y Configuración, métricas, lista maestra y panel de detalle.
 - Idioma principal: español.
@@ -46,7 +46,7 @@ Uso interno en escritorio, con grabaciones almacenadas en carpetas locales, unid
 
 - `README.md`, `ARQUITECTURA.md` y `SPECS.md` describen el alcance esperado.
 - La referencia HTML suministra contenido y comportamiento de demostración.
-- No hay todavía grabaciones reales, identidad gráfica final ni servicios conectados; no deben inventarse como capacidades terminadas.
+- La aplicación ya fue validada con grabaciones operativas locales y descargadas desde Issabel. Las credenciales y servicios siguen dependiendo de la configuración privada de cada equipo y nunca deben incorporarse al repositorio.
 
 ## Product Principles
 

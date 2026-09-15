@@ -51,6 +51,13 @@ CREATE TABLE IF NOT EXISTS analysis_cache (
     cache_key TEXT PRIMARY KEY, result_json TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS file_fingerprints (
+    file_path TEXT PRIMARY KEY,
+    file_size INTEGER NOT NULL,
+    modified_ns INTEGER NOT NULL,
+    digest TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS base_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     input_paths TEXT NOT NULL, output_path TEXT,
@@ -80,8 +87,10 @@ class Database:
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version > 3:
+            if version > 4:
                 raise RuntimeError("La base de datos pertenece a una versión más nueva de Sentry.")
             connection.executescript(SCHEMA)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(calls)")}
@@ -95,16 +104,18 @@ class Database:
             for name, definition in additions.items():
                 if name not in columns:
                     connection.execute(f"ALTER TABLE calls ADD COLUMN {name} {definition}")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_calls_status_category ON calls(status, category)")
             connection.execute("UPDATE calls SET status='ERROR', analysis_error="
                                "'El análisis fue interrumpido al cerrar la aplicación.' "
                                "WHERE status IN ('TRANSFIRIENDO','ANALIZANDO')")
-            connection.execute("PRAGMA user_version=3")
+            connection.execute("PRAGMA user_version=4")
 
     @contextmanager
     def connect(self):
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=30000")
         try:
             with connection:
                 yield connection
@@ -172,15 +183,48 @@ class Database:
                 normalized = [str(Path(path).resolve()) for path in paths]
                 if not normalized:
                     return []
-                placeholders = ",".join("?" for _ in normalized)
-                found = {row["file_path"]: dict(row) for row in connection.execute(
-                    f"SELECT * FROM calls WHERE file_path IN ({placeholders})", normalized)}
+                found = {}
+                for start in range(0, len(normalized), 500):
+                    group = normalized[start:start + 500]
+                    placeholders = ",".join("?" for _ in group)
+                    found.update({row["file_path"]: dict(row) for row in connection.execute(
+                        f"SELECT * FROM calls WHERE file_path IN ({placeholders})", group)})
                 result = [found[path] for path in normalized if path in found]
+            hits_by_call: dict[int, list[dict]] = {item["id"]: [] for item in result}
+            call_ids = list(hits_by_call)
+            for start in range(0, len(call_ids), 500):
+                group = call_ids[start:start + 500]
+                placeholders = ",".join("?" for _ in group)
+                for hit in connection.execute(
+                    "SELECT call_id,keyword,speaker,timestamp_seconds,context_snippet,is_risk_validated "
+                    f"FROM keyword_hits WHERE call_id IN ({placeholders}) "
+                    "ORDER BY call_id,timestamp_seconds", group,
+                ):
+                    payload = dict(hit)
+                    call_id = payload.pop("call_id")
+                    hits_by_call[call_id].append(payload)
             for item in result:
-                item["hits"] = [dict(hit) for hit in connection.execute(
-                    "SELECT keyword,speaker,timestamp_seconds,context_snippet,is_risk_validated "
-                    "FROM keyword_hits WHERE call_id=? ORDER BY timestamp_seconds", (item["id"],))]
+                item["hits"] = hits_by_call[item["id"]]
             return result
+
+    def cached_file_digest(self, file_path, file_size: int, modified_ns: int) -> str | None:
+        path = str(Path(file_path).resolve())
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT digest FROM file_fingerprints WHERE file_path=? AND file_size=? AND modified_ns=?",
+                (path, int(file_size), int(modified_ns)),
+            ).fetchone()
+            return str(row[0]) if row else None
+
+    def save_file_digest(self, file_path, file_size: int, modified_ns: int, digest: str) -> None:
+        path = str(Path(file_path).resolve())
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT INTO file_fingerprints(file_path,file_size,modified_ns,digest) VALUES (?,?,?,?) "
+                "ON CONFLICT(file_path) DO UPDATE SET file_size=excluded.file_size,"
+                "modified_ns=excluded.modified_ns,digest=excluded.digest,updated_at=CURRENT_TIMESTAMP",
+                (path, int(file_size), int(modified_ns), digest),
+            )
 
     def set_call_status(self, file_path, status: str, error=None):
         with self.connect() as connection:
