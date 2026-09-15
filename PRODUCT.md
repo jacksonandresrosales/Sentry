@@ -40,7 +40,7 @@ Uso interno en escritorio, con grabaciones almacenadas en carpetas locales, unid
 - Nombre: Sentry.
 - Paleta del futuro logotipo: `#27953c`, `#40b73c`, `#4f4c4c`, `#7eca29`, `#656263`, `#7a7879`. Debe funcionar como acento de marca, no como fondo dominante.
 - La referencia HTML entregada por el usuario es la autoridad para la estructura de la primera pantalla.
-- Estética operativa, blanca, minimalista y de densidad informativa moderada.
+- Estética operativa y minimalista, con tema claro predeterminado y tema oscuro Zinc / Noche seleccionable, ambos independientes de la configuración visual de Windows.
 
 ## Evidence on Hand
 

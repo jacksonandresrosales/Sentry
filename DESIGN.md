@@ -101,6 +101,8 @@ Sentry se siente como una herramienta de escritorio serena y precisa. El blanco 
 
 El blanco y los neutros claros dominan. Los seis colores corporativos se conservan para la futura identidad del logo y se aplican con moderación en controles, estados y detalles.
 
+La aplicación dispone de un registro escalable de temas. **Claro** es el tema inicial y **Oscuro · Zinc / Noche** usa lienzo `#09090b`, paneles `#121215`, superficies `#1a1a1e`, texto `#f4f4f5` y verde accesible `#38c160`. Cada tema define todos sus colores y recursos en un único registro; añadir uno nuevo no requiere duplicar la interfaz. La selección se aplica inmediatamente, se guarda localmente y nunca depende del modo claro u oscuro de Windows.
+
 ### Primary
 
 - **Blanco de panel:** superficie principal de lectura y controles.
@@ -200,7 +202,7 @@ Los paneles usan radios de 8–10px; campos y botones, 7px; chips, 5px. Las fila
 - La validación conserva el formulario estable, deshabilita temporalmente sus controles y comunica carga, éxito o recuperación junto al campo correspondiente.
 - La conexión WinSCP/SFTP se presenta como un panel de Configuración reducido a IP, usuario y contraseña enmascarada, con una sola acción **Conectar servidor**. Puerto 22, carpeta inicial y huella SSH se resuelven internamente; el éxito siempre se comunica con texto y la contraseña se persiste únicamente cifrada con DPAPI.
 - El mismo panel ofrece una búsqueda remota por teléfono o nombre. Los resultados mantienen una lista compacta con nombre, tamaño y fecha; la ruta completa aparece como ayuda y al seleccionar el archivo, sin introducir una navegación de carpetas separada.
-- El origen de grabaciones es una selección explícita entre Local, NAS e Issabel. El control mantiene una sola acción de escaneo en la cabecera; su etiqueta accesible y ayuda cambian con el origen. El emparejamiento siempre usa teléfono y fecha de `Hoja1`, y el origen Issabel informa que descarga únicamente coincidencias.
+- El origen de grabaciones es una selección explícita entre Local, NAS e Issabel. El emparejamiento se inicia al activar una base, siempre usa teléfono y fecha de `Hoja1`, y en Issabel descarga únicamente coincidencias.
 
 ### Navigation
 
@@ -214,7 +216,7 @@ La onda usa verde oscuro para el recorrido y gris claro para lo pendiente. Una m
 
 ### Análisis persistente
 
-La acción primaria **Analizar** vive en el extremo derecho de la cabecera, junto al escaneo. Durante una cola cambia a **Detener** sin añadir ventanas ni bloquear la navegación. Alertas, buzones y llamadas normales se consultan con el filtro situado a la derecha de **Llamadas detectadas**, junto al orden por prioridad, duración, fecha o nombre; sus contadores usan la misma franja de métricas. Las transcripciones usan los rótulos **Asesor** y **Cliente**, pero el panel de identidad no repite el nombre del asesor. Las coincidencias configuradas aparecen como etiquetas compactas en la tarjeta y completas en el detalle. El estado se comunica siempre con texto además del color. Sin registros reales, la auditoría y los reportes muestran un estado vacío en lugar de datos ficticios.
+La acción primaria **Analizar** vive en el extremo derecho de la cabecera. Durante una cola cambia a **Detener**, parte vacía y se llena en verde conforme termina cada llamada, mostrando además el conteo procesado. Mientras el lote está activo se detiene el audio y permanecen bloqueados la reproducción, la línea de tiempo, los saltos, la apertura del archivo y el marcado como revisada; la navegación y la observación de resultados siguen disponibles. Alertas, buzones y llamadas normales se consultan con el filtro situado a la derecha de **Llamadas detectadas**, junto al orden por prioridad, duración, fecha o nombre; sus contadores usan la misma franja de métricas. Las transcripciones usan los rótulos **Asesor** y **Cliente**, pero el panel de identidad no repite el nombre del asesor. Las coincidencias configuradas aparecen como etiquetas compactas en la tarjeta y completas en el detalle. El estado se comunica siempre con texto además del color. Sin registros reales, la auditoría y los reportes muestran un estado vacío en lugar de datos ficticios.
 
 ## Do's and Don'ts
 

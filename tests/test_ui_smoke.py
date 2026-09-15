@@ -9,10 +9,12 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QUrl
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QFrame, QLabel, QLineEdit, QPushButton
 
 from app.services.audio_analysis import assign_roles
 from app.secret_store import unprotect
+from app.ui.theme import apply_app_theme
 from app.ui.views.main_window import (
     CallRecord, SentryWindow, TranscriptLine, audio_filename_metadata, audio_phone_from_filename, call_record_from_audio,
     call_record_from_row, dated_local_directories, install_ui_font, issabel_directories, scan_audio_files,
@@ -28,7 +30,8 @@ class SentryWindowSmokeTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
-        self.window = SentryWindow(Path(self.temp.name) / "audit.db")
+        self.database_path = Path(self.temp.name) / "audit.db"
+        self.window = SentryWindow(self.database_path)
 
     def tearDown(self) -> None:
         self.window.close()
@@ -96,6 +99,39 @@ class SentryWindowSmokeTest(unittest.TestCase):
         self.window._sort_calls("duration_asc", "menor duración")
         self.assertEqual(self.window.call_records[0].filename, "tercera.wav")
 
+    def test_tables_ignore_the_windows_dark_palette(self) -> None:
+        dark_palette = QPalette()
+        dark_palette.setColor(QPalette.ColorRole.Base, QColor("#000000"))
+        dark_palette.setColor(QPalette.ColorRole.Text, QColor("#ffffff"))
+        self.app.setPalette(dark_palette)
+
+        apply_app_theme(self.app, "light")
+
+        table_palette = self.window.bases_page.history.palette()
+        self.assertEqual(table_palette.color(QPalette.ColorRole.Base).name(), "#ffffff")
+        self.assertEqual(table_palette.color(QPalette.ColorRole.Text).name(), "#202220")
+        self.assertEqual(
+            table_palette.color(QPalette.ColorRole.AlternateBase).name(), "#fafbfa"
+        )
+
+    def test_dark_theme_switches_immediately_and_persists(self) -> None:
+        dark_index = self.window.theme_combo.findData("dark")
+        self.window.theme_combo.setCurrentIndex(dark_index)
+
+        self.assertEqual(self.window.theme, "dark")
+        self.assertEqual(
+            self.app.palette().color(QPalette.ColorRole.Base).name(), "#121215"
+        )
+        self.assertIn("#09090b", self.window.styleSheet())
+        self.assertIn("chevron-down-dark.svg", self.window.styleSheet())
+        self.assertEqual(self.window.timeline.theme, "dark")
+        self.assertEqual(self.window.database.settings()["theme"], "dark")
+
+        self.window.close()
+        self.window = SentryWindow(self.database_path)
+        self.assertEqual(self.window.theme, "dark")
+        self.assertEqual(self.window.theme_combo.currentData(), "dark")
+
     def test_all_sensitive_phrases_are_highlighted(self) -> None:
         highlighted = self.window._highlight_keywords(
             "Presentará una demanda con su abogado.", ("demanda", "abogado")
@@ -123,8 +159,8 @@ class SentryWindowSmokeTest(unittest.TestCase):
         self.assertFalse(logo.pixmap().isNull())
         self.assertEqual(self.window.nav_buttons["config"].text(), "")
         self.assertEqual(self.window.nav_buttons["config"].accessibleName(), "Configuración")
-        self.assertEqual(self.window.scan_button.text(), "")
-        self.assertEqual(self.window.scan_button.accessibleName(), "Escanear carpeta local")
+        self.assertFalse(self.window.bases_button.icon().isNull())
+        self.assertFalse(hasattr(self.window, "scan_button"))
         self.assertEqual(self.window.directory_label.text(), "Sin directorio")
         self.assertEqual(self.window.directory_label.toolTip(), "No se ha configurado una carpeta")
         self.assertIn("QComboBox::down-arrow", self.window.styleSheet())

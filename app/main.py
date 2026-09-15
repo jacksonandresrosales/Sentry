@@ -4,11 +4,11 @@ import sys
 import sqlite3
 from pathlib import Path
 
-
 def main() -> int:
     try:
         from PySide6.QtGui import QIcon
         from PySide6.QtWidgets import QApplication, QMessageBox
+        from app.ui.theme import apply_app_theme
         from app.ui.views.main_window import SentryWindow, install_ui_font
     except ModuleNotFoundError as exc:
         if exc.name in {"PySide6", "openpyxl", "xlsxwriter", "requests"}:
@@ -24,6 +24,7 @@ def main() -> int:
     window_icon = QIcon(str(icon_path))
     app.setWindowIcon(window_icon)
     app.setStyle("Fusion")
+    apply_app_theme(app, "light")
     install_ui_font(app)
 
     try:

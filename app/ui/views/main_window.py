@@ -17,9 +17,13 @@ from app.services.base_conversion import BaseAudioIndex, load_hoja1_audio_index,
 from app.services.winscp_client import (
     WinSCPError, download_remote_audio, scan_host_fingerprint, search_remote_audio, test_connection,
 )
+from app.ui.theme import (
+    DEFAULT_THEME, apply_app_theme, normalize_theme, theme_asset, theme_colors,
+    theme_options,
+)
 from app.ui.views.bases_page import BasesPage
 
-from PySide6.QtCore import QByteArray, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QByteArray, QEasingCurve, QRectF, QSize, Qt, QThread, QTimer, QUrl, QVariantAnimation, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
@@ -47,25 +51,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-
-PALETTE = {
-    "green_deep": "#27953c",
-    "green_accessible": "#1f7830",
-    "green": "#40b73c",
-    "green_lime": "#7eca29",
-    "charcoal": "#4f4c4c",
-    "gray": "#656263",
-    "gray_light": "#7a7879",
-    "canvas": "#f5f6f5",
-    "panel": "#ffffff",
-    "surface": "#fafbfa",
-    "green_soft": "#eef7ef",
-    "border": "#dfe3df",
-    "border_strong": "#c8cdc8",
-    "text": "#202220",
-    "text_soft": "#4f4c4c",
-    "muted": "#656263",
-}
+PALETTE = dict(theme_colors(DEFAULT_THEME))
 
 AUDIO_SUFFIXES = {".mp3", ".wav"}
 
@@ -319,7 +305,6 @@ class AnalysisWorker(QThread):
         for index, path in enumerate(self.paths, 1):
             if self._stop:
                 break
-            self.progress.emit(index, len(self.paths), Path(path).name)
             try:
                 row = analyze_file(self.database, Path(path), self.config)
             except Exception as exc:
@@ -331,6 +316,8 @@ class AnalysisWorker(QThread):
             else:
                 completed += 1
                 self.row_ready.emit(row)
+            finally:
+                self.progress.emit(index, len(self.paths), Path(path).name)
         self.completed.emit(completed, failures, self._stop)
 
 
@@ -415,6 +402,85 @@ class IssabelMatchWorker(QThread):
             })
 
 
+class AnalysisProgressButton(QPushButton):
+    def __init__(self) -> None:
+        super().__init__("Analizar")
+        self.setMinimumWidth(118)
+        self.theme = DEFAULT_THEME
+        self.progress_ratio: float | None = None
+        self._display_progress = 0.0
+        self._animation = QVariantAnimation(self)
+        self._animation.setDuration(220)
+        self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._animation.valueChanged.connect(self._set_display_progress)
+
+    def set_theme(self, theme_name: str) -> None:
+        self.theme = normalize_theme(theme_name)
+        self.update()
+
+    def set_progress(self, current: int, total: int) -> None:
+        total = max(1, total)
+        target = max(0.0, min(1.0, current / total))
+        self.progress_ratio = target
+        self.setText(f"Detener · {current}/{total}")
+        self.setAccessibleName(f"Detener análisis. Progreso: {current} de {total}")
+        self._animation.stop()
+        if target == 0:
+            self._display_progress = 0.0
+            self.update()
+            return
+        self._animation.setStartValue(self._display_progress)
+        self._animation.setEndValue(target)
+        self._animation.start()
+
+    def set_idle(self) -> None:
+        self._animation.stop()
+        self.progress_ratio = None
+        self._display_progress = 0.0
+        self.setText("Analizar")
+        self.setAccessibleName("Analizar audios automáticamente")
+        self.update()
+
+    def _set_display_progress(self, value: object) -> None:
+        self._display_progress = float(value)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        if self.progress_ratio is None:
+            super().paintEvent(event)
+            return
+        colors = theme_colors(self.theme)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        progress_rect = QRectF(
+            rect.x(), rect.y(), rect.width() * self._display_progress, rect.height()
+        )
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(colors["panel"] if self.isEnabled() else colors["disabled_bg"]))
+        painter.drawRoundedRect(rect, 7, 7)
+        if self._display_progress > 0:
+            painter.save()
+            painter.setClipRect(progress_rect)
+            painter.setBrush(QColor(colors["green_accessible"]))
+            painter.drawRoundedRect(rect, 7, 7)
+            painter.restore()
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(colors["green_accessible"]), 1))
+        painter.drawRoundedRect(rect, 7, 7)
+        painter.setFont(self.font())
+        painter.setPen(QColor(colors["text"] if self.isEnabled() else colors["gray_light"]))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.text())
+        if self._display_progress > 0:
+            painter.save()
+            painter.setClipRect(progress_rect)
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.text())
+            painter.restore()
+
+
 class AudioTimeline(QWidget):
     seek_requested = Signal(int)
 
@@ -423,9 +489,14 @@ class AudioTimeline(QWidget):
         self.duration = 1
         self.current = 0
         self.marker: int | None = None
+        self.theme = DEFAULT_THEME
         self.setMinimumHeight(58)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAccessibleName("Línea de tiempo del audio")
+
+    def set_theme(self, theme_name: str) -> None:
+        self.theme = normalize_theme(theme_name)
+        self.update()
 
     def set_audio(self, duration: int, marker: int | None) -> None:
         self.duration = max(1, duration)
@@ -460,23 +531,24 @@ class AudioTimeline(QWidget):
         center = self.height() / 2
         usable = max(1, right - left)
         progress_x = left + usable * (self.current / self.duration)
+        palette = theme_colors(self.theme)
 
         bars = 72
         gap = usable / bars
         for index in range(bars):
             height = 8 + ((index * 17 + index * index * 3) % 24)
             x = left + index * gap
-            color = PALETTE["green_deep"] if x <= progress_x else PALETTE["border_strong"]
+            color = palette["green_deep"] if x <= progress_x else palette["border_strong"]
             painter.setPen(QPen(QColor(color), max(2.0, gap * 0.42), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             painter.drawLine(int(x), int(center - height / 2), int(x), int(center + height / 2))
 
         if self.marker is not None:
             marker_x = left + usable * (self.marker / self.duration)
-            painter.setPen(QPen(QColor(PALETTE["green_deep"]), 2))
+            painter.setPen(QPen(QColor(palette["green_deep"]), 2))
             painter.drawLine(int(marker_x), 5, int(marker_x), self.height() - 5)
 
         if self.hasFocus():
-            painter.setPen(QPen(QColor(PALETTE["green_deep"]), 2))
+            painter.setPen(QPen(QColor(palette["green_deep"]), 2))
             painter.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), 7, 7)
 
 
@@ -598,6 +670,11 @@ class SentryWindow(QMainWindow):
     def __init__(self, database_path: Path = DEFAULT_DATABASE) -> None:
         super().__init__()
         self.database = Database(database_path)
+        settings = self.database.settings()
+        self.theme = normalize_theme(settings.get("theme", DEFAULT_THEME))
+        app = QApplication.instance()
+        if app is not None:
+            apply_app_theme(app, self.theme)
         self.setWindowTitle("Sentry · Auditoría de grabaciones")
         self.setWindowIcon(QIcon(str(Path(__file__).resolve().parents[1] / "assets" / "sentry-app-icon.ico")))
         self.resize(1440, 860)
@@ -640,8 +717,7 @@ class SentryWindow(QMainWindow):
         self.toast_timer.timeout.connect(self._hide_toast)
 
         self._build_ui()
-        self.setStyleSheet(self._stylesheet())
-        settings = self.database.settings()
+        self._set_theme(self.theme)
         if "audio_directory" in settings:
             self.config_directory.setText(settings["audio_directory"])
         if "nas_directory" in settings:
@@ -760,7 +836,7 @@ class SentryWindow(QMainWindow):
         self.bases_button = QPushButton("Bases")
         self.bases_button.setObjectName("navButton")
         self.bases_button.setCheckable(True)
-        self.bases_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.bases_button.setIcon(QIcon(str(assets_path / theme_asset(self.theme, "bases"))))
         self.bases_button.setIconSize(QSize(16, 16))
         self.bases_button.setAccessibleName("Preparar bases DB_delete")
         self.bases_button.setToolTip("Preparar bases CSV / Excel · DB_delete")
@@ -772,10 +848,11 @@ class SentryWindow(QMainWindow):
 
         nav = QHBoxLayout()
         nav.setSpacing(4)
+        settings_icon = QIcon(str(assets_path / theme_asset(self.theme, "settings")))
         for index, (key, text, icon) in enumerate((
             ("audit", "Auditoría", None),
             ("reports", "Reportes", None),
-            ("config", "Configuración", QIcon(str(assets_path / "settings.svg"))),
+            ("config", "Configuración", settings_icon),
         )):
             button = QPushButton("" if icon else text)
             button.setObjectName("navButton")
@@ -793,17 +870,7 @@ class SentryWindow(QMainWindow):
             nav.addWidget(button)
         layout.addLayout(nav)
 
-        self.scan_button = QPushButton()
-        self.scan_button.setObjectName("iconButton")
-        self.scan_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
-        self.scan_button.setIconSize(QSize(17, 17))
-        self.scan_button.setFixedSize(38, 36)
-        self.scan_button.setAccessibleName("Escanear carpeta")
-        self.scan_button.setToolTip("Escanear carpeta")
-        self.scan_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.scan_button.clicked.connect(self._scan_directory)
-        layout.addWidget(self.scan_button)
-        self.analyze_button = QPushButton("Analizar")
+        self.analyze_button = AnalysisProgressButton()
         self.analyze_button.setObjectName("primaryButton")
         self.analyze_button.setAccessibleName("Analizar audios automáticamente")
         self.analyze_button.setToolTip("Transcribe pendientes y los separa en alertas, buzones y normales")
@@ -1134,7 +1201,7 @@ class SentryWindow(QMainWindow):
         controls.addStretch()
 
         self.jump_button = QPushButton()
-        self.jump_button.setObjectName("primaryButton")
+        self.jump_button.setObjectName("criticalButton")
         self.jump_button.clicked.connect(self._jump_to_evidence)
         controls.addWidget(self.jump_button)
         layout.addLayout(controls)
@@ -1265,6 +1332,30 @@ class SentryWindow(QMainWindow):
         subtitle.setObjectName("pageSubtitle")
         outer.addWidget(title)
         outer.addWidget(subtitle)
+
+        appearance = QFrame()
+        appearance.setObjectName("contentPanel")
+        appearance_layout = QVBoxLayout(appearance)
+        appearance_layout.setContentsMargins(20, 18, 20, 18)
+        appearance_layout.setSpacing(8)
+        appearance_title = QLabel("Temas")
+        appearance_title.setObjectName("formTitle")
+        appearance_help = QLabel(
+            "Selecciona la apariencia de Sentry. La elección se guarda en este equipo."
+        )
+        appearance_help.setObjectName("pageSubtitle")
+        self.theme_combo = QComboBox()
+        self.theme_combo.setAccessibleName("Tema de la aplicación")
+        for theme_id, label in theme_options():
+            self.theme_combo.addItem(label, theme_id)
+        theme_index = self.theme_combo.findData(self.theme)
+        self.theme_combo.setCurrentIndex(max(0, theme_index))
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        appearance_title.setBuddy(self.theme_combo)
+        appearance_layout.addWidget(appearance_title)
+        appearance_layout.addWidget(appearance_help)
+        appearance_layout.addWidget(self.theme_combo)
+        outer.addWidget(appearance)
 
         directory = QFrame()
         directory.setObjectName("contentPanel")
@@ -2128,6 +2219,24 @@ class SentryWindow(QMainWindow):
         self.active_transcript_index = -1
         self._update_category_metrics()
 
+    def _set_analysis_controls_locked(self, locked: bool) -> None:
+        if locked:
+            self._stop_playback()
+        has_audio = (
+            self.current_call is not None
+            and self.current_call.source_path is not None
+            and self.current_call.source_path.is_file()
+        )
+        self.play_button.setEnabled(not locked and has_audio)
+        self.original_button.setEnabled(not locked and has_audio)
+        self.reviewed_button.setEnabled(not locked and self.current_call is not None)
+        self.jump_button.setEnabled(
+            not locked and self.current_call is not None and self.current_call.hit_second is not None
+        )
+        self.timeline.setEnabled(not locked)
+        for _line, row, _label in self.transcript_rows:
+            row.setEnabled(not locked)
+
     def _show_call(self, call: CallRecord) -> None:
         self._stop_playback()
         self.current_call = call
@@ -2164,6 +2273,7 @@ class SentryWindow(QMainWindow):
             self.jump_button.setText(f"Ir al momento {format_time(call.hit_second)} · {call.keyword}")
             self.jump_button.setEnabled(True)
         self._render_transcript(call)
+        self._set_analysis_controls_locked(self.analysis_worker is not None)
 
     def _render_transcript(self, call: CallRecord) -> None:
         while self.transcript_layout.count():
@@ -2211,8 +2321,8 @@ class SentryWindow(QMainWindow):
         self.transcript_layout.addStretch()
         self._sync_transcript(self.current_second)
 
-    @staticmethod
-    def _highlight_keywords(text: str, keywords: tuple[str, ...]) -> str:
+    def _highlight_keywords(self, text: str, keywords: tuple[str, ...]) -> str:
+        palette = theme_colors(self.theme)
         terms = sorted({term.strip() for term in keywords if term.strip()}, key=len, reverse=True)
         if not terms:
             return html.escape(text)
@@ -2222,7 +2332,7 @@ class SentryWindow(QMainWindow):
         for match in pattern.finditer(text):
             fragments.append(html.escape(text[cursor:match.start()]))
             fragments.append(
-                f"<span style='color:{PALETTE['green_accessible']}; font-weight:700'>"
+                f"<span style='color:{palette['green_accessible']}; font-weight:700'>"
                 f"{html.escape(match.group(0))}</span>"
             )
             cursor = match.end()
@@ -2275,8 +2385,10 @@ class SentryWindow(QMainWindow):
         ratio = max(0.0, min(1.0, (position_seconds - line.second) / duration))
         return min(word_count, max(1, int(ratio * word_count) + 1))
 
-    @staticmethod
-    def _transcript_progress_html(line: TranscriptLine, heard_words: int, keywords: tuple[str, ...]) -> str:
+    def _transcript_progress_html(
+        self, line: TranscriptLine, heard_words: int, keywords: tuple[str, ...]
+    ) -> str:
+        palette = theme_colors(self.theme)
         word_matches = list(re.finditer(r"\S+", line.text))
         sensitive_indexes: set[int] = set()
         for term in {term.strip() for term in keywords if term.strip()}:
@@ -2290,14 +2402,14 @@ class SentryWindow(QMainWindow):
             safe_word = html.escape(word.group(0))
             styles = []
             if index < heard_words:
-                styles.append(f"color:{PALETTE['green_accessible']}")
+                styles.append(f"color:{palette['green_accessible']}")
             if index in sensitive_indexes:
-                styles.extend((f"color:{PALETTE['green_accessible']}", "font-weight:700"))
+                styles.extend((f"color:{palette['green_accessible']}", "font-weight:700"))
             rendered.append(f"<span style='{';'.join(dict.fromkeys(styles))}'>{safe_word}</span>" if styles else safe_word)
         return " ".join(rendered)
 
     def _toggle_playback(self) -> None:
-        if self.current_call is None:
+        if self.analysis_worker is not None or self.current_call is None:
             return
         source = self.current_call.source_path
         if source is None or not source.is_file():
@@ -2352,7 +2464,7 @@ class SentryWindow(QMainWindow):
         self._show_toast(f"No se pudo reproducir el audio: {detail}")
 
     def _seek_audio(self, seconds: int) -> None:
-        if self.current_call is None:
+        if self.analysis_worker is not None or self.current_call is None:
             return
         self.current_second = max(0, min(seconds, self.current_duration))
         source = self.current_call.source_path
@@ -2366,7 +2478,7 @@ class SentryWindow(QMainWindow):
         self.time_display.setText(f"{format_time(self.current_second)} / {format_time(self.current_duration)}")
 
     def _open_original_audio(self) -> None:
-        if self.current_call is None:
+        if self.analysis_worker is not None or self.current_call is None:
             return
         source = self.current_call.source_path
         if source is None or not source.is_file():
@@ -2376,7 +2488,7 @@ class SentryWindow(QMainWindow):
             self._show_toast("Windows no pudo abrir el archivo con el reproductor predeterminado")
 
     def _jump_to_evidence(self) -> None:
-        if self.current_call is None or self.current_call.hit_second is None:
+        if self.analysis_worker is not None or self.current_call is None or self.current_call.hit_second is None:
             return
         self._seek_audio(self.current_call.hit_second)
         self._show_toast(f"Evidencia localizada en {format_time(self.current_call.hit_second)}")
@@ -2414,15 +2526,8 @@ class SentryWindow(QMainWindow):
         self.issabel_source_note.setVisible(source == "issabel")
         if source == "issabel":
             self._set_directory_display("Issabel")
-            if hasattr(self, "scan_button"):
-                self.scan_button.setToolTip("Buscar y descargar coincidencias desde Issabel")
-                self.scan_button.setAccessibleName("Buscar audios en Issabel")
         else:
             self._set_directory_display(self._selected_directory())
-            if hasattr(self, "scan_button"):
-                label = "Escanear NAS" if source == "nas" else "Escanear carpeta local"
-                self.scan_button.setToolTip(label)
-                self.scan_button.setAccessibleName(label)
 
     def _set_directory_display(self, directory: str) -> None:
         source = self._source_key()
@@ -2433,6 +2538,43 @@ class SentryWindow(QMainWindow):
         label = "NAS" if source == "nas" and directory else Path(directory).name if directory else "Sin directorio"
         self.directory_label.setText(label)
         self.directory_label.setToolTip(directory or "No se ha configurado una carpeta")
+
+    def _on_theme_changed(self) -> None:
+        theme_name = self._set_theme(str(self.theme_combo.currentData()))
+        try:
+            self.database.save_settings({"theme": theme_name})
+        except (sqlite3.Error, OSError, ValueError) as exc:
+            self._show_toast(f"No se pudo guardar el tema: {exc}")
+
+    def _set_theme(self, theme_name: str) -> str:
+        self.theme = normalize_theme(theme_name)
+        PALETTE.clear()
+        PALETTE.update(theme_colors(self.theme))
+        app = QApplication.instance()
+        if app is not None:
+            apply_app_theme(app, self.theme)
+        self.setStyleSheet(self._stylesheet(self.theme))
+        if hasattr(self, "timeline"):
+            self.timeline.set_theme(self.theme)
+        if hasattr(self, "analyze_button"):
+            self.analyze_button.set_theme(self.theme)
+        if hasattr(self, "theme_combo"):
+            index = self.theme_combo.findData(self.theme)
+            if index >= 0 and self.theme_combo.currentIndex() != index:
+                self.theme_combo.blockSignals(True)
+                self.theme_combo.setCurrentIndex(index)
+                self.theme_combo.blockSignals(False)
+        if "config" in self.nav_buttons:
+            assets_path = Path(__file__).resolve().parents[1] / "assets"
+            self.bases_button.setIcon(
+                QIcon(str(assets_path / theme_asset(self.theme, "bases")))
+            )
+            self.nav_buttons["config"].setIcon(
+                QIcon(str(assets_path / theme_asset(self.theme, "settings")))
+            )
+        if self.current_call is not None:
+            self._sync_transcript(self.current_second)
+        return self.theme
 
     def _save_settings(self) -> None:
         source = self._source_key()
@@ -2453,6 +2595,7 @@ class SentryWindow(QMainWindow):
                 "nas_directory": self.nas_directory.text().strip(),
                 "audio_source": source,
                 "keywords": ", ".join(keywords),
+                "theme": self.theme,
             })
             api_count = self._persist_credentials()
             remote_count = self._persist_remote_connection()
@@ -2478,8 +2621,6 @@ class SentryWindow(QMainWindow):
             (self.nas_directory if source == "nas" else self.config_directory).setFocus()
             return
 
-        self.scan_button.setEnabled(False)
-        self.scan_button.setToolTip("Escaneando…")
         directory = Path(directory_text).expanduser()
         # ponytail: el escaneo síncrono basta para esta etapa; mover a un hilo si un NAS grande bloquea la interfaz.
         QTimer.singleShot(0, lambda: self._finish_scan(directory))
@@ -2497,9 +2638,7 @@ class SentryWindow(QMainWindow):
             return
         base_name = re.sub(r"[^A-Za-z0-9._-]+", "_", self.active_base_path.stem)[:80]
         destination = Path(__file__).resolve().parents[3] / "data" / "remote_audio" / base_name
-        self.scan_button.setEnabled(False)
         self.analyze_button.setEnabled(False)
-        self.scan_button.setToolTip("Buscando por teléfono y fecha en Issabel…")
         self._show_toast(
             f"Issabel: revisando {len(self.active_base_index.dates)} carpeta(s) de fecha, no todo el año"
         )
@@ -2532,7 +2671,6 @@ class SentryWindow(QMainWindow):
     def _issabel_match_finished(self) -> None:
         worker = self.issabel_match_worker
         self.issabel_match_worker = None
-        self.scan_button.setEnabled(True)
         self.analyze_button.setEnabled(True)
         self._source_changed()
         if worker is not None:
@@ -2567,8 +2705,6 @@ class SentryWindow(QMainWindow):
                 elif self._source_key() == "nas":
                     self.database.save_settings({"nas_directory": str(directory)})
             except (sqlite3.Error, OSError) as exc:
-                self.scan_button.setEnabled(True)
-                self.scan_button.setToolTip("Escanear carpeta")
                 self._show_toast(f"No se pudo guardar el escaneo: {exc}")
                 return
             self.call_records = records
@@ -2591,8 +2727,6 @@ class SentryWindow(QMainWindow):
             base_note = f" · base {self.active_base_path.name}" if self.active_base_path else ""
             source_label = {"local": "local", "nas": "NAS", "issabel": "Issabel"}.get(self._source_key(), "")
             message = f"Escaneo {source_label} completado · {count} {noun}{base_note}"
-        self.scan_button.setEnabled(True)
-        self.scan_button.setToolTip("Escanear carpeta")
         self._show_toast(message)
 
     def _update_category_metrics(self) -> None:
@@ -2653,6 +2787,7 @@ class SentryWindow(QMainWindow):
             self.analysis_worker.request_stop()
             self.analyze_button.setEnabled(False)
             self.analyze_button.setText("Deteniendo…")
+            self.analyze_button.setAccessibleName("Deteniendo análisis")
             return
         paths = [call.source_path for call in self.call_records
                  if call.source_path is not None and call.source_path.is_file()]
@@ -2670,11 +2805,13 @@ class SentryWindow(QMainWindow):
         self.analysis_worker.progress.connect(self._analysis_progress)
         self.analysis_worker.row_ready.connect(self._analysis_row_ready)
         self.analysis_worker.completed.connect(self._analysis_complete)
-        self.analyze_button.setText("Detener")
-        self.scan_button.setEnabled(False)
+        self.analyze_button.set_progress(0, len(paths))
+        self.analyze_button.setToolTip(f"Analizando 0/{len(paths)} llamadas")
+        self._set_analysis_controls_locked(True)
         self.analysis_worker.start()
 
     def _analysis_progress(self, current: int, total: int, filename: str) -> None:
+        self.analyze_button.set_progress(current, total)
         self.analyze_button.setToolTip(f"Analizando {current}/{total}: {filename}")
 
     def _analysis_row_ready(self, row) -> None:
@@ -2693,9 +2830,8 @@ class SentryWindow(QMainWindow):
     def _analysis_complete(self, completed: int, failures: int, stopped: bool) -> None:
         worker = self.analysis_worker
         self.analysis_worker = None
-        self.scan_button.setEnabled(True)
         self.analyze_button.setEnabled(True)
-        self.analyze_button.setText("Analizar")
+        self.analyze_button.set_idle()
         self.analyze_button.setToolTip("Transcribe pendientes y los separa en alertas, buzones y normales")
         stored = self.database.call_rows([call.source_path for call in self.call_records if call.source_path])
         if stored:
@@ -2706,6 +2842,7 @@ class SentryWindow(QMainWindow):
             if self.call_list.count():
                 self.call_list.setCurrentRow(0)
             self._filter_calls()
+        self._set_analysis_controls_locked(False)
         message = f"Análisis {'detenido' if stopped else 'completado'} · {completed} guardados"
         if failures:
             message += f" · {failures} con error (puedes reintentar)"
@@ -2717,6 +2854,8 @@ class SentryWindow(QMainWindow):
             QTimer.singleShot(0, self.close)
 
     def _mark_reviewed(self) -> None:
+        if self.analysis_worker is not None:
+            return
         if self.current_call is None or self.current_call.source_path is None:
             self._show_toast("Selecciona una llamada antes de marcarla")
             return
@@ -2782,6 +2921,7 @@ class SentryWindow(QMainWindow):
                     "nas_directory": self.nas_directory.text().strip(),
                     "audio_source": self._source_key(),
                     "keywords": keywords,
+                    "theme": self.theme,
                 })
             self._persist_credentials()
             self._persist_remote_connection()
@@ -2802,8 +2942,9 @@ class SentryWindow(QMainWindow):
         super().closeEvent(event)
 
     @staticmethod
-    def _stylesheet() -> str:
-        combo_arrow = (Path(__file__).resolve().parents[1] / "assets" / "chevron-down.svg").as_posix()
+    def _stylesheet(theme_name: str = DEFAULT_THEME) -> str:
+        arrow_name = theme_asset(theme_name, "chevron")
+        combo_arrow = (Path(__file__).resolve().parents[1] / "assets" / arrow_name).as_posix()
         return f"""
             * {{
                 font-family: "Inter", "Segoe UI", sans-serif;
@@ -2839,27 +2980,71 @@ class SentryWindow(QMainWindow):
             QPushButton#navButton:checked {{
                 color: {PALETTE['green_accessible']};
                 background: {PALETTE['green_soft']};
-                border: 1px solid #cfe7d3;
+                border: 1px solid {PALETTE['nav_checked_border']};
             }}
-            QPushButton#secondaryButton, QPushButton#iconButton, QPushButton#sortButton {{
+            QPushButton#secondaryButton, QPushButton#sortButton {{
                 background: {PALETTE['panel']};
                 color: {PALETTE['text_soft']};
                 border: 1px solid {PALETTE['border_strong']};
             }}
-            QPushButton#iconButton {{ padding: 0; }}
             QPushButton#sortButton {{ min-width: 96px; text-align: left; padding-right: 24px; }}
-            QPushButton#secondaryButton:hover, QPushButton#iconButton:hover, QPushButton#sortButton:hover {{ color: {PALETTE['text']}; background: {PALETTE['surface']}; border-color: #afb6af; }}
+            QPushButton#secondaryButton:hover, QPushButton#sortButton:hover {{ color: {PALETTE['text']}; background: {PALETTE['surface_hover']}; border-color: {PALETTE['secondary_hover_border']}; }}
             QPushButton#secondaryButton:disabled {{ color: {PALETTE['gray_light']}; background: {PALETTE['surface']}; border-color: {PALETTE['border']}; }}
-            QTableWidget {{ background: {PALETTE['panel']}; border: 1px solid {PALETTE['border']}; gridline-color: {PALETTE['border']}; selection-background-color: {PALETTE['green_soft']}; selection-color: {PALETTE['text']}; }}
-            QHeaderView::section {{ background: {PALETTE['surface']}; padding: 7px; border: none; border-bottom: 1px solid {PALETTE['border']}; }}
+            QTableWidget, QTableView {{
+                background-color: {PALETTE['panel']};
+                alternate-background-color: {PALETTE['surface']};
+                color: {PALETTE['text']};
+                border: 1px solid {PALETTE['border']};
+                gridline-color: {PALETTE['border']};
+                selection-background-color: {PALETTE['green_soft']};
+                selection-color: {PALETTE['text']};
+            }}
+            QTableWidget::item, QTableView::item {{
+                background-color: {PALETTE['panel']};
+                color: {PALETTE['text']};
+            }}
+            QTableWidget::item:alternate, QTableView::item:alternate {{
+                background-color: {PALETTE['surface']};
+            }}
+            QTableWidget::item:selected, QTableView::item:selected {{
+                background-color: {PALETTE['green_soft']};
+                color: {PALETTE['text']};
+            }}
+            QTableWidget QAbstractScrollArea::viewport, QTableView QAbstractScrollArea::viewport {{
+                background-color: {PALETTE['panel']};
+            }}
+            QHeaderView {{ background-color: {PALETTE['panel']}; }}
+            QHeaderView::section {{
+                background-color: {PALETTE['surface']};
+                color: {PALETTE['text']};
+                padding: 7px;
+                border: none;
+                border-bottom: 1px solid {PALETTE['border']};
+            }}
+            QTableCornerButton::section {{
+                background-color: {PALETTE['surface']};
+                border: none;
+                border-bottom: 1px solid {PALETTE['border']};
+            }}
             QPushButton#primaryButton {{
                 background: {PALETTE['green_accessible']};
                 color: white;
                 border: 1px solid {PALETTE['green_accessible']};
             }}
-            QPushButton#primaryButton:hover {{ background: #238537; }}
+            QPushButton#primaryButton:hover {{ background: {PALETTE['primary_hover']}; }}
             QPushButton#primaryButton:disabled {{
-                background: #eceeec;
+                background: {PALETTE['disabled_bg']};
+                color: {PALETTE['gray_light']};
+                border-color: {PALETTE['border']};
+            }}
+            QPushButton#criticalButton {{
+                background: {PALETTE['alert_bg']};
+                color: {PALETTE['alert_text']};
+                border: 1px solid {PALETTE['alert_border']};
+            }}
+            QPushButton#criticalButton:hover {{ background: {PALETTE['alert_hover']}; }}
+            QPushButton#criticalButton:disabled {{
+                background: {PALETTE['disabled_bg']};
                 color: {PALETTE['gray_light']};
                 border-color: {PALETTE['border']};
             }}
@@ -2888,7 +3073,7 @@ class SentryWindow(QMainWindow):
                 selection-background-color: {PALETTE['green_deep']};
                 selection-color: white;
             }}
-            QLineEdit::placeholder {{ color: #767676; }}
+            QLineEdit::placeholder {{ color: {PALETTE['placeholder']}; }}
             QComboBox::drop-down {{
                 width: 28px;
                 background: {PALETTE['surface']};
@@ -2938,9 +3123,9 @@ class SentryWindow(QMainWindow):
                 border-bottom: 1px solid {PALETTE['border']};
                 border-radius: 0;
             }}
-            QFrame#callCard:hover {{ background: {PALETTE['surface']}; }}
+            QFrame#callCard:hover {{ background: {PALETTE['surface_hover']}; }}
             QFrame#callCard[selected="true"] {{
-                background: #f3faf4;
+                background: {PALETTE['card_selected_bg']};
                 border-left: 1px solid {PALETTE['green_deep']};
                 border-bottom: 1px solid {PALETTE['border']};
             }}
@@ -2949,7 +3134,7 @@ class SentryWindow(QMainWindow):
             QLabel#callAgent {{ color: {PALETTE['text']}; font-weight: 600; }}
             QLabel#callCustomer {{ color: {PALETTE['text']}; font-weight: 600; }}
             QFrame#classificationBadge {{
-                background: #f0f1f0;
+                background: {PALETTE['neutral_badge_bg']};
                 border: 1px solid {PALETTE['border_strong']};
                 border-radius: 5px;
             }}
@@ -2959,16 +3144,16 @@ class SentryWindow(QMainWindow):
                 font-weight: 600;
             }}
             QFrame#classificationBadge[category="ALERTA"] {{
-                background: #f1f8e9;
-                border: 1px solid #b8d884;
+                background: {PALETTE['alert_bg']};
+                border: 1px solid {PALETTE['alert_border']};
             }}
             QFrame#classificationBadge[category="ALERTA"] QLabel#classificationText {{
-                color: #3d6c12;
+                color: {PALETTE['alert_text']};
                 font-size: 9px;
                 font-weight: 650;
             }}
             QFrame#classificationBadge[category="BUZON"] {{
-                background: #f0f1f0;
+                background: {PALETTE['neutral_badge_bg']};
                 border: 1px solid {PALETTE['border_strong']};
             }}
             QFrame#classificationBadge[category="BUZON"] QLabel#classificationText {{
@@ -2978,7 +3163,7 @@ class SentryWindow(QMainWindow):
             }}
             QFrame#classificationBadge[category="NORMAL"] {{
                 background: {PALETTE['green_soft']};
-                border: 1px solid #cfe7d3;
+                border: 1px solid {PALETTE['mailbox_border']};
             }}
             QFrame#classificationBadge[category="NORMAL"] QLabel#classificationText {{
                 color: {PALETTE['green_accessible']};
@@ -2989,7 +3174,7 @@ class SentryWindow(QMainWindow):
             QLabel#sensitiveBadge, QLabel#riskBadge[sensitive="true"] {{
                 color: {PALETTE['green_accessible']};
                 background: {PALETTE['green_soft']};
-                border: 1px solid #cfe7d3;
+                border: 1px solid {PALETTE['mailbox_border']};
                 border-radius: 5px;
                 padding: 2px 6px;
                 font-size: 9px;
@@ -2997,7 +3182,7 @@ class SentryWindow(QMainWindow):
             }}
             QLabel#neutralBadge, QLabel#riskBadge[sensitive="false"] {{
                 color: {PALETTE['gray']};
-                background: #f0f1f0;
+                background: {PALETTE['neutral_badge_bg']};
                 border: 1px solid {PALETTE['border']};
                 border-radius: 5px;
                 padding: 2px 6px;
@@ -3020,21 +3205,21 @@ class SentryWindow(QMainWindow):
                 border: 1px solid {PALETTE['green_accessible']};
                 padding: 0;
             }}
-            QPushButton#playButton:hover {{ background: #238537; }}
+            QPushButton#playButton:hover {{ background: {PALETTE['primary_hover']}; }}
             QPushButton#playButton:disabled {{
-                background: #eceeec;
+                background: {PALETTE['disabled_bg']};
                 border-color: {PALETTE['border']};
             }}
             QScrollArea#transcriptScroll, QWidget#transcriptBody {{ background: transparent; border: none; }}
-            QFrame#transcriptRow {{ background: transparent; border: none; border-bottom: 1px solid #edf0ed; border-radius: 0; }}
-            QFrame#transcriptRow:hover {{ background: #f7faf7; }}
+            QFrame#transcriptRow {{ background: transparent; border: none; border-bottom: 1px solid {PALETTE['transcript_row_border']}; border-radius: 0; }}
+            QFrame#transcriptRow:hover {{ background: {PALETTE['surface_hover']}; }}
             QFrame#transcriptRow[critical="true"] {{
-                background: #f1f9f2;
-                border: 1px solid #cbe5cf;
+                background: {PALETTE['transcript_critical_bg']};
+                border: 1px solid {PALETTE['transcript_critical_border']};
                 border-radius: 7px;
             }}
             QFrame#transcriptRow[playbackState="active"] {{
-                background: #e5f4e7;
+                background: {PALETTE['transcript_played_bg']};
                 border: 1px solid {PALETTE['green_accessible']};
                 border-radius: 7px;
             }}
@@ -3066,9 +3251,9 @@ class SentryWindow(QMainWindow):
                 color: white;
                 border: 1px solid {PALETTE['green_accessible']};
             }}
-            QPushButton#validateButton:hover {{ background: #238537; }}
+            QPushButton#validateButton:hover {{ background: {PALETTE['primary_hover']}; }}
             QPushButton#validateButton:disabled {{
-                background: #eceeec;
+                background: {PALETTE['disabled_bg']};
                 color: {PALETTE['gray_light']};
                 border-color: {PALETTE['border']};
             }}
@@ -3085,8 +3270,8 @@ class SentryWindow(QMainWindow):
             QLabel#reportValue, QLabel#reportValueAccent {{ color: {PALETTE['text']}; font-size: 28px; font-weight: 600; }}
             QLabel#reportValueAccent {{ color: {PALETTE['green_accessible']}; }}
             QLabel#toast {{
-                background: {PALETTE['charcoal']};
-                color: white;
+                background: {PALETTE['toast_bg']};
+                color: {PALETTE['toast_text']};
                 border: none;
                 border-radius: 8px;
                 padding: 11px 16px;
@@ -3096,8 +3281,8 @@ class SentryWindow(QMainWindow):
             QScrollBar::handle:vertical {{ background: {PALETTE['border_strong']}; min-height: 28px; border-radius: 4px; }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
             QToolTip {{
-                background: {PALETTE['charcoal']};
-                color: white;
+                background: {PALETTE['tooltip_bg']};
+                color: {PALETTE['tooltip_text']};
                 border: none;
                 padding: 6px;
             }}

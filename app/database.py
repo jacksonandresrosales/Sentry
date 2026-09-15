@@ -118,7 +118,7 @@ class Database:
     def save_settings(self, values: dict[str, str]):
         allowed = {
             "audio_directory", "nas_directory", "audio_source", "keywords",
-            "base_output_folder", "audio_filter_base",
+            "base_output_folder", "audio_filter_base", "theme",
         }
         if set(values) - allowed:
             raise ValueError("Solo se permiten ajustes locales sin credenciales.")
