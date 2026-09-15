@@ -1,4 +1,4 @@
-"""Persistencia local SQLite. Las credenciales nunca se almacenan aquí."""
+"""Persistencia SQLite; las credenciales se guardan únicamente como blobs cifrados por DPAPI."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -31,6 +31,19 @@ CREATE TABLE IF NOT EXISTS keyword_hits (
 );
 CREATE INDEX IF NOT EXISTS idx_keyword_hits_call ON keyword_hits(call_id);
 CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS api_credentials (
+    service TEXT PRIMARY KEY CHECK(service IN ('transcription','analysis')),
+    provider TEXT NOT NULL, model TEXT NOT NULL, encrypted_key TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS transcription_cache (
+    cache_key TEXT PRIMARY KEY, transcript_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS analysis_cache (
+    cache_key TEXT PRIMARY KEY, result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS base_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     input_paths TEXT NOT NULL, output_path TEXT,
@@ -61,10 +74,24 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version > 1:
+            if version > 2:
                 raise RuntimeError("La base de datos pertenece a una versión más nueva de Sentry.")
             connection.executescript(SCHEMA)
-            connection.execute("PRAGMA user_version=1")
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(calls)")}
+            additions = {
+                "category": "TEXT NOT NULL DEFAULT 'PENDIENTE'",
+                "transcript_json": "TEXT",
+                "analysis_error": "TEXT",
+                "cache_key": "TEXT",
+                "reviewed": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE calls ADD COLUMN {name} {definition}")
+            connection.execute("UPDATE calls SET status='ERROR', analysis_error="
+                               "'El análisis fue interrumpido al cerrar la aplicación.' "
+                               "WHERE status IN ('TRANSFIRIENDO','ANALIZANDO')")
+            connection.execute("PRAGMA user_version=2")
 
     @contextmanager
     def connect(self):
@@ -97,6 +124,89 @@ class Database:
                 ((call.filename, str(call.source_path.resolve()), call.duration)
                  for call in calls if call.source_path is not None),
             )
+
+    def save_credential(self, service: str, provider: str, model: str, encrypted_key: str):
+        if service not in {"transcription", "analysis"}:
+            raise ValueError("Servicio API desconocido.")
+        with self.connect() as connection:
+            connection.execute("INSERT INTO api_credentials(service,provider,model,encrypted_key) VALUES (?,?,?,?) "
+                               "ON CONFLICT(service) DO UPDATE SET provider=excluded.provider,model=excluded.model,"
+                               "encrypted_key=excluded.encrypted_key,updated_at=CURRENT_TIMESTAMP",
+                               (service, provider, model, encrypted_key))
+
+    def credentials(self):
+        with self.connect() as connection:
+            return {row["service"]: dict(row) for row in connection.execute("SELECT * FROM api_credentials")}
+
+    def call_rows(self, paths=None):
+        with self.connect() as connection:
+            if paths is None:
+                result = [dict(row) for row in connection.execute("SELECT * FROM calls ORDER BY id")]
+            else:
+                normalized = [str(Path(path).resolve()) for path in paths]
+                if not normalized:
+                    return []
+                placeholders = ",".join("?" for _ in normalized)
+                found = {row["file_path"]: dict(row) for row in connection.execute(
+                    f"SELECT * FROM calls WHERE file_path IN ({placeholders})", normalized)}
+                result = [found[path] for path in normalized if path in found]
+            for item in result:
+                item["hits"] = [dict(hit) for hit in connection.execute(
+                    "SELECT keyword,speaker,timestamp_seconds,context_snippet,is_risk_validated "
+                    "FROM keyword_hits WHERE call_id=? ORDER BY timestamp_seconds", (item["id"],))]
+            return result
+
+    def set_call_status(self, file_path, status: str, error=None):
+        with self.connect() as connection:
+            connection.execute("UPDATE calls SET status=?,analysis_error=? WHERE file_path=?",
+                               (status, error, str(Path(file_path).resolve())))
+
+    def cache_get(self, table: str, key: str):
+        if table not in {"transcription_cache", "analysis_cache"}:
+            raise ValueError("Caché desconocida.")
+        column = "transcript_json" if table == "transcription_cache" else "result_json"
+        with self.connect() as connection:
+            row = connection.execute(f"SELECT {column} FROM {table} WHERE cache_key=?", (key,)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def cache_set(self, table: str, key: str, payload):
+        if table not in {"transcription_cache", "analysis_cache"}:
+            raise ValueError("Caché desconocida.")
+        column = "transcript_json" if table == "transcription_cache" else "result_json"
+        with self.connect() as connection:
+            connection.execute(f"INSERT INTO {table}(cache_key,{column}) VALUES (?,?) "
+                               f"ON CONFLICT(cache_key) DO UPDATE SET {column}=excluded.{column}",
+                               (key, json.dumps(payload, ensure_ascii=False)))
+
+    def save_call_result(self, file_path, cache_key: str, transcript, result):
+        path = str(Path(file_path).resolve())
+        hits = result.get("hits", [])
+        with self.connect() as connection:
+            row = connection.execute("SELECT id FROM calls WHERE file_path=?", (path,)).fetchone()
+            if row is None:
+                raise ValueError(f"El audio ya no está registrado: {path}")
+            call_id = row[0]
+            connection.execute("DELETE FROM keyword_hits WHERE call_id=?", (call_id,))
+            connection.executemany(
+                "INSERT INTO keyword_hits(call_id,keyword,speaker,timestamp_seconds,context_snippet,is_risk_validated) "
+                "VALUES (?,?,?,?,?,?)",
+                ((call_id, hit.get("keyword", ""), hit.get("speaker"), float(hit.get("second", 0)),
+                  hit.get("snippet", ""), int(bool(hit.get("validated", False)))) for hit in hits),
+            )
+            category = result["category"]
+            connection.execute(
+                "UPDATE calls SET status='COMPLETADO',transcript=?,transcript_json=?,summary=?,sentiment=?,"
+                "risk_level=?,has_sensitive_keyword=?,category=?,analysis_error=NULL,cache_key=?,"
+                "processed_at=CURRENT_TIMESTAMP WHERE id=?",
+                (transcript.get("text", ""), json.dumps(transcript, ensure_ascii=False),
+                 result.get("summary", ""), result.get("sentiment", "NEUTRAL"), result.get("risk", "BAJO"),
+                 int(category == "ALERTA"), category, cache_key, call_id),
+            )
+
+    def set_reviewed(self, file_path, reviewed=True):
+        with self.connect() as connection:
+            connection.execute("UPDATE calls SET reviewed=? WHERE file_path=?",
+                               (int(reviewed), str(Path(file_path).resolve())))
 
     def start_job(self, paths, options) -> int:
         with self.connect() as connection:

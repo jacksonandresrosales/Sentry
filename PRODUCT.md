@@ -28,8 +28,8 @@ Uso interno en escritorio, con grabaciones almacenadas en carpetas locales, unid
 
 ## Capabilities and Constraints
 
-- Audio local con escaneo y reproducción; transcripción y análisis automatizados aún pendientes. La vista Bases integra la transformación CSV/Excel al modelo NO, exportación con numeración segura e historial SQLite. Los reportes de auditoría siguen siendo demostrativos.
-- La configuración permite sustituir proveedor, modelo y claves de transcripción y análisis. La credencial se valida únicamente contra el proveedor seleccionado y, si es aceptada, se carga su catálogo de modelos. Mientras no exista almacenamiento protegido, las claves permanecen solo durante la sesión.
+- Audio local con escaneo, reproducción y análisis bajo demanda. El flujo transcribe, clasifica en alerta, buzón o normal, sincroniza el texto con la reproducción, guarda cada resultado en SQLite y reutiliza cachés por huella/configuración para evitar consumos repetidos. La lista admite filtros y orden por prioridad, duración, fecha o nombre. La vista Bases integra la transformación CSV/Excel al modelo NO. La auditoría y los reportes no muestran datos ficticios.
+- La configuración permite sustituir proveedor, modelo y claves de transcripción y análisis. Las credenciales validadas o guardadas se cifran mediante DPAPI y solo el mismo usuario de Windows puede recuperarlas; nunca se almacenan en texto plano.
 - Estructura de referencia: barra superior, navegación entre Auditoría, Reportes y Configuración, métricas, lista maestra y panel de detalle.
 - Idioma principal: español.
 - Datos sensibles deben aparecer anonimizados.

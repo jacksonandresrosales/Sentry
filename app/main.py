@@ -11,7 +11,7 @@ def main() -> int:
         from PySide6.QtWidgets import QApplication, QMessageBox
         from app.ui.views.main_window import SentryWindow, install_ui_font
     except ModuleNotFoundError as exc:
-        if exc.name in {"PySide6", "openpyxl", "xlsxwriter"}:
+        if exc.name in {"PySide6", "openpyxl", "xlsxwriter", "requests"}:
             raise SystemExit(
                 f"Falta {exc.name}. Ejecuta: python -m pip install -r requirements.txt"
             ) from exc

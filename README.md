@@ -6,8 +6,8 @@ Aplicación de escritorio para la auditoría, transcripción y análisis automat
 
 ## 🚀 Stack Tecnológico
 * **Interfaz de Escritorio:** PySide6 (Qt 6)
-* **Transcripción (STT):** Deepgram Nova-3 (Diarización + Enmascaramiento PII)
-* **Inteligencia y Resúmenes (LLM):** Google Gemini 1.5 Flash
+* **Transcripción (STT):** Deepgram Nova-3 u OpenAI GPT-4o Transcribe Diarize
+* **Inteligencia y Resúmenes (LLM):** Google Gemini Flash-Lite u OpenAI
 * **Base de Datos:** SQLite 3
 
 ---
@@ -28,7 +28,7 @@ La funcionalidad también está integrada en Sentry: abre `Sentry.cmd` y pulsa *
 
 ## Base de datos local
 
-Se crea automáticamente en `data/db/sentry_audit.db`. Incluye `calls`, `keyword_hits`, `app_settings`, `base_jobs` y `base_records`. Guarda los audios detectados, ajustes no secretos, ejecuciones y registros únicos procesados; mantiene teléfonos y documentos como texto. Las llamadas de demostración no se guardan. Las claves API siguen solo en memoria.
+Se crea automáticamente en `data/db/sentry_audit.db`. Incluye `calls`, `keyword_hits`, `app_settings`, `base_jobs` y `base_records`. Guarda los audios detectados, ajustes no secretos, ejecuciones y registros únicos procesados; mantiene teléfonos y documentos como texto. La aplicación inicia sin llamadas ficticias y recupera los análisis reales guardados. Las claves API se almacenan cifradas mediante DPAPI.
 
 Para preparar el esquema sin abrir la interfaz:
 
@@ -55,7 +55,17 @@ python -m pip install -r requirements.txt
 python -m app.main
 ```
 
-El botón **Escanear carpeta** busca archivos `.wav` y `.mp3` de forma recursiva y obtiene la duración de archivos WAV compatibles. Deepgram u OpenAI pueden transcribir cada audio; la separación de voces y el contenido de sus frases permiten distinguir al asesor del cliente. Los términos sensibles se buscan localmente y Gemini solo se consulta cuando existe una posible alerta, reduciendo consumo. Los audios se procesan uno por uno y los errores no detienen la cola. En Configuración se pueden cambiar proveedor, modelo y clave para cada servicio. La transformación de bases y su exportación Excel están conectadas a SQLite desde **Bases**; los reportes agregados siguen siendo demostrativos.
+El botón **Escanear carpeta** busca `.wav` y `.mp3` de forma recursiva y los registra en SQLite. **Analizar** transcribe los audios y los separa en **Demandas / alertas**, **Buzones** y **Llamadas normales**. A la derecha de **Llamadas detectadas** se puede filtrar por clasificación y ordenar por prioridad de términos, duración, fecha, nombre u orden original. La diarización distingue las voces y Sentry usa localmente expresiones habituales de atención para rotularlas como **Asesor** y **Cliente**, sin una consulta adicional a la IA. Cada palabra o frase configurada que aparezca se añade como etiqueta visible y buscable en la llamada.
+
+La transcripción acompaña la reproducción y desplaza automáticamente la línea activa. Cuando el proveedor entrega tiempos por palabra, el texto progresa con esas marcas exactas; los análisis anteriores usan una interpolación local sin consumir nuevamente la API. También se puede pulsar cualquier bloque para mover el audio a ese segundo, y **Ir al momento** centra tanto la evidencia escrita como el audio.
+
+Se guarda cada llamada apenas termina; al reiniciar se recuperan lista, transcripción, resumen, categoría, etiquetas, evidencias y estado de revisión. Los trabajos interrumpidos quedan marcados para reintentar.
+
+Para reducir consumo, Sentry calcula una huella SHA-256 y conserva cachés separadas de transcripción y análisis: repetir el botón con el mismo audio, modelos y términos no vuelve a llamar a las APIs. Si no hay términos sensibles, la clasificación normal se hace localmente y no consume la API contextual; esta solo recibe fragmentos cercanos a posibles coincidencias. Un audio sin conversación o con un único hablante detectado se clasifica como buzón.
+
+En **Configuración** se cambian proveedor, modelo y claves. **Validar** comprueba la credencial y carga modelos. Al guardar ajustes, al validar o al cerrar Sentry, las claves se cifran mediante la protección DPAPI de Windows y se almacenan en SQLite; no quedan en texto plano y solo el mismo usuario de Windows puede recuperarlas. También pueden suministrarse mediante `DEEPGRAM_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY` u `OPENAI_API_KEY`.
+
+La transformación de bases y su Excel siguen disponibles desde **Bases**. Los reportes muestran únicamente conteos reales del directorio analizado; si no hay grabaciones presentan un estado vacío.
 
 Pruebas con CSV ficticios, SQLite temporal e interfaz sin pantalla:
 

@@ -2,23 +2,20 @@ from __future__ import annotations
 
 import html
 import json
-import mimetypes
 import os
-import unicodedata
-import uuid
-import urllib.error
-import urllib.parse
-import urllib.request
+import re
 import wave
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import sqlite3
 
 from app.database import Database, DEFAULT_DATABASE
+from app.secret_store import SecretStoreError, protect, unprotect
+from app.services.audio_analysis import analyze_file, assign_roles
 from app.ui.views.bases_page import BasesPage
 
-from PySide6.QtCore import QByteArray, QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtCore import QByteArray, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
@@ -35,7 +32,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
-    QProgressBar,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -67,36 +64,6 @@ PALETTE = {
 }
 
 AUDIO_SUFFIXES = {".mp3", ".wav"}
-TRANSCRIPTION_LANGUAGE = "es-419"
-
-ADVISOR_SIGNALS = (
-    ("le atiende", 4),
-    ("en que puedo ayudar", 4),
-    ("como puedo ayudar", 4),
-    ("gracias por comunicarse", 4),
-    ("gracias por llamar", 4),
-    ("bienvenido a", 3),
-    ("servicio al cliente", 3),
-    ("voy a validar", 2),
-    ("permita validar", 2),
-    ("voy a revisar", 2),
-    ("me confirma", 2),
-    ("numero de caso", 2),
-)
-
-CUSTOMER_SIGNALS = (
-    ("llamo porque", 4),
-    ("llamo por", 3),
-    ("quiero cancelar", 3),
-    ("quiero dar de baja", 3),
-    ("tengo un problema", 3),
-    ("me cobraron", 3),
-    ("me estan cobrando", 3),
-    ("mi factura", 2),
-    ("mi servicio", 2),
-    ("necesito ayuda", 2),
-    ("quiero reclamar", 2),
-)
 
 
 def scan_audio_files(directory: Path) -> tuple[Path, ...]:
@@ -128,6 +95,7 @@ class TranscriptLine:
     speaker: str
     text: str
     critical: bool = False
+    word_seconds: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -147,135 +115,13 @@ class CallRecord:
     snippet: str
     transcript: tuple[TranscriptLine, ...]
     source_path: Path | None = None
-
-
-DEMO_CALLS = (
-    CallRecord(
-        1,
-        "audio_20260914_103015.wav",
-        "Juan Pérez",
-        "+593 98***123",
-        "10:30",
-        54,
-        "Alerta legal",
-        True,
-        "demanda",
-        38,
-        "Crítica",
-        "El cliente reclama por un cobro duplicado de $45. Advierte que, si no se acredita el saldo hoy, presentará una demanda formal con su abogado.",
-        "…si hoy no me acreditan el dinero voy a presentar una demanda formal…",
-        (
-            TranscriptLine(3, "Asesor", "Buenas tardes, atención al cliente le atiende Juan. ¿Con quién tengo el gusto?"),
-            TranscriptLine(10, "Cliente", "Llevo tres días esperando que me devuelvan los 45 dólares que me cobraron doble en mi tarjeta terminada en [DATOS_PROTEGIDOS]."),
-            TranscriptLine(38, "Cliente", "¡Si hoy no me acreditan mi dinero voy a presentar una DEMANDA formal con mi abogado!", True),
-            TranscriptLine(47, "Asesor", "Comprendo. En este instante escalo el caso con supervisión para darle seguimiento."),
-        ),
-    ),
-    CallRecord(
-        2,
-        "audio_20260914_111502.wav",
-        "María Gómez",
-        "+593 99***456",
-        "11:15",
-        48,
-        "Alerta legal",
-        True,
-        "abogado",
-        31,
-        "Alta",
-        "La clienta reporta interrupciones recurrentes. Solicita una solución inmediata y comunica que consultará a su abogado para presentar una denuncia.",
-        "…voy a llamar a mi abogado para denunciar las interrupciones…",
-        (
-            TranscriptLine(2, "Asesor", "Gracias por comunicarse. Le atiende María, ¿en qué puedo ayudarle?"),
-            TranscriptLine(9, "Cliente", "El servicio se corta cada noche y ya registré tres reclamos sin respuesta."),
-            TranscriptLine(31, "Cliente", "Voy a llamar a mi ABOGADO para denunciar esto si hoy no lo solucionan.", True),
-            TranscriptLine(40, "Asesor", "Voy a validar la incidencia y escalarla al área técnica de prioridad."),
-        ),
-    ),
-    CallRecord(
-        3,
-        "audio_20260914_094011.wav",
-        "Carlos Loor",
-        "+593 92***789",
-        "09:40",
-        42,
-        "Cancelación",
-        False,
-        "cancelación",
-        None,
-        "Baja",
-        "El cliente desea cancelar el servicio por fallas recurrentes. El agente inicia el procedimiento de retención y revisión técnica.",
-        "Quiero dar de baja el servicio; estoy teniendo fallas…",
-        (
-            TranscriptLine(4, "Asesor", "Buenos días, le atiende Carlos. ¿Cómo puedo ayudarle?"),
-            TranscriptLine(12, "Cliente", "Quiero dar de baja el servicio porque sigo teniendo fallas."),
-            TranscriptLine(27, "Asesor", "Antes de cancelar, puedo solicitar una revisión prioritaria sin costo."),
-        ),
-    ),
-    CallRecord(
-        4,
-        "audio_20260914_091204.wav",
-        "Sofía Castro",
-        "+593 95***001",
-        "09:12",
-        38,
-        "Consulta",
-        False,
-        "consulta",
-        None,
-        "Baja",
-        "La clienta consulta el saldo de su plan. La información fue confirmada y la llamada terminó sin incidencias.",
-        "Muchas gracias por confirmarme el saldo de mi plan…",
-        (
-            TranscriptLine(3, "Asesor", "Buenos días, le atiende Sofía. ¿En qué puedo ayudarle?"),
-            TranscriptLine(8, "Cliente", "Quisiera confirmar el saldo y la fecha de corte de mi plan."),
-            TranscriptLine(24, "Asesor", "Su saldo está al día y la siguiente fecha de corte es el 28 de septiembre."),
-            TranscriptLine(34, "Cliente", "Perfecto, muchas gracias por la ayuda."),
-        ),
-    ),
-)
+    category_code: str = ""
+    tags: tuple[str, ...] = ()
 
 
 def format_time(seconds: int) -> str:
     minutes, remaining = divmod(max(0, seconds), 60)
     return f"{minutes:02d}:{remaining:02d}"
-
-
-def _infer_speaker_roles(utterances: list[object]) -> dict[str, str]:
-    samples: dict[str, list[str]] = {}
-    for item in utterances:
-        if not isinstance(item, dict) or not str(item.get("transcript", "")).strip():
-            continue
-        speaker = str(item.get("speaker", 0))
-        samples.setdefault(speaker, []).append(str(item["transcript"]))
-
-    speakers = list(samples)
-    roles = {speaker: f"Participante {index}" for index, speaker in enumerate(speakers, 1)}
-    if not speakers:
-        return roles
-
-    def score(texts: list[str], signals: tuple[tuple[str, int], ...]) -> int:
-        text = " ".join(texts)
-        text = "".join(character for character in unicodedata.normalize("NFD", text.casefold()) if not unicodedata.combining(character))
-        return sum(weight for phrase, weight in signals if phrase in text)
-
-    def winner(scores: dict[str, int]) -> str | None:
-        ranked = sorted(scores, key=scores.get, reverse=True)
-        return ranked[0] if scores[ranked[0]] >= 3 and (len(ranked) == 1 or scores[ranked[0]] - scores[ranked[1]] >= 2) else None
-
-    advisor = winner({speaker: score(samples[speaker], ADVISOR_SIGNALS) for speaker in speakers})
-    customer = winner({speaker: score(samples[speaker], CUSTOMER_SIGNALS) for speaker in speakers})
-
-    if advisor:
-        roles[advisor] = "Asesor"
-    if customer and customer != advisor:
-        roles[customer] = "Cliente"
-    if len(speakers) == 2:
-        if advisor and not customer:
-            roles[next(speaker for speaker in speakers if speaker != advisor)] = "Cliente"
-        elif customer and not advisor:
-            roles[next(speaker for speaker in speakers if speaker != customer)] = "Asesor"
-    return roles
 
 
 def call_record_from_audio(path: Path, call_id: int) -> CallRecord:
@@ -316,144 +162,87 @@ def call_record_from_audio(path: Path, call_id: int) -> CallRecord:
         snippet="Archivo listo para procesar.",
         transcript=(TranscriptLine(0, "Sistema", "Transcripción pendiente."),),
         source_path=path,
+        category_code="PENDIENTE",
     )
 
 
-class AnalysisSignals(QObject):
-    finished = Signal(int, object)
-    failed = Signal(int, str)
-
-
-def _request_json(url: str, method: str, headers: dict[str, str], payload: object) -> object:
-    body = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(url, data=body, headers=headers, method=method)
-    with urllib.request.urlopen(request, timeout=120) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def _transcription_request(path: Path, provider: str, model: str, key: str) -> tuple[list[dict[str, object]], str]:
-    audio = path.read_bytes()
-    content_type = mimetypes.guess_type(path.name)[0] or "audio/wav"
-    if provider == "deepgram":
-        endpoint = "https://api.deepgram.com/v1/listen?" + urllib.parse.urlencode({
-            "model": model or "nova-3",
-            "language": TRANSCRIPTION_LANGUAGE,
-            "smart_format": "true",
-            "diarize": "true",
-            "utterances": "true",
-        })
-        payload = _request_bytes(endpoint, audio, {
-            "Authorization": f"Token {key}",
-            "Content-Type": content_type,
-        })
-        results = payload.get("results", {}) if isinstance(payload, dict) else {}
-        utterances = results.get("utterances", []) if isinstance(results, dict) else []
-        speaker_roles = _infer_speaker_roles(utterances)
-        lines = [
-            {
-                "second": round(float(item.get("start", 0))),
-                "speaker": speaker_roles.get(str(item.get("speaker", 0)), "Participante"),
-                "text": str(item.get("transcript", "")).strip(),
-            }
-            for item in utterances
-            if isinstance(item, dict) and str(item.get("transcript", "")).strip()
-        ]
-        channels = results.get("channels", []) if isinstance(results, dict) else []
-        transcript = ""
-        if channels and isinstance(channels[0], dict):
-            alternatives = channels[0].get("alternatives", [])
-            if alternatives and isinstance(alternatives[0], dict):
-                transcript = str(alternatives[0].get("transcript", "")).strip()
-        return lines or [{"second": 0, "speaker": "Transcripción", "text": transcript}], transcript
-
-    boundary = f"----Sentry{uuid.uuid4().hex}"
-    chunks = [
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model or 'gpt-4o-mini-transcribe'}\r\n".encode(),
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{path.name}\"\r\nContent-Type: {content_type}\r\n\r\n".encode(),
-        audio,
-        f"\r\n--{boundary}--\r\n".encode(),
-    ]
-    payload = _request_bytes("https://api.openai.com/v1/audio/transcriptions", b"".join(chunks), {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": f"multipart/form-data; boundary={boundary}",
-    })
-    transcript = str(payload.get("text", "")).strip() if isinstance(payload, dict) else ""
-    return [{"second": 0, "speaker": "Transcripción", "text": transcript}], transcript
-
-
-def _request_bytes(url: str, body: bytes, headers: dict[str, str]) -> object:
-    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=180) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def _summary_request(provider: str, model: str, key: str, transcript: str) -> str:
-    if len(transcript) > 4000:
-        transcript = transcript[:3000] + "\n[transcripción recortada]\n" + transcript[-1000:]
-    prompt = (
-        "Resume esta llamada en español en máximo 2 frases. Indica solo motivo, resultado "
-        "y riesgo. No inventes datos.\n\n" + transcript
+def call_record_from_row(row: dict) -> CallRecord:
+    category = row.get("category") or "PENDIENTE"
+    if row.get("status") == "ERROR":
+        category = "ERROR"
+    segments = []
+    try:
+        stored_transcript = json.loads(row.get("transcript_json") or "[]")
+    except json.JSONDecodeError:
+        stored_transcript = []
+    hits = row.get("hits") or []
+    if isinstance(stored_transcript, dict):
+        raw_segments = assign_roles(stored_transcript)["segments"]
+    else:
+        raw_segments = assign_roles({"segments": stored_transcript, "speaker_count":
+                                     len({item.get('speaker') for item in stored_transcript})
+                                     if stored_transcript else None})["segments"]
+    for item in raw_segments:
+        critical = any(hit.get("keyword", "").casefold() in str(item.get("text", "")).casefold() for hit in hits)
+        raw_word_seconds = item.get("word_seconds", ())
+        word_seconds = tuple(
+            float(second) for second in raw_word_seconds if isinstance(second, (int, float))
+        ) if isinstance(raw_word_seconds, (list, tuple)) else ()
+        segments.append(TranscriptLine(round(float(item.get("second", 0))), str(item.get("speaker", "Hablante")),
+                                       str(item.get("text", "")), critical, word_seconds))
+    path = Path(row["file_path"])
+    customer = "Sin identificar"
+    parts = path.stem.split("-")
+    if len(parts) >= 3 and parts[2].isdigit() and len(parts[2]) >= 7:
+        customer = f"{parts[2][:3]}***{parts[2][-4:]}"
+    risk = row.get("risk_level") or ("Pendiente" if category == "PENDIENTE" else "Bajo")
+    labels = {"ALERTA": "Alerta sensible", "BUZON": "Buzón / sin conversación",
+              "NORMAL": "Llamada normal", "PENDIENTE": "Pendiente", "ERROR": "Error"}
+    return CallRecord(
+        call_id=int(row["id"]), filename=row["filename"], agent="",
+        customer=customer, clock="--:--", duration=int(row.get("duration_seconds") or 0),
+        category=labels.get(category, category.title()), sensitive=category == "ALERTA",
+        keyword=hits[0]["keyword"] if hits else ("Sin analizar" if category == "PENDIENTE" else labels.get(category, category)),
+        hit_second=round(float(hits[0]["timestamp_seconds"])) if hits else None,
+        risk=risk.title(), summary=row.get("summary") or row.get("analysis_error") or
+        "El audio está pendiente de análisis.", snippet=row.get("analysis_error") or "",
+        transcript=tuple(segments) or (TranscriptLine(0, "Sistema", "Transcripción pendiente."),), source_path=path,
+        category_code=category,
+        tags=tuple(dict.fromkeys(str(hit["keyword"]) for hit in hits if hit.get("keyword"))),
     )
-    if provider == "gemini":
-        generation_config = {"temperature": 0.1, "candidateCount": 1, "maxOutputTokens": 100}
-        if (model or "").startswith("gemini-2.5-flash"):
-            generation_config["thinkingConfig"] = {"thinkingBudget": 0}
-        payload = _request_json(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model or 'gemini-2.5-flash-lite'}:generateContent?key={key}",
-            "POST",
-            {"Content-Type": "application/json"},
-            {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": generation_config},
-        )
-        candidates = payload.get("candidates", []) if isinstance(payload, dict) else []
-        parts = candidates[0].get("content", {}).get("parts", []) if candidates and isinstance(candidates[0], dict) else []
-        return str(parts[0].get("text", "")).strip() if parts and isinstance(parts[0], dict) else ""
-
-    payload = _request_json(
-        "https://api.openai.com/v1/chat/completions",
-        "POST",
-        {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        {"model": model or "gpt-4o-mini", "temperature": 0.1, "messages": [{"role": "user", "content": prompt}]},
-    )
-    choices = payload.get("choices", []) if isinstance(payload, dict) else []
-    message = choices[0].get("message", {}) if choices and isinstance(choices[0], dict) else {}
-    return str(message.get("content", "")).strip() if isinstance(message, dict) else ""
 
 
-class AudioAnalysisJob(QRunnable):
-    def __init__(self, call_id: int, path: Path, transcription: tuple[str, str, str], analysis: tuple[str, str, str], keywords: tuple[str, ...]) -> None:
-        super().__init__()
-        self.call_id = call_id
-        self.path = path
-        self.transcription = transcription
-        self.analysis = analysis
-        self.keywords = keywords
-        self.signals = AnalysisSignals()
+class AnalysisWorker(QThread):
+    progress = Signal(int, int, str)
+    row_ready = Signal(object)
+    completed = Signal(int, int, bool)
 
-    def run(self) -> None:
-        try:
-            lines, transcript = _transcription_request(self.path, *self.transcription)
-            lowered = transcript.casefold()
-            matches = [word for word in self.keywords if word.casefold() in lowered]
-            keyword = matches[0] if matches else "Sin alertas"
-            hit_second = next((int(line["second"]) for line in lines if any(word.casefold() in str(line["text"]).casefold() for word in matches)), None)
-            summary = ""
-            use_gemini = self.analysis[0] == "gemini"
-            if self.analysis[2].strip() and transcript and (not use_gemini or matches):
+    def __init__(self, database, paths, config, parent=None):
+        super().__init__(parent)
+        self.database, self.paths, self.config = database, paths, config
+        self._stop = False
+
+    def request_stop(self):
+        self._stop = True
+
+    def run(self):
+        completed = failures = 0
+        for index, path in enumerate(self.paths, 1):
+            if self._stop:
+                break
+            self.progress.emit(index, len(self.paths), Path(path).name)
+            try:
+                row = analyze_file(self.database, Path(path), self.config)
+            except Exception as exc:
                 try:
-                    summary = _summary_request(*self.analysis, transcript)
-                except (OSError, ValueError, KeyError, json.JSONDecodeError):
-                    summary = ""
-            if not summary:
-                summary = "Transcripción completada. " + ("Se detectaron términos sensibles." if matches else "No se detectaron términos sensibles.")
-            self.signals.finished.emit(self.call_id, {
-                "lines": lines,
-                "summary": summary,
-                "matches": matches,
-                "keyword": keyword,
-                "hit_second": hit_second,
-            })
-        except (OSError, ValueError, KeyError, json.JSONDecodeError, urllib.error.URLError) as error:
-            self.signals.failed.emit(self.call_id, str(error))
+                    self.database.set_call_status(path, "ERROR", str(exc))
+                except Exception:
+                    pass
+                failures += 1
+            else:
+                completed += 1
+                self.row_ready.emit(row)
+        self.completed.emit(completed, failures, self._stop)
 
 
 class AudioTimeline(QWidget):
@@ -521,6 +310,30 @@ class AudioTimeline(QWidget):
             painter.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), 7, 7)
 
 
+class TranscriptRow(QFrame):
+    seek_requested = Signal(int)
+
+    def __init__(self, second: int) -> None:
+        super().__init__()
+        self.second = second
+        self.setObjectName("transcriptRow")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAccessibleName(f"Ir al segundo {format_time(second)} de la llamada")
+        self.setToolTip(f"Ir a {format_time(second)}")
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.seek_requested.emit(self.second)
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.seek_requested.emit(self.second)
+            return
+        super().keyPressEvent(event)
+
+
 class CallCard(QFrame):
     clicked = Signal(int)
 
@@ -547,8 +360,39 @@ class CallCard(QFrame):
         customer.setToolTip(call.customer)
         top.addWidget(customer)
 
-        badge = QLabel(call.keyword.capitalize())
-        badge.setObjectName("sensitiveBadge" if call.sensitive else "neutralBadge")
+        classification = call.category_code or ("ALERTA" if call.sensitive else "NORMAL")
+        classification_labels = {
+            "ALERTA": "Demanda / alerta",
+            "BUZON": "Buzón",
+            "NORMAL": "Llamada normal",
+        }
+        icon_names = {
+            "ALERTA": "category-alert.svg",
+            "BUZON": "category-mailbox.svg",
+            "NORMAL": "category-normal.svg",
+        }
+        tag_text = " · ".join(call.tags[:2])
+        if len(call.tags) > 2:
+            tag_text += f" · +{len(call.tags) - 2}"
+        badge = QFrame()
+        badge.setObjectName("classificationBadge")
+        badge.setProperty("category", classification)
+        badge_layout = QHBoxLayout(badge)
+        badge_layout.setContentsMargins(6, 2, 6, 2)
+        badge_layout.setSpacing(4)
+        icon_name = icon_names.get(classification)
+        if icon_name:
+            icon = QLabel()
+            icon.setObjectName("classificationIcon")
+            icon.setPixmap(QIcon(str(Path(__file__).resolve().parents[1] / "assets" / icon_name)).pixmap(14, 14))
+            badge_layout.addWidget(icon)
+        badge_text = QLabel(tag_text or classification_labels.get(classification, call.keyword.capitalize()))
+        badge_text.setObjectName("classificationText")
+        badge_layout.addWidget(badge_text)
+        if call.tags:
+            badge.setToolTip("Etiquetas encontradas: " + ", ".join(call.tags))
+        else:
+            badge.setToolTip("Clasificación: " + classification_labels.get(classification, call.category))
         top.addWidget(badge)
         top.addStretch()
 
@@ -589,19 +433,22 @@ class SentryWindow(QMainWindow):
         self.resize(1440, 860)
         self.setMinimumSize(1080, 680)
 
-        self.call_records = list(DEMO_CALLS)
-        self.calls = {call.call_id: call for call in self.call_records}
+        self.call_records: list[CallRecord] = []
+        self.calls: dict[int, CallRecord] = {}
         self.detected_audio_files: tuple[Path, ...] = ()
-        self.current_call = DEMO_CALLS[0]
+        self.current_call: CallRecord | None = None
         self.current_second = 0
-        self.current_duration = self.current_call.duration
+        self.current_duration = 0
         self.call_cards: dict[int, CallCard] = {}
         self.nav_buttons: dict[str, QPushButton] = {}
         self.critical_line: QWidget | None = None
+        self.transcript_rows: list[tuple[TranscriptLine, TranscriptRow, QLabel]] = []
+        self.active_transcript_index = -1
+        self.sort_mode = "original"
+        self.sort_label = "original"
         self.network = QNetworkAccessManager(self)
-        self.analysis_pool = QThreadPool(self)
-        self.analysis_queue: list[int] = []
-        self.analysis_running = False
+        self.analysis_worker: AnalysisWorker | None = None
+        self.close_after_analysis = False
 
         self.audio_output = QAudioOutput(self)
         self.audio_output.setVolume(1.0)
@@ -624,7 +471,18 @@ class SentryWindow(QMainWindow):
             self._set_directory_display(settings["audio_directory"])
         if "keywords" in settings:
             self.keywords_input.setText(settings["keywords"])
-        self.call_list.setCurrentRow(0)
+        self._restore_credentials()
+        persisted = self.database.call_rows()
+        if persisted:
+            self.call_records = [call_record_from_row(row) for row in persisted]
+            self.calls = {call.call_id: call for call in self.call_records}
+            self.detected_audio_files = tuple(call.source_path for call in self.call_records if call.source_path)
+            self._populate_call_list()
+            self._update_category_metrics()
+        if self.call_list.count():
+            self.call_list.setCurrentRow(0)
+        else:
+            self._show_empty_state()
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -695,7 +553,7 @@ class SentryWindow(QMainWindow):
         self.directory_label.setAccessibleName("Directorio actual")
         self.directory_label.setMinimumWidth(90)
         self.directory_label.setMaximumWidth(155)
-        self._set_directory_display(r"C:\Grabaciones\Llamadas_Entrantes")
+        self._set_directory_display("")
         directory_layout.addWidget(self.directory_label, 1)
         change = QPushButton("Cambiar")
         change.setObjectName("linkButton")
@@ -719,7 +577,7 @@ class SentryWindow(QMainWindow):
         nav = QHBoxLayout()
         nav.setSpacing(4)
         for index, (key, text, icon) in enumerate((
-            ("audit", "Auditoría  ·  2", None),
+            ("audit", "Auditoría", None),
             ("reports", "Reportes", None),
             ("config", "Configuración", QIcon(str(assets_path / "settings.svg"))),
         )):
@@ -749,6 +607,12 @@ class SentryWindow(QMainWindow):
         self.scan_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.scan_button.clicked.connect(self._scan_directory)
         layout.addWidget(self.scan_button)
+        self.analyze_button = QPushButton("Analizar")
+        self.analyze_button.setObjectName("primaryButton")
+        self.analyze_button.setAccessibleName("Analizar audios automáticamente")
+        self.analyze_button.setToolTip("Transcribe pendientes y los separa en alertas, buzones y normales")
+        self.analyze_button.clicked.connect(self._start_analysis)
+        layout.addWidget(self.analyze_button)
         return header
 
     def _build_audit_page(self) -> QWidget:
@@ -779,9 +643,10 @@ class SentryWindow(QMainWindow):
         layout.setSpacing(18)
 
         for attribute, value, label, accent in (
-            ("files_metric", "22", "Archivos", False),
-            ("sensitive_metric", "02", "Sensibles", True),
-            ("normal_metric", "20", "Sin novedad", False),
+            ("files_metric", "0", "Archivos", False),
+            ("sensitive_metric", "0", "Alertas", True),
+            ("mailbox_metric", "0", "Buzones", False),
+            ("normal_metric", "0", "Normales", False),
         ):
             metric = QVBoxLayout()
             metric.setSpacing(0)
@@ -799,7 +664,7 @@ class SentryWindow(QMainWindow):
         layout.addStretch()
         self.search_input = QLineEdit()
         self.search_input.setObjectName("searchInput")
-        self.search_input.setPlaceholderText("Buscar por archivo, agente o cliente")
+        self.search_input.setPlaceholderText("Buscar por archivo, cliente o etiqueta")
         self.search_input.setClearButtonEnabled(True)
         self.search_input.setMinimumWidth(260)
         self.search_input.textChanged.connect(self._filter_calls)
@@ -807,10 +672,11 @@ class SentryWindow(QMainWindow):
 
         self.status_filter = QComboBox()
         self.status_filter.addItem("Todas las llamadas", "all")
-        self.status_filter.addItem("Solo sensibles", "sensitive")
-        self.status_filter.addItem("Sin novedad", "normal")
+        self.status_filter.addItem("Demandas / alertas", "alert")
+        self.status_filter.addItem("Buzones", "mailbox")
+        self.status_filter.addItem("Llamadas normales", "normal")
+        self.status_filter.addItem("Pendientes / errores", "pending")
         self.status_filter.currentIndexChanged.connect(self._filter_calls)
-        layout.addWidget(self.status_filter)
 
         self.export_button = QPushButton("Exportar Excel")
         self.export_button.setObjectName("secondaryButton")
@@ -831,10 +697,31 @@ class SentryWindow(QMainWindow):
         heading_layout.setContentsMargins(16, 11, 16, 11)
         title = QLabel("Llamadas detectadas")
         title.setObjectName("sectionTitle")
-        self.call_count = QLabel("4 llamadas")
+        self.call_count = QLabel("0 llamadas")
         self.call_count.setObjectName("monoMuted")
         heading_layout.addWidget(title)
         heading_layout.addStretch()
+        self.sort_button = QPushButton("Orden: original")
+        self.sort_button.setObjectName("sortButton")
+        self.sort_button.setAccessibleName("Ordenar llamadas")
+        self.sort_button.setToolTip("La prioridad respeta el orden de los términos sensibles configurados")
+        sort_menu = QMenu(self.sort_button)
+        for label, short_label, mode in (
+            ("Prioridad de términos sensibles", "prioridad", "priority"),
+            ("Mayor duración primero", "mayor duración", "duration_desc"),
+            ("Menor duración primero", "menor duración", "duration_asc"),
+            ("Más recientes", "más recientes", "newest"),
+            ("Más antiguas", "más antiguas", "oldest"),
+            ("Nombre A-Z", "nombre A-Z", "name"),
+            ("Orden original", "original", "original"),
+        ):
+            action = sort_menu.addAction(label)
+            action.triggered.connect(lambda _checked=False, m=mode, text=short_label: self._sort_calls(m, text))
+        self.sort_button.setMenu(sort_menu)
+        heading_layout.addWidget(self.sort_button)
+        self.status_filter.setMinimumWidth(165)
+        self.status_filter.setAccessibleName("Organizar llamadas por clasificación")
+        heading_layout.addWidget(self.status_filter)
         heading_layout.addWidget(self.call_count)
         layout.addWidget(heading)
 
@@ -850,6 +737,7 @@ class SentryWindow(QMainWindow):
         return panel
 
     def _populate_call_list(self) -> None:
+        self._apply_call_sort()
         self.call_list.blockSignals(True)
         try:
             self.call_list.clear()
@@ -868,7 +756,85 @@ class SentryWindow(QMainWindow):
         count = len(self.call_records)
         self.call_count.setText(f"{count} {'llamada' if count == 1 else 'llamadas'}")
 
+    def _apply_call_sort(self) -> None:
+        def modified(call: CallRecord) -> float:
+            try:
+                return call.source_path.stat().st_mtime if call.source_path else 0
+            except OSError:
+                return 0
+
+        if self.sort_mode == "priority":
+            priorities = {
+                term.strip().casefold(): index
+                for index, term in enumerate(self.keywords_input.text().split(","))
+                if term.strip()
+            }
+
+            def priority(call: CallRecord) -> tuple[int, int, int]:
+                matches = [priorities[tag.casefold()] for tag in call.tags if tag.casefold() in priorities]
+                if call.keyword.casefold() in priorities:
+                    matches.append(priorities[call.keyword.casefold()])
+                return (not call.sensitive, min(matches, default=len(priorities)), call.call_id)
+
+            self.call_records.sort(key=priority)
+        elif self.sort_mode == "duration_desc":
+            self.call_records.sort(key=lambda call: (-call.duration, call.call_id))
+        elif self.sort_mode == "duration_asc":
+            self.call_records.sort(key=lambda call: (call.duration, call.call_id))
+        elif self.sort_mode == "newest":
+            self.call_records.sort(key=lambda call: (-modified(call), call.call_id))
+        elif self.sort_mode == "oldest":
+            self.call_records.sort(key=lambda call: (modified(call), call.call_id))
+        elif self.sort_mode == "name":
+            self.call_records.sort(key=lambda call: (call.filename.casefold(), call.call_id))
+        else:
+            self.call_records.sort(key=lambda call: call.call_id)
+
+    def _sort_calls(self, mode: str, label: str) -> None:
+        current = self.call_list.currentItem()
+        selected_id = current.data(Qt.ItemDataRole.UserRole) if current else None
+        self.sort_mode = mode
+        self.sort_label = label
+        self.sort_button.setText("Orden" if self.width() < 1240 else f"Orden: {label}")
+        self.sort_button.setToolTip(f"Orden actual: {label}. La prioridad respeta el orden de los términos configurados")
+        self._populate_call_list()
+        self._filter_calls()
+        if selected_id is not None:
+            self._select_call_by_id(selected_id)
+
     def _build_detail_panel(self) -> QWidget:
+        self.detail_pages = QStackedWidget()
+        self.detail_pages.setObjectName("detailPages")
+
+        empty = QWidget()
+        empty.setObjectName("emptyDetail")
+        empty_layout = QVBoxLayout(empty)
+        empty_layout.setContentsMargins(48, 48, 48, 48)
+        empty_layout.addStretch()
+        empty_icon = QLabel()
+        empty_icon.setObjectName("emptyIcon")
+        empty_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_icon.setPixmap(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView).pixmap(34, 34))
+        self.empty_detail_title = QLabel("Sin llamadas")
+        self.empty_detail_title.setObjectName("emptyTitle")
+        self.empty_detail_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_detail_text = QLabel("Configura una carpeta y escanéala para comenzar la auditoría.")
+        self.empty_detail_text.setObjectName("pageSubtitle")
+        self.empty_detail_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_detail_text.setWordWrap(True)
+        empty_action = QPushButton("Ir a configuración")
+        empty_action.setObjectName("secondaryButton")
+        empty_action.setMaximumWidth(180)
+        empty_action.clicked.connect(lambda: self._switch_page("config"))
+        empty_layout.addWidget(empty_icon)
+        empty_layout.addSpacing(8)
+        empty_layout.addWidget(self.empty_detail_title)
+        empty_layout.addWidget(self.empty_detail_text)
+        empty_layout.addSpacing(12)
+        empty_layout.addWidget(empty_action, 0, Qt.AlignmentFlag.AlignHCenter)
+        empty_layout.addStretch()
+        self.detail_pages.addWidget(empty)
+
         scroll = QScrollArea()
         scroll.setObjectName("detailScroll")
         scroll.setWidgetResizable(True)
@@ -888,7 +854,8 @@ class SentryWindow(QMainWindow):
         self.detail_layout.addWidget(self._build_transcript(), 1)
         self.detail_layout.addLayout(self._build_detail_actions())
         scroll.setWidget(content)
-        return scroll
+        self.detail_pages.addWidget(scroll)
+        return self.detail_pages
 
     def _build_call_identity(self) -> QWidget:
         frame = QFrame()
@@ -912,14 +879,9 @@ class SentryWindow(QMainWindow):
 
         meta = QGridLayout()
         meta.setHorizontalSpacing(26)
-        agent_space = QWidget()
-        agent_space.setMinimumWidth(120)
-        meta.addWidget(agent_space, 0, 0, 2, 1)
-        self.agent_value = QLabel(frame)
-        self.agent_value.hide()
-        self.customer_value = self._add_meta(meta, 1, "CLIENTE")
-        self.time_value = self._add_meta(meta, 2, "HORA")
-        self.risk_value = self._add_meta(meta, 3, "RIESGO")
+        self.customer_value = self._add_meta(meta, 0, "CLIENTE")
+        self.time_value = self._add_meta(meta, 1, "HORA")
+        self.risk_value = self._add_meta(meta, 2, "RIESGO")
         layout.addLayout(meta)
         return frame
 
@@ -997,7 +959,7 @@ class SentryWindow(QMainWindow):
         heading = QHBoxLayout()
         title = QLabel("Transcripción de la llamada")
         title.setObjectName("sectionTitle")
-        mode = QLabel("Diarización activa")
+        mode = QLabel("Audio sincronizado")
         mode.setObjectName("statusOnline")
         heading.addWidget(title)
         heading.addStretch()
@@ -1021,13 +983,13 @@ class SentryWindow(QMainWindow):
 
     def _build_detail_actions(self) -> QHBoxLayout:
         actions = QHBoxLayout()
-        reviewed = QPushButton("Marcar como revisada")
-        reviewed.setObjectName("secondaryButton")
-        reviewed.clicked.connect(lambda: self._show_toast("Llamada marcada como revisada"))
+        self.reviewed_button = QPushButton("Marcar como revisada")
+        self.reviewed_button.setObjectName("secondaryButton")
+        self.reviewed_button.clicked.connect(self._mark_reviewed)
         self.original_button = QPushButton("Abrir audio original")
         self.original_button.setObjectName("linkButton")
         self.original_button.clicked.connect(self._open_original_audio)
-        actions.addWidget(reviewed)
+        actions.addWidget(self.reviewed_button)
         actions.addStretch()
         actions.addWidget(self.original_button)
         return actions
@@ -1043,58 +1005,42 @@ class SentryWindow(QMainWindow):
         titles = QVBoxLayout()
         title = QLabel("Reportes y estadísticas")
         title.setObjectName("pageTitle")
-        subtitle = QLabel("Resumen ilustrativo del directorio seleccionado")
+        subtitle = QLabel("Resumen del directorio seleccionado")
         subtitle.setObjectName("pageSubtitle")
         titles.addWidget(title)
         titles.addWidget(subtitle)
         title_row.addLayout(titles)
         title_row.addStretch()
-        download = QPushButton("Descargar informe")
-        download.setObjectName("primaryButton")
-        download.clicked.connect(lambda: self._show_toast("La descarga se conectará en la etapa de reportes"))
-        title_row.addWidget(download)
+        self.report_download = QPushButton("Descargar informe")
+        self.report_download.setObjectName("primaryButton")
+        self.report_download.setEnabled(False)
+        self.report_download.clicked.connect(lambda: self._show_toast("La descarga se conectará en la etapa de reportes"))
+        title_row.addWidget(self.report_download)
         outer.addLayout(title_row)
 
         metrics = QHBoxLayout()
         metrics.setSpacing(12)
-        metrics.addWidget(self._report_metric("280", "Llamadas analizadas", "Total ilustrativo del mes"))
-        metrics.addWidget(self._report_metric("08", "Alertas sensibles", "2,8% de las analizadas", True))
-        metrics.addWidget(self._report_metric("$1,18", "Costo estimado", "Datos demostrativos · USD"))
+        metrics.addWidget(self._report_metric("report_total_value", "Llamadas encontradas", "Archivos del directorio"))
+        metrics.addWidget(self._report_metric("report_sensitive_value", "Alertas sensibles", "Términos detectados", True))
+        metrics.addWidget(self._report_metric("report_normal_value", "Llamadas normales", "Análisis completados"))
         outer.addLayout(metrics)
 
-        distribution = QFrame()
-        distribution.setObjectName("contentPanel")
-        dist_layout = QVBoxLayout(distribution)
-        dist_layout.setContentsMargins(20, 18, 20, 20)
-        dist_layout.setSpacing(12)
-        dist_title = QLabel("Incidencias por término")
-        dist_title.setObjectName("sectionTitle")
-        dist_layout.addWidget(dist_title)
-        for label, value, total in (("demanda", 5, 8), ("abogado", 2, 8), ("denuncia", 1, 8)):
-            row = QHBoxLayout()
-            name = QLabel(label.capitalize())
-            name.setMinimumWidth(90)
-            bar = QProgressBar()
-            bar.setRange(0, total)
-            bar.setValue(value)
-            bar.setTextVisible(False)
-            count = QLabel(f"{value:02d}")
-            count.setObjectName("timeDisplay")
-            row.addWidget(name)
-            row.addWidget(bar, 1)
-            row.addWidget(count)
-            dist_layout.addLayout(row)
-        outer.addWidget(distribution)
+        self.report_empty = QLabel("Escanea una carpeta para generar estadísticas reales.")
+        self.report_empty.setObjectName("emptyReport")
+        self.report_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.report_empty.setMinimumHeight(180)
+        outer.addWidget(self.report_empty)
         outer.addStretch()
         return page
 
-    def _report_metric(self, value: str, label: str, note: str, accent: bool = False) -> QWidget:
+    def _report_metric(self, attribute: str, label: str, note: str, accent: bool = False) -> QWidget:
         frame = QFrame()
         frame.setObjectName("reportMetricAccent" if accent else "reportMetric")
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(18, 16, 18, 16)
-        number = QLabel(value)
+        number = QLabel("0")
         number.setObjectName("reportValueAccent" if accent else "reportValue")
+        setattr(self, attribute, number)
         caption = QLabel(label)
         caption.setObjectName("reportLabel")
         hint = QLabel(note)
@@ -1172,7 +1118,7 @@ class SentryWindow(QMainWindow):
         api_title.setObjectName("formTitle")
         api_help = QLabel(
             "Configura el proveedor, modelo y clave usados para transcribir y analizar. "
-            "Las claves permanecen solo durante esta sesión."
+            "Las claves se cifran con Windows y solo tu usuario puede recuperarlas."
         )
         api_help.setObjectName("pageSubtitle")
         api_help.setWordWrap(True)
@@ -1193,7 +1139,9 @@ class SentryWindow(QMainWindow):
         self._select_provider(self.transcription_provider, os.getenv("SENTRY_TRANSCRIPTION_PROVIDER", "deepgram"))
         self.transcription_model = QComboBox()
         self.transcription_model.setEditable(True)
-        self.transcription_model.addItem(os.getenv("SENTRY_TRANSCRIPTION_MODEL", "nova-3"))
+        transcription_default = ("gpt-4o-transcribe-diarize"
+                                 if self.transcription_provider.currentData() == "openai" else "nova-3")
+        self.transcription_model.addItem(os.getenv("SENTRY_TRANSCRIPTION_MODEL", transcription_default))
         transcription_key = "OPENAI_API_KEY" if self.transcription_provider.currentData() == "openai" else "DEEPGRAM_API_KEY"
         self.transcription_api_key = QLineEdit(os.getenv(transcription_key, ""))
         self.transcription_key_toggle, self.transcription_validate, self.transcription_api_status = self._add_api_fields(
@@ -1219,7 +1167,8 @@ class SentryWindow(QMainWindow):
         self._select_provider(self.analysis_provider, os.getenv("SENTRY_ANALYSIS_PROVIDER", "gemini"))
         self.analysis_model = QComboBox()
         self.analysis_model.setEditable(True)
-        self.analysis_model.addItem(os.getenv("SENTRY_ANALYSIS_MODEL", "gemini-2.5-flash-lite"))
+        analysis_default = "gpt-4o-mini" if self.analysis_provider.currentData() == "openai" else "gemini-3.5-flash-lite"
+        self.analysis_model.addItem(os.getenv("SENTRY_ANALYSIS_MODEL", analysis_default))
         analysis_key = (
             os.getenv("OPENAI_API_KEY", "")
             if self.analysis_provider.currentData() == "openai"
@@ -1324,8 +1273,8 @@ class SentryWindow(QMainWindow):
         provider, model, key, button, status = self._api_controls(service)
         defaults = {
             ("transcription", "deepgram"): "nova-3",
-            ("transcription", "openai"): "gpt-4o-mini-transcribe",
-            ("analysis", "gemini"): "gemini-2.5-flash-lite",
+            ("transcription", "openai"): "gpt-4o-transcribe-diarize",
+            ("analysis", "gemini"): "gemini-3.5-flash-lite",
             ("analysis", "openai"): "gpt-4o-mini",
         }
         model.clear()
@@ -1337,6 +1286,35 @@ class SentryWindow(QMainWindow):
         button.setEnabled(True)
         button.setText("Validar")
         self._set_api_status(status, "Sin validar", "idle")
+
+    def _restore_credentials(self) -> None:
+        try:
+            saved = self.database.credentials()
+            for service in ("transcription", "analysis"):
+                item = saved.get(service)
+                if not item:
+                    continue
+                provider, model, field, _button, status = self._api_controls(service)
+                provider.blockSignals(True)
+                self._select_provider(provider, item["provider"])
+                provider.blockSignals(False)
+                model.clear()
+                model.addItem(item["model"])
+                field.setText(unprotect(item["encrypted_key"]))
+                self._set_api_status(status, "Clave recuperada de forma segura · pendiente de validar", "idle")
+        except (SecretStoreError, sqlite3.Error, OSError) as exc:
+            self._show_toast(f"No se pudieron recuperar las claves: {exc}")
+
+    def _persist_credentials(self, services=("transcription", "analysis")) -> int:
+        saved = 0
+        for service in services:
+            provider, model, field, _button, _status = self._api_controls(service)
+            key = field.text().strip()
+            if not key:
+                continue
+            self.database.save_credential(service, str(provider.currentData()), model.currentText().strip(), protect(key))
+            saved += 1
+        return saved
 
     def _mark_api_dirty(self, service: str) -> None:
         _provider, _model, _key, button, status = self._api_controls(service)
@@ -1434,6 +1412,10 @@ class SentryWindow(QMainWindow):
         self._set_api_busy(service, False)
         button.setText("Validada")
         self._set_api_status(status, message, "valid")
+        try:
+            self._persist_credentials((service,))
+        except (SecretStoreError, sqlite3.Error, OSError) as exc:
+            self._set_api_status(status, f"Clave válida, pero no se pudo guardar: {exc}", "error")
 
     @staticmethod
     def _extract_models(provider: str, service: str, payload: object) -> list[str]:
@@ -1498,12 +1480,15 @@ class SentryWindow(QMainWindow):
         visible = 0
         first_visible: QListWidgetItem | None = None
         for row, call in enumerate(self.call_records):
-            searchable = f"{call.filename} {call.agent} {call.customer} {call.keyword} {call.snippet}".casefold()
+            searchable = f"{call.filename} {call.customer} {call.keyword} {' '.join(call.tags)} {call.snippet}".casefold()
             matches_query = not query or query in searchable
             matches_status = (
                 status == "all"
-                or (status == "sensitive" and call.sensitive)
-                or (status == "normal" and not call.sensitive and call.risk != "Pendiente")
+                or (status == "alert" and (call.category_code == "ALERTA" or call.sensitive))
+                or (status == "mailbox" and call.category_code == "BUZON")
+                or (status == "normal" and (call.category_code == "NORMAL" or
+                                             (not call.category_code and not call.sensitive and call.risk != "Pendiente")))
+                or (status == "pending" and call.category_code in {"PENDIENTE", "ERROR", ""})
             )
             item = self.call_list.item(row)
             item.setHidden(not (matches_query and matches_status))
@@ -1531,24 +1516,49 @@ class SentryWindow(QMainWindow):
                 self.call_list.setCurrentItem(item)
                 return
 
+    def _show_empty_state(
+        self,
+        title: str = "Sin llamadas",
+        message: str = "Configura una carpeta y escanéala para comenzar la auditoría.",
+    ) -> None:
+        self.current_call = None
+        self.current_second = 0
+        self.current_duration = 0
+        self._stop_playback()
+        self.media_player.setSource(QUrl())
+        self.empty_detail_title.setText(title)
+        self.empty_detail_text.setText(message)
+        self.detail_pages.setCurrentIndex(0)
+        self.play_button.setEnabled(False)
+        self.original_button.setEnabled(False)
+        self.reviewed_button.setEnabled(False)
+        self.jump_button.setEnabled(False)
+        self.transcript_rows.clear()
+        self.active_transcript_index = -1
+        self._update_category_metrics()
+
     def _show_call(self, call: CallRecord) -> None:
         self._stop_playback()
         self.current_call = call
+        self.detail_pages.setCurrentIndex(1)
         self.current_second = 0
         self.current_duration = call.duration
+        self.transcript_rows = []
+        self.active_transcript_index = -1
         source = call.source_path
         has_audio = source is not None and source.is_file()
         self.play_button.setEnabled(has_audio)
         self.original_button.setEnabled(has_audio)
+        self.reviewed_button.setEnabled(True)
         self.media_player.setSource(QUrl.fromLocalFile(str(source)) if has_audio else QUrl())
         self.filename_label.setText(call.filename)
-        badge_text = "Término sensible" if call.sensitive else "Sin alerta crítica"
+        badge_text = ("Etiquetas: " + ", ".join(call.tags)) if call.tags else (
+            "Término sensible" if call.sensitive else "Sin alerta crítica")
         self.risk_badge.setText("Pendiente de análisis" if call.risk == "Pendiente" else badge_text)
         self.risk_badge.setProperty("sensitive", call.sensitive)
         self.risk_badge.style().unpolish(self.risk_badge)
         self.risk_badge.style().polish(self.risk_badge)
         self.duration_label.setText(format_time(call.duration))
-        self.agent_value.setText(call.agent)
         self.customer_value.setText(call.customer)
         self.time_value.setText(call.clock)
         self.risk_value.setText(call.risk)
@@ -1573,9 +1583,16 @@ class SentryWindow(QMainWindow):
             if widget is not None:
                 widget.deleteLater()
         self.critical_line = None
+        self.transcript_rows = []
+        self.active_transcript_index = -1
+        sensitive_terms = tuple(term for term in call.tags if term.strip()) if call.sensitive else ()
+        if call.sensitive and not sensitive_terms and call.keyword.strip():
+            sensitive_terms = (call.keyword,)
         for line in call.transcript:
-            row = QFrame()
-            row.setObjectName("criticalTranscript" if line.critical else "transcriptLine")
+            row = TranscriptRow(line.second)
+            row.setProperty("critical", line.critical)
+            row.setProperty("playbackState", "upcoming")
+            row.seek_requested.connect(self._seek_audio)
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(12, 10, 12, 10)
             row_layout.setSpacing(12)
@@ -1585,8 +1602,8 @@ class SentryWindow(QMainWindow):
             stamp.setFixedWidth(42)
             speaker = QLabel(line.speaker)
             speaker.setObjectName("speaker")
-            speaker.setFixedWidth(54)
-            text = QLabel(self._highlight_keyword(line.text, call.keyword) if line.critical else html.escape(line.text))
+            speaker.setFixedWidth(72)
+            text = QLabel(self._transcript_progress_html(line, 0, sensitive_terms))
             text.setTextFormat(Qt.TextFormat.RichText)
             text.setWordWrap(True)
             text.setObjectName("transcriptText")
@@ -1597,20 +1614,100 @@ class SentryWindow(QMainWindow):
             row_layout.addWidget(speaker, 0, Qt.AlignmentFlag.AlignTop)
             row_layout.addWidget(text, 1)
             self.transcript_layout.addWidget(row)
-            if line.critical:
+            self.transcript_rows.append((line, row, text))
+            if line.critical and self.critical_line is None:
                 self.critical_line = row
         self.transcript_layout.addStretch()
+        self._sync_transcript(self.current_second)
 
     @staticmethod
-    def _highlight_keyword(text: str, keyword: str) -> str:
-        safe = html.escape(text)
-        start = safe.casefold().find(keyword.casefold())
-        if start < 0:
-            return safe
-        end = start + len(keyword)
-        return f"{safe[:start]}<span style='color:{PALETTE['green_accessible']}; font-weight:700'>{safe[start:end]}</span>{safe[end:]}"
+    def _highlight_keywords(text: str, keywords: tuple[str, ...]) -> str:
+        terms = sorted({term.strip() for term in keywords if term.strip()}, key=len, reverse=True)
+        if not terms:
+            return html.escape(text)
+        pattern = re.compile("|".join(re.escape(term) for term in terms), re.IGNORECASE)
+        fragments: list[str] = []
+        cursor = 0
+        for match in pattern.finditer(text):
+            fragments.append(html.escape(text[cursor:match.start()]))
+            fragments.append(
+                f"<span style='color:{PALETTE['green_accessible']}; font-weight:700'>"
+                f"{html.escape(match.group(0))}</span>"
+            )
+            cursor = match.end()
+        fragments.append(html.escape(text[cursor:]))
+        return "".join(fragments)
+
+    def _sync_transcript(self, position_seconds: float, scroll: bool = False) -> None:
+        active = next(
+            (index for index in range(len(self.transcript_rows) - 1, -1, -1)
+             if position_seconds >= self.transcript_rows[index][0].second),
+            -1,
+        )
+        terms = ()
+        if self.current_call is not None and self.current_call.sensitive:
+            terms = tuple(term for term in self.current_call.tags if term.strip())
+            if not terms and self.current_call.keyword.strip():
+                terms = (self.current_call.keyword,)
+        for index, (line, row, text_label) in enumerate(self.transcript_rows):
+            state = "played" if index < active else "active" if index == active else "upcoming"
+            if row.property("playbackState") != state:
+                row.setProperty("playbackState", state)
+                row.style().unpolish(row)
+                row.style().polish(row)
+            word_count = len(line.text.split())
+            heard_words = (
+                word_count if state == "played"
+                else self._heard_word_count(index, position_seconds) if state == "active"
+                else 0
+            )
+            progress_html = self._transcript_progress_html(line, heard_words, terms)
+            if text_label.text() != progress_html:
+                text_label.setText(progress_html)
+        if scroll and active >= 0 and active != self.active_transcript_index:
+            self.transcript_scroll.ensureWidgetVisible(self.transcript_rows[active][1], 0, 50)
+        self.active_transcript_index = active
+
+    def _heard_word_count(self, index: int, position_seconds: float) -> int:
+        line = self.transcript_rows[index][0]
+        word_count = len(line.text.split())
+        if not word_count:
+            return 0
+        if line.word_seconds:
+            return min(word_count, sum(timestamp <= position_seconds for timestamp in line.word_seconds))
+        next_second = (
+            self.transcript_rows[index + 1][0].second
+            if index + 1 < len(self.transcript_rows)
+            else self.current_duration
+        )
+        duration = max(1, next_second - line.second)
+        ratio = max(0.0, min(1.0, (position_seconds - line.second) / duration))
+        return min(word_count, max(1, int(ratio * word_count) + 1))
+
+    @staticmethod
+    def _transcript_progress_html(line: TranscriptLine, heard_words: int, keywords: tuple[str, ...]) -> str:
+        word_matches = list(re.finditer(r"\S+", line.text))
+        sensitive_indexes: set[int] = set()
+        for term in {term.strip() for term in keywords if term.strip()}:
+            for match in re.finditer(re.escape(term), line.text, re.IGNORECASE):
+                sensitive_indexes.update(
+                    index for index, word in enumerate(word_matches)
+                    if word.start() < match.end() and word.end() > match.start()
+                )
+        rendered = []
+        for index, word in enumerate(word_matches):
+            safe_word = html.escape(word.group(0))
+            styles = []
+            if index < heard_words:
+                styles.append(f"color:{PALETTE['green_accessible']}")
+            if index in sensitive_indexes:
+                styles.extend((f"color:{PALETTE['green_accessible']}", "font-weight:700"))
+            rendered.append(f"<span style='{';'.join(dict.fromkeys(styles))}'>{safe_word}</span>" if styles else safe_word)
+        return " ".join(rendered)
 
     def _toggle_playback(self) -> None:
+        if self.current_call is None:
+            return
         source = self.current_call.source_path
         if source is None or not source.is_file():
             self._show_toast("Selecciona un audio real antes de reproducir")
@@ -1634,15 +1731,20 @@ class SentryWindow(QMainWindow):
         self.current_second = max(0, position_ms // 1000)
         self.timeline.set_position(self.current_second)
         self._update_time_display()
+        self._sync_transcript(
+            position_ms / 1000,
+            scroll=self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState,
+        )
 
     def _on_player_duration_changed(self, duration_ms: int) -> None:
-        if self.current_call.source_path is None or duration_ms <= 0:
+        if self.current_call is None or self.current_call.source_path is None or duration_ms <= 0:
             return
         self.current_duration = max(1, round(duration_ms / 1000))
         self.duration_label.setText(format_time(self.current_duration))
         self.timeline.set_audio(self.current_duration, self.current_call.hit_second)
         self.timeline.set_position(self.current_second)
         self._update_time_display()
+        self._sync_transcript(self.current_second)
 
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
         if not hasattr(self, "play_button"):
@@ -1659,17 +1761,22 @@ class SentryWindow(QMainWindow):
         self._show_toast(f"No se pudo reproducir el audio: {detail}")
 
     def _seek_audio(self, seconds: int) -> None:
+        if self.current_call is None:
+            return
         self.current_second = max(0, min(seconds, self.current_duration))
         source = self.current_call.source_path
         if source is not None and source.is_file():
             self.media_player.setPosition(self.current_second * 1000)
         self.timeline.set_position(self.current_second)
         self._update_time_display()
+        self._sync_transcript(self.current_second, scroll=True)
 
     def _update_time_display(self) -> None:
         self.time_display.setText(f"{format_time(self.current_second)} / {format_time(self.current_duration)}")
 
     def _open_original_audio(self) -> None:
+        if self.current_call is None:
+            return
         source = self.current_call.source_path
         if source is None or not source.is_file():
             self._show_toast("El archivo de audio ya no está disponible")
@@ -1678,11 +1785,9 @@ class SentryWindow(QMainWindow):
             self._show_toast("Windows no pudo abrir el archivo con el reproductor predeterminado")
 
     def _jump_to_evidence(self) -> None:
-        if self.current_call.hit_second is None:
+        if self.current_call is None or self.current_call.hit_second is None:
             return
         self._seek_audio(self.current_call.hit_second)
-        if self.critical_line is not None:
-            self.transcript_scroll.ensureWidgetVisible(self.critical_line, 0, 40)
         self._show_toast(f"Evidencia localizada en {format_time(self.current_call.hit_second)}")
 
     def _choose_directory(self) -> None:
@@ -1695,8 +1800,8 @@ class SentryWindow(QMainWindow):
         self._show_toast("Directorio actualizado")
 
     def _set_directory_display(self, directory: str) -> None:
-        self.directory_label.setText(Path(directory).name or directory)
-        self.directory_label.setToolTip(directory)
+        self.directory_label.setText(Path(directory).name if directory else "Sin directorio")
+        self.directory_label.setToolTip(directory or "No se ha configurado una carpeta")
 
     def _save_settings(self) -> None:
         directory = self.config_directory.text().strip()
@@ -1712,16 +1817,17 @@ class SentryWindow(QMainWindow):
         self._set_directory_display(directory)
         try:
             self.database.save_settings({"audio_directory": directory, "keywords": ", ".join(keywords)})
-        except (sqlite3.Error, OSError) as exc:
+            api_count = self._persist_credentials()
+        except (SecretStoreError, sqlite3.Error, OSError) as exc:
             self._show_toast(f"No se pudieron guardar los ajustes: {exc}")
             return
-        api_count = sum(bool(field.text().strip()) for field in (self.transcription_api_key, self.analysis_api_key))
-        self._show_toast(f"Ajustes guardados · {api_count}/2 claves solo en esta sesión")
+        self._show_toast(f"Ajustes guardados · {api_count}/2 claves protegidas por Windows")
 
     def _scan_directory(self) -> None:
         directory_text = self.config_directory.text().strip()
         if not directory_text:
             self._show_toast("Selecciona un directorio antes de escanear")
+            self._switch_page("config")
             self.config_directory.setFocus()
             return
 
@@ -1745,109 +1851,165 @@ class SentryWindow(QMainWindow):
             records = [call_record_from_audio(path, index) for index, path in enumerate(self.detected_audio_files, 1)]
             try:
                 self.database.register_calls(records)
+                self.database.save_settings({"audio_directory": str(directory)})
             except (sqlite3.Error, OSError) as exc:
                 self.scan_button.setEnabled(True)
                 self.scan_button.setToolTip("Escanear carpeta")
                 self._show_toast(f"No se pudo guardar el escaneo: {exc}")
                 return
             self.call_records = records
+            stored = self.database.call_rows(self.detected_audio_files)
+            self.call_records = [call_record_from_row(row) for row in stored]
             self.calls = {call.call_id: call for call in self.call_records}
             self._populate_call_list()
             self.search_input.clear()
             self.status_filter.setCurrentIndex(0)
-            self.files_metric.setText(str(count))
-            self.sensitive_metric.setText("0")
-            self.normal_metric.setText(str(count))
-            self.normal_metric_label.setText("Pendientes")
+            self._update_category_metrics()
             if self.call_records:
                 self.call_list.setCurrentRow(0)
+            else:
+                self._show_empty_state(
+                    "No se encontraron audios",
+                    "La carpeta no contiene archivos WAV o MP3. Elige otra carpeta o vuelve a escanear.",
+                )
             self._filter_calls()
             noun = "audio encontrado" if count == 1 else "audios encontrados"
             message = f"Escaneo completado · {count} {noun}"
-            self._start_automatic_analysis()
         self.scan_button.setEnabled(True)
         self.scan_button.setToolTip("Escanear carpeta")
         self._show_toast(message)
 
-    def _start_automatic_analysis(self) -> None:
+    def _update_category_metrics(self) -> None:
+        counts = {name: sum(call.category_code == name for call in self.call_records)
+                  for name in ("ALERTA", "BUZON", "NORMAL")}
+        self.files_metric.setText(str(len(self.call_records)))
+        self.sensitive_metric.setText(str(counts["ALERTA"]))
+        self.mailbox_metric.setText(str(counts["BUZON"]))
+        self.normal_metric.setText(str(counts["NORMAL"]))
+        self.normal_metric_label.setText("Normales")
+        if hasattr(self, "report_total_value"):
+            self.report_total_value.setText(str(len(self.call_records)))
+            self.report_sensitive_value.setText(str(counts["ALERTA"]))
+            self.report_normal_value.setText(str(counts["NORMAL"]))
+            self.report_empty.setVisible(not self.call_records)
+            self.report_download.setEnabled(bool(self.call_records))
+        pending = sum(call.category_code in {"PENDIENTE", "ERROR", ""} for call in self.call_records)
+        current = self.status_filter.currentData()
+        labels = {
+            "all": f"Todas las llamadas ({len(self.call_records)})",
+            "alert": f"Demandas / alertas ({counts['ALERTA']})",
+            "mailbox": f"Buzones ({counts['BUZON']})",
+            "normal": f"Llamadas normales ({counts['NORMAL']})",
+            "pending": f"Pendientes / errores ({pending})",
+        }
+        self.status_filter.blockSignals(True)
+        for index in range(self.status_filter.count()):
+            value = self.status_filter.itemData(index)
+            if value in labels:
+                self.status_filter.setItemText(index, labels[value])
+        target = self.status_filter.findData(current)
+        if target >= 0:
+            self.status_filter.setCurrentIndex(target)
+        self.status_filter.blockSignals(False)
+
+    def _analysis_config(self):
+        keywords = [word.strip() for word in self.keywords_input.text().split(",") if word.strip()]
         transcription_key = self.transcription_api_key.text().strip()
+        analysis_key = self.analysis_api_key.text().strip()
         if not transcription_key:
-            return
-        self.analysis_queue = [call.call_id for call in self.call_records if call.source_path is not None]
-        if self.analysis_queue:
-            self.analysis_running = True
-            self._analyze_next_call()
+            raise ValueError("Configura la clave de transcripción antes de analizar.")
+        if not analysis_key:
+            raise ValueError("Configura la clave de análisis contextual antes de analizar.")
+        if not keywords:
+            raise ValueError("Configura al menos un término sensible.")
+        return {
+            "keywords": keywords,
+            "transcription_provider": str(self.transcription_provider.currentData()),
+            "transcription_model": self.transcription_model.currentText().strip(),
+            "transcription_key": transcription_key,
+            "analysis_provider": str(self.analysis_provider.currentData()),
+            "analysis_model": self.analysis_model.currentText().strip(),
+            "analysis_key": analysis_key,
+        }
 
-    def _analyze_next_call(self) -> None:
-        if not self.analysis_queue:
-            self.analysis_running = False
-            self._show_toast("Análisis automático completado")
+    def _start_analysis(self) -> None:
+        if self.analysis_worker is not None:
+            self.analysis_worker.request_stop()
+            self.analyze_button.setEnabled(False)
+            self.analyze_button.setText("Deteniendo…")
             return
-        call_id = self.analysis_queue.pop(0)
-        call = self.calls.get(call_id)
-        if call is None or call.source_path is None:
-            self._analyze_next_call()
+        paths = [call.source_path for call in self.call_records
+                 if call.source_path is not None and call.source_path.is_file()]
+        if not paths:
+            self._show_toast("Escanea primero una carpeta con audios")
             return
-        self._show_toast(f"Analizando {call.filename}…")
-        transcription = (
-            str(self.transcription_provider.currentData()),
-            self.transcription_model.currentText().strip(),
-            self.transcription_api_key.text().strip(),
-        )
-        analysis = (
-            str(self.analysis_provider.currentData()),
-            self.analysis_model.currentText().strip(),
-            self.analysis_api_key.text().strip(),
-        )
-        keywords = tuple(word.strip() for word in self.keywords_input.text().split(",") if word.strip())
-        job = AudioAnalysisJob(call_id, call.source_path, transcription, analysis, keywords)
-        job.signals.finished.connect(self._finish_automatic_analysis)
-        job.signals.failed.connect(self._fail_automatic_analysis)
-        self.analysis_pool.start(job)
+        try:
+            config = self._analysis_config()
+            self._persist_credentials()
+        except (ValueError, SecretStoreError, sqlite3.Error, OSError) as exc:
+            self._show_toast(str(exc))
+            self._switch_page("config")
+            return
+        self.analysis_worker = AnalysisWorker(self.database, paths, config, self)
+        self.analysis_worker.progress.connect(self._analysis_progress)
+        self.analysis_worker.row_ready.connect(self._analysis_row_ready)
+        self.analysis_worker.completed.connect(self._analysis_complete)
+        self.analyze_button.setText("Detener")
+        self.scan_button.setEnabled(False)
+        self.analysis_worker.start()
 
-    def _finish_automatic_analysis(self, call_id: int, result: object) -> None:
-        call = self.calls.get(call_id)
-        if call is None or not isinstance(result, dict):
-            self._analyze_next_call()
-            return
-        lines = tuple(
-            TranscriptLine(int(line.get("second", 0)), str(line.get("speaker", "Participante")), str(line.get("text", "")))
-            for line in result.get("lines", [])
-            if isinstance(line, dict) and str(line.get("text", "")).strip()
-        )
-        matches = [str(match) for match in result.get("matches", [])]
-        updated = replace(
-            call,
-            sensitive=bool(matches),
-            keyword=matches[0] if matches else "Sin alertas",
-            hit_second=result.get("hit_second"),
-            risk="Crítica" if matches else "Baja",
-            category="Alerta sensible" if matches else "Sin novedad",
-            summary=str(result.get("summary", "Transcripción completada.")),
-            snippet=(lines[0].text if lines else "Sin texto transcrito")[:150],
-            transcript=lines or (TranscriptLine(0, "Transcripción", "No se recibió texto."),),
-        )
-        self.calls[call_id] = updated
-        self.call_records = [updated if item.call_id == call_id else item for item in self.call_records]
-        selected_id = self.current_call.call_id
+    def _analysis_progress(self, current: int, total: int, filename: str) -> None:
+        self.analyze_button.setToolTip(f"Analizando {current}/{total}: {filename}")
+
+    def _analysis_row_ready(self, row) -> None:
+        updated = call_record_from_row(row)
+        self.call_records = [updated if call.source_path == updated.source_path else call for call in self.call_records]
+        self.calls = {call.call_id: call for call in self.call_records}
+        selected_path = self.current_call.source_path if self.current_call else None
         self._populate_call_list()
+        self._update_category_metrics()
+        if selected_path:
+            selected = next((call.call_id for call in self.call_records if call.source_path == selected_path), None)
+            if selected is not None:
+                self._select_call_by_id(selected)
         self._filter_calls()
-        self._select_call_by_id(selected_id if selected_id == call_id else call_id)
-        self.sensitive_metric.setText(str(sum(item.sensitive for item in self.call_records)))
-        self.normal_metric.setText(str(sum(not item.sensitive for item in self.call_records)))
-        self.normal_metric_label.setText("Sin novedad")
-        self._analyze_next_call()
 
-    def _fail_automatic_analysis(self, call_id: int, error: str) -> None:
-        call = self.calls.get(call_id)
-        if call is not None:
-            updated = replace(call, risk="Error", summary="No se pudo analizar este audio. Revisa la API y vuelve a escanear.")
-            self.calls[call_id] = updated
-            self.call_records = [updated if item.call_id == call_id else item for item in self.call_records]
+    def _analysis_complete(self, completed: int, failures: int, stopped: bool) -> None:
+        worker = self.analysis_worker
+        self.analysis_worker = None
+        self.scan_button.setEnabled(True)
+        self.analyze_button.setEnabled(True)
+        self.analyze_button.setText("Analizar")
+        self.analyze_button.setToolTip("Transcribe pendientes y los separa en alertas, buzones y normales")
+        stored = self.database.call_rows([call.source_path for call in self.call_records if call.source_path])
+        if stored:
+            self.call_records = [call_record_from_row(row) for row in stored]
+            self.calls = {call.call_id: call for call in self.call_records}
             self._populate_call_list()
+            self._update_category_metrics()
+            if self.call_list.count():
+                self.call_list.setCurrentRow(0)
             self._filter_calls()
-        self._show_toast(f"Error al analizar {call.filename if call else 'el audio'}")
-        self._analyze_next_call()
+        message = f"Análisis {'detenido' if stopped else 'completado'} · {completed} guardados"
+        if failures:
+            message += f" · {failures} con error (puedes reintentar)"
+        self._show_toast(message)
+        if worker is not None:
+            worker.deleteLater()
+        if self.close_after_analysis:
+            self.close_after_analysis = False
+            QTimer.singleShot(0, self.close)
+
+    def _mark_reviewed(self) -> None:
+        if self.current_call is None or self.current_call.source_path is None:
+            self._show_toast("Selecciona una llamada antes de marcarla")
+            return
+        try:
+            self.database.set_reviewed(self.current_call.source_path)
+        except sqlite3.Error as exc:
+            self._show_toast(f"No se pudo guardar la revisión: {exc}")
+            return
+        self._show_toast("Llamada marcada como revisada y guardada")
 
     def _show_toast(self, message: str) -> None:
         self.toast.setText(message)
@@ -1877,14 +2039,32 @@ class SentryWindow(QMainWindow):
         if hasattr(self, "directory_label"):
             self.directory_label.setMaximumWidth(120 if compact else 155)
             self.export_button.setText("Excel" if compact else "Exportar Excel")
+        if hasattr(self, "sort_button"):
+            self.sort_button.setText("Orden" if compact else f"Orden: {self.sort_label}")
+            self.call_count.setVisible(not compact)
         self._position_toast()
 
     def closeEvent(self, event) -> None:
+        try:
+            directory = self.config_directory.text().strip()
+            keywords = self.keywords_input.text().strip()
+            if directory and keywords:
+                self.database.save_settings({"audio_directory": directory, "keywords": keywords})
+            self._persist_credentials()
+        except (SecretStoreError, sqlite3.Error, OSError):
+            pass
         if hasattr(self, "bases_page") and self.bases_page.busy:
-            self._show_toast("Espera a que termine el procesamiento antes de cerrar Sentry")
+            self._show_toast("Espera a que termine el procesamiento de bases antes de cerrar Sentry")
+            event.ignore()
+            return
+        if self.analysis_worker is not None:
+            self.close_after_analysis = True
+            self.analysis_worker.request_stop()
+            self._show_toast("Guardando el audio actual; Sentry se cerrará cuando termine")
             event.ignore()
             return
         self.media_player.stop()
+        self.media_player.setSource(QUrl())
         super().closeEvent(event)
 
     @staticmethod
@@ -1927,13 +2107,14 @@ class SentryWindow(QMainWindow):
                 background: {PALETTE['green_soft']};
                 border: 1px solid #cfe7d3;
             }}
-            QPushButton#secondaryButton, QPushButton#iconButton {{
+            QPushButton#secondaryButton, QPushButton#iconButton, QPushButton#sortButton {{
                 background: {PALETTE['panel']};
                 color: {PALETTE['text_soft']};
                 border: 1px solid {PALETTE['border_strong']};
             }}
             QPushButton#iconButton {{ padding: 0; }}
-            QPushButton#secondaryButton:hover, QPushButton#iconButton:hover {{ color: {PALETTE['text']}; background: {PALETTE['surface']}; border-color: #afb6af; }}
+            QPushButton#sortButton {{ min-width: 96px; text-align: left; padding-right: 24px; }}
+            QPushButton#secondaryButton:hover, QPushButton#iconButton:hover, QPushButton#sortButton:hover {{ color: {PALETTE['text']}; background: {PALETTE['surface']}; border-color: #afb6af; }}
             QPushButton#secondaryButton:disabled {{ color: {PALETTE['gray_light']}; background: {PALETTE['surface']}; border-color: {PALETTE['border']}; }}
             QTableWidget {{ background: {PALETTE['panel']}; border: 1px solid {PALETTE['border']}; gridline-color: {PALETTE['border']}; selection-background-color: {PALETTE['green_soft']}; selection-color: {PALETTE['text']}; }}
             QHeaderView::section {{ background: {PALETTE['surface']}; padding: 7px; border: none; border-bottom: 1px solid {PALETTE['border']}; }}
@@ -1995,9 +2176,20 @@ class SentryWindow(QMainWindow):
                 selection-color: {PALETTE['green_accessible']};
                 outline: none;
             }}
+            QMenu {{
+                background: {PALETTE['panel']};
+                color: {PALETTE['text']};
+                border: 1px solid {PALETTE['border_strong']};
+                padding: 5px;
+            }}
+            QMenu::item {{ padding: 8px 24px 8px 10px; border-radius: 5px; }}
+            QMenu::item:selected {{ background: {PALETTE['green_soft']}; color: {PALETTE['green_accessible']}; }}
             QSplitter#mainSplitter::handle {{ background: {PALETTE['border']}; width: 1px; }}
             QFrame#queuePanel {{ background: {PALETTE['panel']}; }}
+            QStackedWidget#detailPages, QWidget#emptyDetail,
             QScrollArea#detailScroll, QWidget#detailContent {{ background: {PALETTE['canvas']}; }}
+            QLabel#emptyTitle {{ color: {PALETTE['text']}; font-size: 17px; font-weight: 600; }}
+            QLabel#emptyReport {{ color: {PALETTE['muted']}; font-size: 13px; }}
             QFrame#sectionHeader {{ background: {PALETTE['panel']}; border-bottom: 1px solid {PALETTE['border']}; }}
             QListWidget#callList {{
                 background: {PALETTE['panel']};
@@ -2022,6 +2214,44 @@ class SentryWindow(QMainWindow):
             QFrame#normalDot {{ background: {PALETTE['border_strong']}; border-radius: 4px; }}
             QLabel#callAgent {{ color: {PALETTE['text']}; font-weight: 600; }}
             QLabel#callCustomer {{ color: {PALETTE['text']}; font-weight: 600; }}
+            QFrame#classificationBadge {{
+                background: #f0f1f0;
+                border: 1px solid {PALETTE['border_strong']};
+                border-radius: 5px;
+            }}
+            QFrame#classificationBadge QLabel#classificationText {{
+                color: {PALETTE['gray']};
+                font-size: 9px;
+                font-weight: 600;
+            }}
+            QFrame#classificationBadge[category="ALERTA"] {{
+                background: #f1f8e9;
+                border: 1px solid #b8d884;
+            }}
+            QFrame#classificationBadge[category="ALERTA"] QLabel#classificationText {{
+                color: #3d6c12;
+                font-size: 9px;
+                font-weight: 650;
+            }}
+            QFrame#classificationBadge[category="BUZON"] {{
+                background: #f0f1f0;
+                border: 1px solid {PALETTE['border_strong']};
+            }}
+            QFrame#classificationBadge[category="BUZON"] QLabel#classificationText {{
+                color: {PALETTE['gray']};
+                font-size: 9px;
+                font-weight: 600;
+            }}
+            QFrame#classificationBadge[category="NORMAL"] {{
+                background: {PALETTE['green_soft']};
+                border: 1px solid #cfe7d3;
+            }}
+            QFrame#classificationBadge[category="NORMAL"] QLabel#classificationText {{
+                color: {PALETTE['green_accessible']};
+                font-size: 9px;
+                font-weight: 600;
+            }}
+            QLabel#classificationIcon {{ background: transparent; border: none; }}
             QLabel#sensitiveBadge, QLabel#riskBadge[sensitive="true"] {{
                 color: {PALETTE['green_accessible']};
                 background: {PALETTE['green_soft']};
@@ -2062,11 +2292,24 @@ class SentryWindow(QMainWindow):
                 border-color: {PALETTE['border']};
             }}
             QScrollArea#transcriptScroll, QWidget#transcriptBody {{ background: transparent; border: none; }}
-            QFrame#transcriptLine {{ background: transparent; border: none; border-bottom: 1px solid #edf0ed; border-radius: 0; }}
-            QFrame#criticalTranscript {{
+            QFrame#transcriptRow {{ background: transparent; border: none; border-bottom: 1px solid #edf0ed; border-radius: 0; }}
+            QFrame#transcriptRow:hover {{ background: #f7faf7; }}
+            QFrame#transcriptRow[critical="true"] {{
                 background: #f1f9f2;
                 border: 1px solid #cbe5cf;
                 border-radius: 7px;
+            }}
+            QFrame#transcriptRow[playbackState="active"] {{
+                background: #e5f4e7;
+                border: 1px solid {PALETTE['green_accessible']};
+                border-radius: 7px;
+            }}
+            QFrame#transcriptRow:focus {{ border: 2px solid {PALETTE['green_deep']}; border-radius: 7px; }}
+            QFrame#transcriptRow[playbackState="active"] QLabel#transcriptStamp,
+            QFrame#transcriptRow[playbackState="active"] QLabel#criticalStamp,
+            QFrame#transcriptRow[playbackState="active"] QLabel#speaker {{
+                color: {PALETTE['green_accessible']};
+                font-weight: 700;
             }}
             QLabel#transcriptStamp {{ color: {PALETTE['muted']}; }}
             QLabel#criticalStamp {{ color: {PALETTE['green_accessible']}; font-weight: 650; }}
@@ -2107,13 +2350,6 @@ class SentryWindow(QMainWindow):
             QFrame#reportMetricAccent {{ background: {PALETTE['panel']}; }}
             QLabel#reportValue, QLabel#reportValueAccent {{ color: {PALETTE['text']}; font-size: 28px; font-weight: 600; }}
             QLabel#reportValueAccent {{ color: {PALETTE['green_accessible']}; }}
-            QProgressBar {{
-                height: 8px;
-                background: #e4e7e4;
-                border: none;
-                border-radius: 4px;
-            }}
-            QProgressBar::chunk {{ background: {PALETTE['green_deep']}; border-radius: 4px; }}
             QLabel#toast {{
                 background: {PALETTE['charcoal']};
                 color: white;

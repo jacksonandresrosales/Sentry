@@ -207,7 +207,11 @@ El acceso **Bases** vive inmediatamente al lado del directorio en la cabecera, c
 
 ### Línea de tiempo de evidencia
 
-La onda usa verde oscuro para el recorrido y gris claro para lo pendiente. Una marca vertical indica el segundo sensible; admite clic y teclado, y “Ir al momento” ofrece una alternativa explícita.
+La onda usa verde oscuro para el recorrido y gris claro para lo pendiente. Una marca vertical indica el segundo sensible; admite clic y teclado, y “Ir al momento” ofrece una alternativa explícita. La transcripción mantiene una sola línea activa, avanza con el audio y permite pulsar cada bloque para navegar a su segundo; los términos sensibles conservan énfasis dentro del progreso palabra por palabra.
+
+### Análisis persistente
+
+La acción primaria **Analizar** vive en el extremo derecho de la cabecera, junto al escaneo. Durante una cola cambia a **Detener** sin añadir ventanas ni bloquear la navegación. Alertas, buzones y llamadas normales se consultan con el filtro situado a la derecha de **Llamadas detectadas**, junto al orden por prioridad, duración, fecha o nombre; sus contadores usan la misma franja de métricas. Las transcripciones usan los rótulos **Asesor** y **Cliente**, pero el panel de identidad no repite el nombre del asesor. Las coincidencias configuradas aparecen como etiquetas compactas en la tarjeta y completas en el detalle. El estado se comunica siempre con texto además del color. Sin registros reales, la auditoría y los reportes muestran un estado vacío en lugar de datos ficticios.
 
 ## Do's and Don'ts
 
