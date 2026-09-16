@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="app/ui/assets/ecuaconexion-logo.png" alt="Ecuaconexión" width="280">
+  <img src="app/ui/assets/sentry-logo.png" alt="Logo de Sentry" width="280">
 </p>
 
 <h1 align="center">Sentry</h1>
