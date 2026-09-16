@@ -4,7 +4,9 @@ Sentry es una aplicación de escritorio para Windows orientada a la auditoría d
 
 La aplicación relaciona grabaciones con bases de clientes mediante teléfono y fecha, identifica palabras o frases sensibles y clasifica cada llamada como alerta, buzón o llamada normal.
 
-Versión actual: `0.1.0-beta.6`
+Versión actual: `0.1.0-beta.7`
+
+La beta.7 corrige la visualización de tarjetas al desplazarse por listas filtradas de denuncias o cambiar el tamaño de la ventana. Los datos del cliente y el historial de análisis no se modifican. Se mantiene la carga de tarjetas bajo demanda para evitar crear un elemento visual por cada grabación.
 
 ## Funcionalidades principales
 
@@ -54,7 +56,7 @@ Cada equipo debe configurar sus propias claves API y credenciales de conexión d
 
 ## Actualizaciones de la aplicación
 
-La versión `0.1.0-beta.6` se instala manualmente una vez en los equipos con versiones anteriores, incluida la beta.5 distribuida desde otro repositorio. A partir de esta versión, Sentry consulta y descarga las siguientes publicaciones del repositorio original `jacksonandresrosales/Sentry` desde **Configuración → Actualizaciones de Sentry**, sin solicitar una cuenta de GitHub mientras el repositorio permanezca público.
+Instale manualmente la versión actual en los equipos con beta.5 o anteriores, incluida la beta.5 distribuida desde otro repositorio. Desde beta.6, Sentry consulta y descarga las siguientes publicaciones del repositorio original `jacksonandresrosales/Sentry` desde **Configuración → Actualizaciones de Sentry**, sin solicitar una cuenta de GitHub mientras el repositorio permanezca público. Publicar un Release no fuerza la instalación: cada cliente debe descargar la actualización y confirmar el reinicio cuando haya terminado sus tareas.
 
 - La aplicación instalada consulta las versiones al iniciar cuando corresponde y cada seis horas. La comprobación automática puede desactivarse; el botón **Buscar actualizaciones** permite consultar manualmente.
 - **Descargar actualización** obtiene el instalador del repositorio público configurado y verifica su versión, tamaño y huella SHA-256 antes de habilitar la instalación.

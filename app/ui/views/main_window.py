@@ -5,7 +5,7 @@ import json
 import os
 import re
 import wave
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -865,6 +865,23 @@ class CallCard(QFrame):
         super().mouseReleaseEvent(event)
 
 
+class CallListWidget(QListWidget):
+    """Notifica cambios del viewport después de actualizar la geometría de Qt."""
+    viewport_changed = Signal()
+
+    def scrollContentsBy(self, dx: int, dy: int) -> None:
+        super().scrollContentsBy(dx, dy)
+        self.viewport_changed.emit()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.viewport_changed.emit()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.viewport_changed.emit()
+
+
 class SentryWindow(QMainWindow):
     def __init__(self, database_path: Path = DEFAULT_DATABASE) -> None:
         super().__init__()
@@ -888,6 +905,7 @@ class SentryWindow(QMainWindow):
         self.call_cards: dict[int, CallCard] = {}
         self.call_items: dict[int, QListWidgetItem] = {}
         self.call_search_cache: dict[int, str] = {}
+        self._visible_call_rows: tuple[int, ...] = ()
         self.selected_call_id: int | None = None
         self.nav_buttons: dict[str, QPushButton] = {}
         self.critical_line: QWidget | None = None
@@ -1220,7 +1238,7 @@ class SentryWindow(QMainWindow):
         heading_layout.addWidget(self.call_count)
         layout.addWidget(heading)
 
-        self.call_list = QListWidget()
+        self.call_list = CallListWidget()
         self.call_list.setObjectName("callList")
         self.call_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.call_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1228,7 +1246,11 @@ class SentryWindow(QMainWindow):
         self.call_list.setSpacing(0)
         self.call_list.setContentsMargins(0, 0, 0, 0)
         self.call_list.currentItemChanged.connect(self._on_call_selected)
-        self.call_list.verticalScrollBar().valueChanged.connect(self._materialize_visible_cards)
+        self.call_card_refresh_timer = QTimer(self)
+        self.call_card_refresh_timer.setSingleShot(True)
+        self.call_card_refresh_timer.timeout.connect(self._materialize_visible_cards)
+        self.call_list.viewport_changed.connect(self._schedule_visible_cards)
+        self.call_list.verticalScrollBar().rangeChanged.connect(self._schedule_visible_cards)
         self._populate_call_list()
         layout.addWidget(self.call_list, 1)
         return panel
@@ -1251,6 +1273,7 @@ class SentryWindow(QMainWindow):
                 item.setSizeHint(QSize(0, 118))
                 self.call_list.addItem(item)
                 self.call_items[call.call_id] = item
+            self._visible_call_rows = tuple(range(len(self.call_records)))
             for row in range(min(24, len(self.call_records))):
                 self._materialize_call_card(row)
         finally:
@@ -1258,7 +1281,7 @@ class SentryWindow(QMainWindow):
             self.call_list.setUpdatesEnabled(True)
         count = len(self.call_records)
         self.call_count.setText(f"{count} {'llamada' if count == 1 else 'llamadas'}")
-        QTimer.singleShot(0, self._materialize_visible_cards)
+        self._schedule_visible_cards()
 
     def _materialize_call_card(self, row: int) -> CallCard | None:
         if row < 0 or row >= self.call_list.count():
@@ -1280,18 +1303,23 @@ class SentryWindow(QMainWindow):
         self.call_list.setItemWidget(item, card)
         return card
 
+    def _schedule_visible_cards(self, *_args) -> None:
+        # Coalesce scroll/filter/resize events until Qt has laid out hidden rows.
+        self.call_card_refresh_timer.start(0)
+
     def _materialize_visible_cards(self, _value: int | None = None) -> None:
         if not hasattr(self, "call_list") or not self.call_list.count():
             return
-        first = self.call_list.indexAt(QPoint(2, 2)).row()
-        last = self.call_list.indexAt(QPoint(2, max(2, self.call_list.viewport().height() - 2))).row()
-        if first < 0:
-            first = 0
-        if last < first:
-            last = min(self.call_list.count() - 1, first + 20)
         kept_ids: set[int] = set()
-        for row in range(max(0, first - 5), min(self.call_list.count(), last + 11)):
-            if not self.call_list.item(row).isHidden():
+        visible_rows = self._visible_call_rows
+        if visible_rows:
+            first_row = self.call_list.indexAt(QPoint(2, 2)).row()
+            first = bisect_left(visible_rows, max(0, first_row))
+            # Count filtered rows, not model positions: two visible complaints can
+            # be hundreds of hidden rows apart. The bottom may be empty space.
+            height = max(1, self.call_list.item(visible_rows[0]).sizeHint().height())
+            page_rows = (self.call_list.viewport().height() + height - 1) // height + 1
+            for row in visible_rows[max(0, first - 5):first + page_rows + 10]:
                 self._materialize_call_card(row)
                 kept_ids.add(self.call_list.item(row).data(Qt.ItemDataRole.UserRole))
         if self.selected_call_id is not None:
@@ -2537,6 +2565,7 @@ class SentryWindow(QMainWindow):
         query = self.search_input.text().strip().casefold()
         status = self.status_filter.currentData()
         visible = 0
+        visible_rows: list[int] = []
         first_visible: QListWidgetItem | None = None
         for row, call in enumerate(self.call_records):
             searchable = self.call_search_cache.get(call.call_id)
@@ -2556,12 +2585,14 @@ class SentryWindow(QMainWindow):
             item.setHidden(not (matches_query and matches_status))
             if not item.isHidden():
                 visible += 1
+                visible_rows.append(row)
                 first_visible = first_visible or item
+        self._visible_call_rows = tuple(visible_rows)
         self.call_count.setText(f"{visible} {'llamada' if visible == 1 else 'llamadas'}")
         current = self.call_list.currentItem()
         if (current is None or current.isHidden()) and first_visible is not None:
             self.call_list.setCurrentItem(first_visible)
-        QTimer.singleShot(0, self._materialize_visible_cards)
+        self._schedule_visible_cards()
 
     def _on_call_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
         previous_id = _previous.data(Qt.ItemDataRole.UserRole) if _previous is not None else self.selected_call_id

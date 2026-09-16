@@ -43,9 +43,9 @@ class InstallerUpdateTests(unittest.TestCase):
             # Un ejecutable GUI mínimo evita abrir consolas o ejecutar la app del cliente.
             source = folder / "Program.cs"
             source.write_text(
-                'using System; using System.IO; class Program { static void Main() { '
+                'using System; using System.IO; using System.Diagnostics; class Program { static void Main() { '
                 'var p = Environment.GetEnvironmentVariable("SENTRY_TEST_RESTART"); '
-                'if (!String.IsNullOrEmpty(p)) File.WriteAllText(p, "restarted"); } }',
+                'if (!String.IsNullOrEmpty(p)) File.WriteAllText(p, Process.GetCurrentProcess().Id.ToString()); } }',
                 encoding="utf-8",
             )
             self.run_hidden([str(CSC), "/nologo", "/target:winexe",
@@ -91,10 +91,7 @@ class InstallerUpdateTests(unittest.TestCase):
                     self.assertEqual((destination / "payload.txt").read_text(encoding="utf-8"), "old")
                     self.assertEqual(updater.wait(timeout=45), 0)
                 self.assertIsNotNone(parent.poll())
-            deadline = time.monotonic() + 10
-            while not marker.exists() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            self.assertTrue(marker.exists(), "El instalador no relanzó la aplicación")
+            self.wait_for_restarted_fixture(marker)
             self.assertEqual((destination / "payload.txt").read_text(encoding="utf-8"), "new")
             self.assertEqual(database.read_bytes(), expected_database)
             self.assertEqual(recording.read_bytes(), b"original recording fixture")
@@ -104,11 +101,49 @@ class InstallerUpdateTests(unittest.TestCase):
             # Caso habitual: Sentry ya terminó cuando el instalador llega a PrepareToInstall.
             marker.unlink()
             self.run_hidden(arguments + ["/SENTRYUPDATE=1", f"/UPDATEFROMPID={parent.pid}"], env=environment)
-            deadline = time.monotonic() + 10
-            while not marker.exists() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            self.assertTrue(marker.exists())
+            self.wait_for_restarted_fixture(marker)
             self.assertEqual(database.read_bytes(), expected_database)
+
+    def wait_for_restarted_fixture(self, marker: Path, timeout: float = 10):
+        """Espera solo el PID del ejecutable ficticio antes de borrar su directorio."""
+        import ctypes
+        from ctypes import wintypes
+
+        deadline = time.monotonic() + timeout
+        process_id = None
+        while time.monotonic() < deadline:
+            try:
+                value = marker.read_text(encoding="utf-8").strip()
+            except (FileNotFoundError, PermissionError):
+                value = ""
+            if value.isdigit() and int(value) > 0:
+                process_id = int(value)
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(process_id, "El instalador no relanzó el ejecutable ficticio")
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel.OpenProcess(0x00100000, False, process_id)  # SYNCHRONIZE: solo esperar.
+        if not handle:
+            error = ctypes.get_last_error()
+            if error == 87:  # ERROR_INVALID_PARAMETER: el PID ya terminó.
+                return
+            raise ctypes.WinError(error)
+        try:
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            status = kernel.WaitForSingleObject(handle, remaining_ms)
+            if status == 0xFFFFFFFF:  # WAIT_FAILED.
+                raise ctypes.WinError(ctypes.get_last_error())
+            self.assertEqual(status, 0, "El ejecutable ficticio relanzado no terminó dentro del plazo")
+        finally:
+            kernel.CloseHandle(handle)
 
     def run_hidden(self, command, **options):
         result = subprocess.run(command, capture_output=True, text=True, timeout=60, **options,

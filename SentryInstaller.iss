@@ -1,9 +1,9 @@
 #define MyAppName "Sentry"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.0-beta.6"
+  #define MyAppVersion "0.1.0-beta.7"
 #endif
 #ifndef MyAppFileVersion
-  #define MyAppFileVersion "0.1.0.6"
+  #define MyAppFileVersion "0.1.0.7"
 #endif
 #define MyAppPublisher "Ecuaconexión"
 #define MyAppExeName "Sentry.exe"
