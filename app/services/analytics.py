@@ -1,7 +1,6 @@
 """Analítica global de los últimos resultados guardados, sin cargar transcripciones."""
 from collections import Counter
-from datetime import date, datetime, timedelta
-from pathlib import Path
+from datetime import date, timedelta
 import calendar
 
 
@@ -48,37 +47,6 @@ def load_report(database, start, end):
             ORDER BY created_at DESC
         """, args)]
     return summarize(calls, hits, bases, jobs, start, end)
-
-
-def demo_report(start, end):
-    calls, hits, links = [], [], {}
-    day = start
-    terms = ('queja', 'cancelar servicio', 'demanda', 'abogado', 'estafa')
-    while day < end:
-        for i in range(18 + day.toordinal() % 17):
-            call_id = len(calls) + 1
-            category = 'ALERTA' if i % 5 == 0 else ('BUZON' if i % 7 == 0 else 'NORMAL')
-            status = 'ERROR' if i == 11 else ('PENDIENTE' if i == 13 else 'COMPLETADO')
-            if status != 'COMPLETADO':
-                category = status
-            occurred = f'{day.isoformat()} {9 + i // 6:02d}:{(i * 7) % 60:02d}:00'
-            calls.append(dict(id=call_id, filename=f'ejemplo_llamada_{call_id:04d}.wav', status=status,
-                              category=category, reviewed=int(category == 'ALERTA' and i % 2 == 0),
-                              duration_seconds=45 + i * 3, occurred_at=occurred))
-            if category == 'ALERTA':
-                for term in (terms[i % 5], terms[(i // 5 + 1) % 5]):
-                    hits.append(dict(call_id=call_id, keyword=term, is_risk_validated=1))
-            if status == 'COMPLETADO':
-                name = ('Atención', 'Seguimiento', 'Retención')[i % 3]
-                path = f'Ejemplo_{name}_{day:%Y_%m}.xlsx'
-                base = links.setdefault(path, dict(base_path=path, calls=0, incidents=0, last_analysis=occurred))
-                base['calls'] += 1
-                base['incidents'] += category == 'ALERTA'
-                base['last_analysis'] = occurred
-        day += timedelta(days=1)
-    jobs = [dict(id=i,output_path=b['base_path'],status='COMPLETADO',unique_count=b['calls'],
-                 created_at=f'{start} 08:00:00') for i,b in enumerate(links.values(),1)]
-    return summarize(calls, hits, list(links.values()), jobs, start, end)
 
 
 def summarize(calls, hits, bases, jobs, start, end):

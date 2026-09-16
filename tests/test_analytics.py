@@ -1,23 +1,15 @@
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 import tempfile
 import unittest
 from app.database import Database
-from app.services.analytics import period_bounds, demo_report, load_report
+from app.services.analytics import period_bounds, load_report
 
 
 class AnalyticsTest(unittest.TestCase):
-    def test_calendar_boundaries_and_demo_totals(self):
+    def test_calendar_boundaries(self):
         self.assertEqual(period_bounds(date(2024,2,29),'month'),(date(2024,2,1),date(2024,3,1)))
         self.assertEqual(period_bounds(date(2026,9,16),'week'),(date(2026,9,14),date(2026,9,21)))
-        for period in ('day','week','month'):
-            start,end=period_bounds(date(2026,9,16),period)
-            r=demo_report(start,end)
-            self.assertEqual(sum(row[1] for row in r['daily']),r['completed'])
-            self.assertEqual(r['completed'],r['normal']+r['mailbox']+r['incidents'])
-            self.assertEqual(r['total'],r['completed']+r['pending']+r['errors'])
-            self.assertEqual(sum(b['calls'] for b in r['bases']),r['completed'])
-            self.assertGreater(len(r['keywords']),0)
 
     def test_global_history_date_filter_base_links_and_keywords(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -39,6 +31,4 @@ class AnalyticsTest(unittest.TestCase):
             self.assertEqual(r['bases'][0]['calls'],1)
             self.assertEqual(r['calls'][0]['keywords'],'queja')
             self.assertEqual(load_report(db,date(2026,9,14),date(2026,9,21))['total'],2)
-            demo_report(date(2026,9,1),date(2026,10,1))
-            with db.connect() as con:
-                self.assertEqual(con.execute('SELECT COUNT(*) FROM calls').fetchone()[0],2)
+            self.assertEqual(load_report(db,date(2025,9,14),date(2025,9,21))['total'],0)

@@ -1,4 +1,4 @@
-"""Reportes globales y demostración aislada de los datos operativos."""
+"""Reportes globales de los datos operativos guardados en SQLite."""
 from datetime import timedelta
 import html
 from pathlib import Path
@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, Q
     QToolTip)
 import xlsxwriter
 
-from app.services.analytics import period_bounds, load_report, demo_report
+from app.services.analytics import period_bounds, load_report
 from app.ui.theme import theme_colors
 
 
@@ -20,13 +20,13 @@ class ReportWorker(QThread):
     ready = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, database, start, end, demo, parent):
+    def __init__(self, database, start, end, parent):
         super().__init__(parent)
-        self.database, self.start_date, self.end_date, self.demo = database, start, end, demo
+        self.database, self.start_date, self.end_date = database, start, end
 
     def run(self):
         try:
-            result = demo_report(self.start_date, self.end_date) if self.demo else load_report(self.database, self.start_date, self.end_date)
+            result = load_report(self.database, self.start_date, self.end_date)
             self.ready.emit(result)
         except (sqlite3.Error, OSError, ValueError) as exc:
             self.failed.emit(str(exc))
@@ -134,16 +134,9 @@ class ReportsPage(QScrollArea):
         self.date.setMinimumWidth(140)
         self.date.setDisplayFormat('dd/MM/yyyy')
         self.date.setAccessibleName('Fecha de referencia')
-        self.source = QComboBox()
-        self.source.addItem('Datos reales',False)
-        self.source.addItem('Datos de ejemplo',True)
-        self.source.setAccessibleName('Origen de los datos del reporte')
-        with database.connect() as db:
-            if db.execute('SELECT COUNT(*) FROM calls').fetchone()[0] == 0:
-                self.source.setCurrentIndex(1)
         self.refresh_button = QPushButton('Actualizar')
         self.refresh_button.setObjectName('secondaryButton')
-        for label, widget in (('Período', self.period), ('Fecha de referencia', self.date), ('Fuente', self.source)):
+        for label, widget in (('Período', self.period), ('Fecha de referencia', self.date)):
             group = QVBoxLayout()
             group.setSpacing(5)
             caption = QLabel(label)
@@ -154,10 +147,6 @@ class ReportsPage(QScrollArea):
         controls.addStretch()
         controls.addWidget(self.refresh_button, 0, Qt.AlignmentFlag.AlignBottom)
         outer.addWidget(toolbar)
-        self.notice = QLabel()
-        self.notice.setWordWrap(True)
-        self.notice.setObjectName('reportNotice')
-        outer.addWidget(self.notice)
         self.range_label = QLabel()
         self.range_label.setObjectName('pageSubtitle')
         self.range_label.setWordWrap(True)
@@ -246,7 +235,6 @@ class ReportsPage(QScrollArea):
         outer.addStretch()
         self.period.currentIndexChanged.connect(self.refresh)
         self.date.dateChanged.connect(self.refresh)
-        self.source.currentIndexChanged.connect(self.refresh)
         self.refresh_button.clicked.connect(self.refresh)
 
     @staticmethod
@@ -281,17 +269,12 @@ class ReportsPage(QScrollArea):
         if self.worker is not None:
             return
         self.start_date,self.end_date=period_bounds(self.date.date().toPython(),self.period.currentData())
-        self.demo=bool(self.source.currentData())
-        self.notice.setProperty('demo', self.demo)
-        self.notice.setText('Datos de ejemplo · Información ficticia; no se guarda ni se mezcla con los datos reales.' if self.demo else 'Datos reales · Historial global guardado en este equipo.')
-        self.notice.style().unpolish(self.notice)
-        self.notice.style().polish(self.notice)
         self.range_label.setText(f'{self.start_date:%d/%m/%Y} — {self.end_date-timedelta(days=1):%d/%m/%Y} · '
                                  'Semana de lunes a domingo; mes calendario. Fechas de análisis en hora local.')
         self.summary.setText('Cargando analítica…')
-        for control in (self.period,self.date,self.source,self.refresh_button,self.export):
+        for control in (self.period,self.date,self.refresh_button,self.export):
             control.setEnabled(False)
-        self.worker=ReportWorker(self.database,self.start_date,self.end_date,self.demo,self)
+        self.worker=ReportWorker(self.database,self.start_date,self.end_date,self)
         self.worker.ready.connect(self.render)
         self.worker.failed.connect(self.failed)
         self.worker.finished.connect(self.finished)
@@ -300,7 +283,7 @@ class ReportsPage(QScrollArea):
     def finished(self):
         self.worker.deleteLater()
         self.worker=None
-        for control in (self.period,self.date,self.source,self.refresh_button):
+        for control in (self.period,self.date,self.refresh_button):
             control.setEnabled(True)
         self.export.setEnabled(self.result is not None)
 
@@ -330,7 +313,7 @@ class ReportsPage(QScrollArea):
         self.summary.setText(f"{result['total']} llamadas registradas · {result['normal']} normales · {result['mailbox']} buzones · "
                              f"{result['pending']} pendientes · {result['errors']} con error · {result['seconds']/60:.0f} min analizados · "
                              f"{rate:.1f}% de incidentes" if result['total'] else
-                             'No hay llamadas en este período. Cambia la fecha o selecciona Datos de ejemplo para explorar la analítica.')
+                             'No hay llamadas registradas en este período. Cambia la fecha o el período para consultar otro intervalo.')
         self.chart.setAccessibleDescription('; '.join(f'{day}: {total} analizadas, {alerts} incidentes' for day,total,alerts in result['daily']))
         self.chart.rows=result['daily']
         self.chart.update()
@@ -386,15 +369,14 @@ class ReportsPage(QScrollArea):
         return f"<b>{values[0]}</b><br>{values[1]} llamadas analizadas · {values[2]} incidentes"
 
     def export_excel(self):
-        prefix='EJEMPLO_' if self.demo else ''
-        path,_=QFileDialog.getSaveFileName(self,'Exportar analítica',f'{prefix}Sentry_{self.start_date}.xlsx','Excel (*.xlsx)')
+        path,_=QFileDialog.getSaveFileName(self,'Exportar analítica',f'Sentry_{self.start_date}.xlsx','Excel (*.xlsx)')
         if not path:
             return
         try:
             with xlsxwriter.Workbook(path,{'strings_to_formulas':False,'strings_to_urls':False}) as book:
                 header=book.add_format({'bold':True,'bg_color':'#EEF7EF'})
                 summary=book.add_worksheet('Resumen')
-                summary.write_row(0,0,['DATOS DE EJEMPLO' if self.demo else 'DATOS REALES',str(self.start_date),str(self.end_date-timedelta(days=1))],header)
+                summary.write_row(0,0,['Reporte Sentry',str(self.start_date),str(self.end_date-timedelta(days=1))],header)
                 for i,key in enumerate(('total','completed','incidents','verified','normal','mailbox','pending','errors','seconds'),2):
                     summary.write_row(i,0,[{'total':'Llamadas registradas','completed':'Llamadas analizadas','incidents':'Incidentes',
                         'verified':'Denuncias verificadas','normal':'Normales','mailbox':'Buzones','pending':'Pendientes',

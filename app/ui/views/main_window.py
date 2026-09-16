@@ -3709,19 +3709,6 @@ class SentryWindow(QMainWindow):
                 border: 1px solid {PALETTE['border']};
                 border-radius: 10px;
             }}
-            QLabel#reportNotice {{
-                color: {PALETTE['text_soft']};
-                background: {PALETTE['surface']};
-                border: 1px solid {PALETTE['border']};
-                border-radius: 7px;
-                padding: 9px 12px;
-                font-weight: 550;
-            }}
-            QLabel#reportNotice[demo="true"] {{
-                color: {PALETTE['green_accessible']};
-                background: {PALETTE['green_soft']};
-                border-color: {PALETTE['nav_checked_border']};
-            }}
             QTabWidget#reportTabs::pane {{
                 background: {PALETTE['panel']};
                 border: 1px solid {PALETTE['border']};
