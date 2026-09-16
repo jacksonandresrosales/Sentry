@@ -1,7 +1,8 @@
 """Información de la versión publicada; actualizar aquí al preparar cada entrega."""
 
 APP_NAME = "Sentry"
-APP_VERSION = "0.1.0-beta.1"
+APP_VERSION = "0.1.0-beta.6"
+UPDATE_REPOSITORY = "jacksonandresrosales/Sentry"
 APP_AUTHORS = "Jackson Ocaña y Jeremy Godoy"
 APP_DESCRIPTION = (
     "Auditoría de llamadas para una atención mejor informada. "

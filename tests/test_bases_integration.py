@@ -180,6 +180,7 @@ class BasesUiTests(unittest.TestCase):
                 self.assertEqual(page.history.rowCount(), 1)
                 self.assertTrue(page.use_base_button.isEnabled())
                 page.use_result_for_audio()
+                self.wait_for_conversion(page)
                 self.assertEqual(page.active_phones, {"0990000001"})
                 self.assertEqual(window.active_base_phones, {"0990000001"})
                 self.assertEqual(window.database.settings()["audio_filter_base"], str(first))

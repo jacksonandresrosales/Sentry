@@ -1,13 +1,16 @@
 """Persistencia SQLite; las credenciales se guardan únicamente como blobs cifrados por DPAPI."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import json
 import os
 from pathlib import Path
 import shutil
 import sqlite3
 import sys
+import tempfile
+import time
+from datetime import datetime, timezone
 
 
 _configured_storage = os.environ.get("SENTRY_STORAGE_ROOT", "").strip()
@@ -130,12 +133,19 @@ class Database:
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA synchronous=NORMAL")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             if version > 6:
                 raise RuntimeError("La base de datos pertenece a una versión más nueva de Sentry.")
-            connection.executescript(SCHEMA)
+            if version < 6 and connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1"
+            ).fetchone():
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                self.backup_to(self.path.parent / "backups" / f"before-schema-{version}-to-6-{stamp}.db")
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
+            # Incluye DDL y versión en la misma transacción: una migración fallida
+            # no deja la base marcada como actualizada ni parcialmente alterada.
+            connection.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(calls)")}
             additions = {
                 "category": "TEXT NOT NULL DEFAULT 'PENDIENTE'",
@@ -170,10 +180,43 @@ class Database:
         with self.connect() as connection:
             return dict(connection.execute("SELECT key,value FROM app_settings").fetchall())
 
+    def backup_to(self, destination: Path, *, cancel=None, timeout=60) -> Path:
+        """Respaldo SQLite consistente (incluye WAL), publicado sin sobrescritura."""
+        destination = Path(destination).resolve()
+        if destination == self.path or destination.exists():
+            raise ValueError("El respaldo debe usar un archivo nuevo distinto de la base activa.")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".sentry-backup-", suffix=".db", dir=destination.parent)
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        started = time.monotonic()
+
+        def progress(_status, _remaining, _total):
+            if cancel and cancel():
+                raise InterruptedError("Respaldo cancelado; la base original permanece intacta.")
+            if time.monotonic() - started > timeout:
+                raise TimeoutError("El respaldo tardó demasiado; no se instalará la actualización.")
+
+        try:
+            progress(0, 0, 0)
+            with closing(sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True)) as source:
+                with closing(sqlite3.connect(temporary)) as target:
+                    source.backup(target, pages=256, progress=progress, sleep=.05)
+                    if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                        raise RuntimeError("El respaldo no superó la verificación de integridad.")
+            if os.name == "nt":
+                temporary.rename(destination)
+            else:
+                os.link(temporary, destination)
+            return destination
+        finally:
+            temporary.unlink(missing_ok=True)
+
     def save_settings(self, values: dict[str, str]):
         allowed = {
             "audio_directory", "nas_directory", "audio_source", "keywords",
-            "base_output_folder", "audio_filter_base", "theme",
+            "base_output_folder", "base_source_system", "audio_filter_base", "theme",
+            "analysis_parallelism", "updates_enabled", "updates_last_checked",
         }
         if set(values) - allowed:
             raise ValueError("Solo se permiten ajustes locales sin credenciales.")

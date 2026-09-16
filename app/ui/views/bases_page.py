@@ -32,6 +32,24 @@ class ConversionWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class AudioIndexWorker(QThread):
+    succeeded = Signal(str, object)
+    failed = Signal(str)
+
+    def __init__(self, path: Path, parent=None):
+        super().__init__(parent)
+        self.path = path
+
+    def run(self):
+        try:
+            index = load_hoja1_audio_index(self.path)
+            if not index.phones:
+                raise ValueError("Hoja1 no contiene teléfonos para relacionar con grabaciones.")
+            self.succeeded.emit(str(self.path), index)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class BasesPage(QWidget):
     """Vista nativa: no lanza Tkinter ni duplica las reglas del transformador."""
     base_selected = Signal(str, object)
@@ -46,6 +64,7 @@ class BasesPage(QWidget):
         self.active_base_path: Path | None = None
         self.active_phones: set[str] = set()
         self.active_index = BaseAudioIndex({})
+        settings = database.settings()
         self.setObjectName("basesPage")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -59,7 +78,7 @@ class BasesPage(QWidget):
         layout.setSpacing(18)
         title = QLabel("Preparar bases")
         title.setObjectName("pageTitle")
-        subtitle = QLabel("Carga CSV o Excel y genera el formato NO, con filtros, fórmulas y numeración segura.")
+        subtitle = QLabel("Prepara bases CSV o Excel de Issabel o Lucid para relacionarlas con tus grabaciones.")
         subtitle.setObjectName("pageSubtitle")
         subtitle.setWordWrap(True)
         layout.addWidget(title)
@@ -70,6 +89,23 @@ class BasesPage(QWidget):
         form = QVBoxLayout(panel)
         form.setContentsMargins(20, 18, 20, 18)
         form.setSpacing(12)
+        source_row = QHBoxLayout()
+        source_label = QLabel("Sistema de origen")
+        self.source_system = QComboBox()
+        self.source_system.setObjectName("baseSourceSystem")
+        self.source_system.addItem("Issabel", "issabel")
+        self.source_system.addItem("Lucid", "lucid")
+        source_label.setBuddy(self.source_system)
+        saved_source = self.source_system.findData(settings.get("base_source_system", "issabel"))
+        self.source_system.setCurrentIndex(max(0, saved_source))
+        source_row.addWidget(source_label)
+        source_row.addWidget(self.source_system)
+        source_row.addStretch()
+        form.addLayout(source_row)
+        self.source_hint = QLabel()
+        self.source_hint.setObjectName("pageSubtitle")
+        self.source_hint.setWordWrap(True)
+        form.addWidget(self.source_hint)
         files_row = QHBoxLayout()
         files_title = QLabel("Bases de origen")
         files_title.setObjectName("formTitle")
@@ -85,7 +121,7 @@ class BasesPage(QWidget):
         fields = QGridLayout()
         fields.setHorizontalSpacing(12)
         fields.setVerticalSpacing(10)
-        self.output_folder = QLineEdit(database.settings().get(
+        self.output_folder = QLineEdit(settings.get(
             "base_output_folder", str(APP_STORAGE_ROOT / "outputs")))
         self.folder_button = self.button("Examinar…", self.choose_folder)
         folder_label = QLabel("Carpeta de resultados")
@@ -108,6 +144,7 @@ class BasesPage(QWidget):
         number_label.setBuddy(self.base_number)
         fields.addWidget(number_label, 1, 2)
         fields.addWidget(self.base_number, 1, 3, 1, 2)
+        self.issabel_controls = [type_label, self.base_type, number_label, self.base_number]
         form.addLayout(fields)
 
         self.advanced_toggle = self.button("Opciones avanzadas", self.toggle_advanced)
@@ -133,7 +170,10 @@ class BasesPage(QWidget):
             label.setBuddy(field)
             advanced.addWidget(label, row, 0)
             advanced.addWidget(field, row, 1)
+            if field in (self.state, self.call_state):
+                self.issabel_controls.extend((label, field))
         advanced.addWidget(self.include_ruc, 5, 1)
+        self.issabel_controls.append(self.include_ruc)
         self.advanced.hide()
         form.addWidget(self.advanced)
         self.output_name = QLabel("Selecciona una o varias bases. Los archivos originales no se modifican.")
@@ -197,12 +237,14 @@ class BasesPage(QWidget):
         layout.addStretch()
         scroll.setWidget(content)
         outer.addWidget(scroll)
-        self.controls = [self.choose_button, self.output_folder, self.folder_button,
+        self.controls = [self.source_system, self.choose_button, self.output_folder, self.folder_button,
                          self.base_type, self.base_number, self.state, self.call_state,
                          self.sheet, self.encoding, self.delimiter, self.include_ruc,
                          self.advanced_toggle, self.process_button, self.history]
         self.base_number.textChanged.connect(self.preview_name)
         self.output_folder.textChanged.connect(self.preview_name)
+        self.source_system.currentIndexChanged.connect(self.source_system_changed)
+        self.update_source_controls()
         self.refresh_history()
         self.restore_active_base()
 
@@ -215,6 +257,29 @@ class BasesPage(QWidget):
 
     def toggle_advanced(self):
         self.advanced.setVisible(self.advanced_toggle.isChecked())
+
+    def update_source_controls(self):
+        lucid = self.source_system.currentData() == "lucid"
+        for control in self.issabel_controls:
+            control.setVisible(not lucid)
+            control.setEnabled(not lucid and not self.busy)
+        self.source_hint.setText(
+            "Lucid: genera Teléfono, Nombre, ID y Estado; también acepta GESTION. Conserva los ID y todos los "
+            "estados de personas. Excluye empresas identificadas por su razón social (S.A., Ltda., etc.), "
+            "no por tener RUC. Añade el cero inicial al teléfono cuando falta. "
+            "Busca solo grabaciones out- por teléfono desde el 01/09/2026 "
+            "en la carpeta o servidor configurado; no usa Fecha Rellamada ni la fecha del CSV."
+            if lucid else
+            "Issabel: conserva el formato NO con filtros, fórmulas y numeración de base."
+        )
+
+    def source_system_changed(self):
+        self.update_source_controls()
+        self.preview_name()
+        try:
+            self.database.save_settings({"base_source_system": self.source_system.currentData()})
+        except (ValueError, sqlite3.Error) as exc:
+            self.status.setText(f"No se pudo guardar el sistema de origen: {exc}")
 
     def choose_files(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "Seleccionar bases", "", "Bases CSV o Excel (*.csv *.xlsx)")
@@ -242,7 +307,10 @@ class BasesPage(QWidget):
         if not self.paths:
             return
         try:
-            output = default_output(self.paths[0], Path(self.output_folder.text()), self.base_number.text().strip() or None)
+            source_system = self.source_system.currentData()
+            number = (self.base_number.text().strip() or None) if source_system == "issabel" else None
+            output = default_output(self.paths[0], Path(self.output_folder.text()), number,
+                                    source_system=source_system)
             self.output_name.setText(f"Salida prevista: {output.name} · Se confirma al leer el origen.")
         except BaseError as exc:
             self.output_name.setText(str(exc))
@@ -257,61 +325,84 @@ class BasesPage(QWidget):
             self.status.setText("Selecciona una carpeta de resultados.")
             return
         try:
-            number = normalize_base_number(self.base_number.text().strip()) if self.base_number.text().strip() else None
+            source_system = self.source_system.currentData()
+            lucid = source_system == "lucid"
+            number = (normalize_base_number(self.base_number.text().strip())
+                      if not lucid and self.base_number.text().strip() else None)
             if number and len(self.paths) > 1:
                 raise BaseError("El número manual se aplica a una sola base; para consolidar, usa automático.")
             delimiter = self.delimiter.text() or None
             if delimiter is not None and len(delimiter) != 1:
                 raise BaseError("El separador debe tener un solo carácter.")
             folder = Path(self.output_folder.text().strip()).resolve()
-            self.database.save_settings({"base_output_folder": str(folder)})
+            self.database.save_settings({"base_output_folder": str(folder), "base_source_system": source_system})
         except (BaseError, OSError, ValueError, sqlite3.Error) as exc:
             self.status.setText(str(exc))
             return
-        options = dict(base_number=number, base_type=self.base_type.currentData(),
-                       state=self.state.text().strip(), call_state=self.call_state.text().strip(),
+        options = dict(source_system=source_system, base_number=number,
+                       entity_filter="people" if lucid else "all",
+                       base_type=None if lucid else self.base_type.currentData(),
+                       state="*" if lucid else self.state.text().strip(),
+                       call_state="*" if lucid else self.call_state.text().strip(),
                        sheet=self.sheet.text().strip() or None, encoding=self.encoding.text().strip() or None,
-                       delimiter=delimiter, include_ruc_third_9=self.include_ruc.isChecked())
-        self.busy = True
+                       delimiter=delimiter, include_ruc_third_9=not lucid and self.include_ruc.isChecked())
         self.result_path = None
-        for control in self.controls:
-            control.setEnabled(False)
-        self.open_button.setEnabled(False)
-        self.open_folder_button.setEnabled(False)
-        self.use_base_button.setEnabled(False)
-        self.progress.show()
-        self.status.setText("Procesando bases… Puedes seguir trabajando en Auditoría.")
+        self.begin_work("Procesando bases… Puedes seguir trabajando en Auditoría.")
         self.worker = ConversionWorker(self.database, list(self.paths), folder, options, self)
         self.worker.succeeded.connect(self.conversion_done)
         self.worker.failed.connect(self.conversion_failed)
         self.worker.finished.connect(self.worker_finished)
         self.worker.start()
 
+    def begin_work(self, message):
+        self.busy = True
+        for control in self.controls:
+            control.setEnabled(False)
+        self.open_button.setEnabled(False)
+        self.open_folder_button.setEnabled(False)
+        self.use_base_button.setEnabled(False)
+        self.progress.show()
+        self.status.setText(message)
+
     def conversion_done(self, result):
         self.result_path = result.output
         self.output_name.setText(f"Archivo generado: {result.output.name}")
         self.output_name.setToolTip(str(result.output))
         read = sum(source[1] for source in result.sources)
-        self.status.setText(f"Terminado · {read:,} leídos · {result.filtered:,} filtrados · "
-                            f"{result.unique:,} únicos · {result.filtered - result.unique:,} teléfonos repetidos retirados.")
+        if result.source_system == "lucid":
+            self.status.setText(
+                f"Terminado · Registros leídos: {read:,} · Registros de empresas excluidos: {result.excluded:,} · "
+                f"Teléfonos únicos: {result.unique:,} · "
+                f"Teléfonos repetidos retirados: {result.filtered - result.unique:,}."
+            )
+        else:
+            self.status.setText(f"Terminado · {read:,} leídos · {result.filtered:,} filtrados · "
+                                f"{result.unique:,} únicos · {result.filtered - result.unique:,} teléfonos repetidos retirados.")
         if not result.filtered:
-            self.status.setText(self.status.text() + " No hubo coincidencias; se conservan originales y cabeceras.")
+            message = (" No quedaron registros de personas; se conservan originales y cabeceras."
+                       if result.source_system == "lucid" else
+                       " No hubo coincidencias; se conservan originales y cabeceras.")
+            self.status.setText(self.status.text() + message)
 
     def conversion_failed(self, message):
         self.status.setText(f"No se completó el procesamiento: {message}")
 
     def worker_finished(self):
+        worker = self.worker
+        self.worker = None
         self.busy = False
         self.progress.hide()
         for control in self.controls:
             control.setEnabled(True)
-        self.refresh_history()
+        self.update_source_controls()
+        if isinstance(worker, ConversionWorker):
+            self.refresh_history()
         exists = self.result_path is not None and self.result_path.is_file()
         self.use_base_button.setEnabled(exists)
         self.open_button.setEnabled(exists)
         self.open_folder_button.setEnabled(exists)
-        self.worker.deleteLater()
-        self.worker = None
+        if worker is not None:
+            worker.deleteLater()
 
     def refresh_history(self):
         try:
@@ -355,29 +446,54 @@ class BasesPage(QWidget):
         self._set_active_base(path, index)
 
     def use_result_for_audio(self):
+        if self.busy:
+            return
         if self.result_path is None:
             self.status.setText("Selecciona primero un resultado generado o una fila del historial.")
             return
-        try:
-            index = load_hoja1_audio_index(self.result_path)
-            if not index.phones:
-                raise ValueError("Hoja1 no contiene teléfonos para relacionar con grabaciones.")
-            self.database.save_settings({"audio_filter_base": str(self.result_path.resolve())})
-        except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
-            self.status.setText(f"No se pudo usar la base para buscar audios: {exc}")
+        path = self.result_path.resolve()
+        self.begin_work("Leyendo los teléfonos de la base… Puedes seguir trabajando en Auditoría.")
+        self.worker = AudioIndexWorker(path, self)
+        self.worker.succeeded.connect(self.audio_index_ready)
+        self.worker.failed.connect(self.audio_index_failed)
+        self.worker.finished.connect(self.worker_finished)
+        self.worker.start()
+
+    def audio_index_ready(self, selected_path: str, index: BaseAudioIndex):
+        path = Path(selected_path)
+        if self.result_path is None or self.result_path.resolve() != path:
+            self.status.setText("La selección cambió. Vuelve a elegir la base para buscar audios.")
             return
-        self._set_active_base(self.result_path, index)
+        try:
+            self.database.save_settings({"audio_filter_base": selected_path})
+        except (ValueError, sqlite3.Error) as exc:
+            self.audio_index_failed(str(exc))
+            return
+        self._set_active_base(path, index)
+        lookup_hint = " de grabaciones out- por teléfono, desde el 01/09/2026" if index.source_system == "lucid" else ""
         self.status.setText(
-            f"Base seleccionada · {len(index.phones):,} teléfonos únicos. Buscando coincidencias en la carpeta de grabaciones…"
+            f"Base seleccionada · {len(index.phones):,} teléfonos únicos. "
+            f"Buscando coincidencias{lookup_hint} en la carpeta o servidor de grabaciones…"
         )
         self.base_selected.emit(str(self.active_base_path), self.active_index)
+
+    def audio_index_failed(self, message):
+        self.status.setText(f"No se pudo usar la base para buscar audios: {message}")
+
+    def closeEvent(self, event):
+        if self.busy:
+            self.status.setText("Espera a que termine la lectura o el procesamiento de la base antes de cerrar.")
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _set_active_base(self, path: Path, index: BaseAudioIndex):
         self.active_base_path = Path(path).resolve()
         self.active_index = index
         self.active_phones = index.phones
         self.active_base.setText(
-            f"Base activa para grabaciones: {self.active_base_path.name} · {len(self.active_phones):,} teléfonos"
+            f"Base activa para grabaciones: {self.active_base_path.name} · "
+            f"{index.source_system.title()} · {len(self.active_phones):,} teléfonos"
         )
         self.active_base.setToolTip(str(self.active_base_path))
 

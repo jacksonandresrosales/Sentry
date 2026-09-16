@@ -6,7 +6,6 @@ import os
 import re
 import wave
 from bisect import bisect_right
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -15,8 +14,12 @@ import sqlite3
 from app.database import APP_STORAGE_ROOT, Database, DEFAULT_DATABASE
 from app.about import APP_NAME, APP_VERSION, APP_AUTHORS, APP_DESCRIPTION, APP_FEATURES
 from app.secret_store import SecretStoreError, protect, unprotect
-from app.services.audio_analysis import analyze_file, assign_roles, cached_file_hash, keyword_signature
-from app.services.base_conversion import BaseAudioIndex, load_hoja1_audio_index, normalize_phone_number
+from app.services.audio_analysis import assign_roles, keyword_signature
+from app.services.analysis_batch import analysis_concurrency, run_analysis_batch
+from app.ui.update_controller import UpdatePanel
+from app.services.base_conversion import (
+    LUCID_AUDIO_SINCE, BaseAudioIndex, load_hoja1_audio_index, normalize_phone_number,
+)
 from app.services.report_export import EXPORT_MODE_LABELS, export_audit_excel
 from app.services.winscp_client import (
     match_and_download_remote_audio, scan_host_fingerprint, search_remote_audio,
@@ -78,9 +81,16 @@ def category_pixmap(name: str) -> QPixmap:
 
 def audio_phone_from_filename(path: Path) -> str | None:
     parts = path.stem.split("-")
-    if len(parts) < 3 or parts[0].casefold() != "q" or not parts[1].isdigit() or len(parts[1]) != 3:
+    if len(parts) < 3:
         return None
-    phone = normalize_phone_number(parts[2])
+    prefix = parts[0].casefold()
+    if prefix == "q" and parts[1].isdigit() and len(parts[1]) == 3:
+        raw_phone = parts[2]
+    elif prefix == "out" and parts[2].isdigit():
+        raw_phone = parts[1]
+    else:
+        return None
+    phone = normalize_phone_number(raw_phone)
     return phone or None
 
 
@@ -99,6 +109,12 @@ def audio_key_from_filename(path: Path) -> tuple[str, str] | None:
 def audio_matches_index(path: Path, index: BaseAudioIndex) -> bool:
     key = audio_key_from_filename(path)
     if key is None or key[0] not in index.phone_dates:
+        return False
+    prefix = path.stem.split("-", 1)[0].casefold()
+    if index.source_system == "lucid":
+        if prefix != "out" or key[1] < LUCID_AUDIO_SINCE:
+            return False
+    elif prefix != "q":
         return False
     expected_dates = index.phone_dates[key[0]]
     return not expected_dates or key[1] in expected_dates
@@ -233,12 +249,12 @@ def format_time(seconds: int) -> str:
 
 
 def audio_filename_metadata(path: Path, stat_fallback: bool = True) -> tuple[str, str]:
-    """Obtiene teléfono anonimizado y hora desde q-000-teléfono-AAAAMMDD-HHMMSS."""
+    """Obtiene teléfono anonimizado y hora de grabaciones q- (Issabel) y out- (Lucid)."""
     parts = path.stem.split("-")
     raw_phone = audio_phone_from_filename(path)
     customer = f"{raw_phone[:3]}***{raw_phone[-4:]}" if raw_phone else "Sin identificar"
-    if len(parts) >= 5 and parts[0].casefold() == "q" and parts[1].isdigit() and len(parts[1]) == 3:
-        _phone, raw_date, raw_time = parts[2:5]
+    if len(parts) >= 5 and raw_phone:
+        raw_date, raw_time = parts[3:5]
         try:
             parsed = datetime.strptime(raw_date + raw_time, "%Y%m%d%H%M%S")
         except ValueError:
@@ -313,6 +329,7 @@ def collect_audio_records(
                 index.phones if index is not None else None,
                 index.phone_dates if index is not None else None,
             )
+            if index is None or audio_matches_index(path, index)
         }
     else:
         detected = {
@@ -391,79 +408,13 @@ class AnalysisWorker(QThread):
         self._stop = True
 
     def run(self):
-        completed = failures = processed = 0
-        total = len(self.paths)
-        groups: dict[str, list[Path]] = {}
-        for raw_path in self.paths:
-            if self._stop:
-                break
-            path = Path(raw_path)
-            try:
-                digest = cached_file_hash(self.database, path)
-            except Exception as exc:
-                try:
-                    self.database.set_call_status(path, "ERROR", str(exc))
-                except Exception:
-                    pass
-                failures += 1
-                processed += 1
-                self.progress.emit(processed, total, path.name)
-                continue
-            groups.setdefault(digest, []).append(path)
-
-        work = iter(groups.items())
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="sentry-analysis") as pool:
-            pending = {}
-
-            def fill_workers() -> None:
-                while not self._stop and len(pending) < 3:
-                    try:
-                        digest, paths = next(work)
-                    except StopIteration:
-                        break
-                    pending[pool.submit(analyze_file, self.database, paths[0], self.config, digest)] = (
-                        digest, paths
-                    )
-
-            fill_workers()
-            while pending:
-                done, _remaining = wait(pending, return_when=FIRST_COMPLETED)
-                for future in done:
-                    digest, paths = pending.pop(future)
-                    try:
-                        rows = [future.result()]
-                    except Exception as exc:
-                        rows = []
-                        for path in paths:
-                            try:
-                                self.database.set_call_status(path, "ERROR", str(exc))
-                            except Exception:
-                                pass
-                            failures += 1
-                            processed += 1
-                            self.progress.emit(processed, total, path.name)
-                    else:
-                        if not self._stop:
-                            for path in paths[1:]:
-                                try:
-                                    rows.append(analyze_file(self.database, path, self.config, digest))
-                                except Exception as exc:
-                                    try:
-                                        self.database.set_call_status(path, "ERROR", str(exc))
-                                    except Exception:
-                                        pass
-                                    failures += 1
-                                    processed += 1
-                                    self.progress.emit(processed, total, path.name)
-                        for row in rows:
-                            if self.config.get("base_path"):
-                                self.database.record_analysis_base(row["id"], self.config["base_path"])
-                            completed += 1
-                            processed += 1
-                            self.row_ready.emit(row)
-                            self.progress.emit(processed, total, row["filename"])
-                fill_workers()
-        self.completed.emit(completed, failures, self._stop)
+        result = run_analysis_batch(
+            self.database, self.paths, self.config,
+            max_workers=self.config.get("analysis_parallelism", 6),
+            progress=self.progress.emit, row_ready=self.row_ready.emit,
+            stop_requested=lambda: self._stop,
+        )
+        self.completed.emit(*result)
 
 
 class LocalScanWorker(QThread):
@@ -578,6 +529,7 @@ class RemoteSearchWorker(QThread):
 class IssabelMatchWorker(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
+    progress = Signal(object)
 
     def __init__(self, config: dict, index: BaseAudioIndex, destination: Path,
                  base_path: Path | None = None, parent=None):
@@ -586,23 +538,42 @@ class IssabelMatchWorker(QThread):
         self.index = index
         self.destination = Path(destination)
         self.base_path = Path(base_path).resolve() if base_path is not None else None
+        self._reported_paths: set[Path] = set()
+
+    def request_stop(self) -> None:
+        self.requestInterruption()
+
+    def _report_progress(self, payload: dict) -> None:
+        paths = [Path(path) for path in payload.get("paths", ())
+                 if Path(path) not in self._reported_paths]
+        records = []
+        if paths:
+            paths, records = collect_audio_records(self.destination, self.index, paths)
+            self._reported_paths.update(paths)
+        self.progress.emit({**payload, "paths": paths, "records": records,
+                            "base_path": self.base_path})
 
     def run(self):
         try:
             directories = issabel_directories(self.config.get("remote_path", ""), self.index.dates)
-            if not directories:
+            phone_only = self.index.source_system == "lucid" and not self.index.dates
+            if phone_only:
+                directories = [self.config.get("remote_path") or "/var/spool/asterisk/monitor/"]
+            elif not directories:
                 raise ValueError("La base activa no contiene fechas válidas para localizar los audios en Issabel.")
             request = dict(self.config)
             request["remote_paths"] = directories
-            request["recursive"] = False
-            phone_dates = {
-                variant: dates
-                for phone, dates in self.index.phone_dates.items()
-                for variant in issabel_phone_variants({phone})
-            }
+            request["recursive"] = phone_only
+            request["source_system"] = self.index.source_system
+            if phone_only:
+                request["audio_since"] = LUCID_AUDIO_SINCE
             result = match_and_download_remote_audio(
-                request, phone_dates, self.destination, limit=5000
+                request, self.index.phone_dates, self.destination, limit=0,
+                progress_callback=self._report_progress,
+                should_cancel=self.isInterruptionRequested,
             )
+            # Include a last batch even when a backend only reports its final result.
+            self._report_progress(result)
         except Exception as exc:
             self.failed.emit(str(exc))
         else:
@@ -937,6 +908,7 @@ class SentryWindow(QMainWindow):
         self.issabel_match_worker: IssabelMatchWorker | None = None
         self.report_export_worker: ReportExportWorker | None = None
         self.close_after_analysis = False
+        self.close_after_remote_scan = False
 
         self.audio_output = QAudioOutput(self)
         self.audio_output.setVolume(1.0)
@@ -1118,6 +1090,23 @@ class SentryWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self._build_filter_bar())
+
+        self.scan_status = QFrame()
+        self.scan_status.setObjectName("sectionHeader")
+        scan_layout = QHBoxLayout(self.scan_status)
+        scan_layout.setContentsMargins(20, 8, 20, 8)
+        self.scan_status_label = QLabel()
+        self.scan_status_label.setWordWrap(True)
+        self.scan_status_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.scan_status_label.setObjectName("mutedText")
+        scan_layout.addWidget(self.scan_status_label, 1)
+        self.scan_cancel_button = QPushButton("Detener búsqueda")
+        self.scan_cancel_button.setObjectName("secondaryButton")
+        self.scan_cancel_button.clicked.connect(self._cancel_issabel_match)
+        scan_layout.addWidget(self.scan_cancel_button)
+        self.scan_status.hide()
+        self.scan_cancel_button.hide()
+        layout.addWidget(self.scan_status)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setObjectName("mainSplitter")
@@ -1897,6 +1886,29 @@ class SentryWindow(QMainWindow):
         api_layout.addLayout(services)
         outer.addWidget(api_settings)
 
+        performance = QFrame()
+        performance.setObjectName("contentPanel")
+        performance_layout = QVBoxLayout(performance)
+        performance_layout.setContentsMargins(20, 18, 20, 18)
+        performance_title = QLabel("Velocidad del análisis")
+        performance_title.setObjectName("formTitle")
+        performance_layout.addWidget(performance_title)
+        self.analysis_parallelism = QComboBox()
+        self.analysis_parallelism.setAccessibleName("Llamadas analizadas simultáneamente")
+        for count in range(1, 9):
+            self.analysis_parallelism.addItem(f"{count} llamadas simultáneas" + (" · recomendado" if count == 6 else ""), count)
+        workers = analysis_concurrency(self.database.settings().get("analysis_parallelism", 6))
+        self.analysis_parallelism.setCurrentIndex(self.analysis_parallelism.findData(workers))
+        performance_layout.addWidget(self.analysis_parallelism)
+        performance_help = QLabel("Las transcripciones y análisis guardados se reutilizan. Reduce la concurrencia "
+                                  "si tu proveedor tiene una cuota pequeña; los límites temporales se respetan automáticamente.")
+        performance_help.setWordWrap(True)
+        performance_help.setObjectName("pageSubtitle")
+        performance_layout.addWidget(performance_help)
+        outer.addWidget(performance)
+        self.updates_panel = UpdatePanel(self)
+        outer.addWidget(self.updates_panel)
+
         save_row = QHBoxLayout()
         save_row.addStretch()
         save = QPushButton("Guardar ajustes")
@@ -2478,19 +2490,23 @@ class SentryWindow(QMainWindow):
             button.setChecked(name == key)
 
     def _activate_audio_base(self, path: str, index_payload: object) -> None:
-        self.active_base_path = Path(path).resolve()
+        next_base_path = Path(path).resolve()
         if isinstance(index_payload, BaseAudioIndex):
-            self.active_base_index = index_payload
+            next_index = index_payload
         else:
             try:
-                self.active_base_index = load_hoja1_audio_index(self.active_base_path)
+                next_index = load_hoja1_audio_index(next_base_path)
             except (OSError, ValueError, KeyError) as exc:
                 self._show_toast(f"No se pudo leer teléfono y fecha de Hoja1: {exc}")
                 return
-        self.active_base_phones = self.active_base_index.phones
-        if not self.active_base_phones:
+        if not next_index.phones:
             self._show_toast("La base seleccionada no contiene teléfonos en Hoja1")
             return
+        self.active_base_path = next_base_path
+        self.active_base_index = next_index
+        self.active_base_phones = next_index.phones
+        if self.issabel_match_worker is not None:
+            self.issabel_match_worker.request_stop()
         if self._source_key() != "issabel" and not self._selected_directory():
             self._show_toast("Base seleccionada. Configura ahora la carpeta del origen elegido")
             self._switch_page("config")
@@ -2498,9 +2514,9 @@ class SentryWindow(QMainWindow):
             return
         self._switch_page("audit")
         self._prepare_base_refresh()
-        self._show_toast(
-            f"Buscando {len(self.active_base_phones):,} teléfonos en {len(self.active_base_index.dates):,} fecha(s)"
-        )
+        scope = ("en grabaciones out- desde septiembre de 2026 (Lucid)" if self.active_base_index.source_system == "lucid"
+                 else f"en {len(self.active_base_index.dates):,} fecha(s)")
+        self._show_toast(f"Buscando {len(self.active_base_phones):,} teléfonos {scope}")
         self._scan_directory()
 
     def _prepare_base_refresh(self) -> None:
@@ -2509,6 +2525,8 @@ class SentryWindow(QMainWindow):
         self.calls = {}
         self.detected_audio_files = ()
         self.selected_call_id = None
+        self.search_input.clear()
+        self.status_filter.setCurrentIndex(0)
         self._populate_call_list()
         self._show_empty_state(
             "Actualizando resultados…",
@@ -2992,6 +3010,7 @@ class SentryWindow(QMainWindow):
                 "audio_source": source,
                 "keywords": ", ".join(keywords),
                 "theme": self.theme,
+                "analysis_parallelism": str(self.analysis_parallelism.currentData()),
             })
             api_count = self._persist_credentials()
             remote_count = self._persist_remote_connection()
@@ -3023,8 +3042,19 @@ class SentryWindow(QMainWindow):
     def _set_scan_busy(self, busy: bool, message: str = "") -> None:
         self.analyze_button.setEnabled(not busy)
         self.audio_source.setEnabled(not busy)
+        if message:
+            self.scan_status_label.setText(message)
+            self.scan_status.show()
         if not busy:
+            self.scan_cancel_button.hide()
             self._source_changed()
+
+    def _show_scan_error(self, title: str, message: str) -> None:
+        self.scan_status_label.setText(f"{title}: {message}")
+        self.scan_status.show()
+        if not self.call_records:
+            self._show_empty_state(title, message)
+        self._show_toast(f"{title}: {message}")
 
     def _start_local_scan(
         self,
@@ -3062,7 +3092,10 @@ class SentryWindow(QMainWindow):
             self._apply_scan_result(result)
 
     def _local_scan_failed(self, error: str) -> None:
-        self._show_toast(f"No se pudo completar el escaneo: {error}")
+        worker = self.sender()
+        if isinstance(worker, LocalScanWorker) and worker.base_path != self.active_base_path:
+            return
+        self._show_scan_error("No se pudo completar el escaneo", error)
 
     def _local_scan_finished(self) -> None:
         worker = self.local_scan_worker
@@ -3081,56 +3114,147 @@ class SentryWindow(QMainWindow):
     def _start_issabel_match(self) -> None:
         if self.issabel_match_worker is not None:
             self.pending_base_scan = True
-            self._show_toast("La nueva base quedó en cola; se actualizará al terminar la búsqueda actual")
+            self.issabel_match_worker.request_stop()
+            self.scan_status_label.setText("Deteniendo la búsqueda anterior para cargar la nueva base…")
             return
         config = self._remote_config()
         if not config["fingerprint"] or not config["password"]:
+            self._show_scan_error("No se inició la búsqueda", "Conecta primero Issabel desde Configuración.")
             self._show_toast("Conecta primero Issabel desde Configuración")
             self._switch_page("config")
             return
-        if not self.active_base_index.dates:
-            self._show_toast("La base activa no contiene fechas válidas en Hoja1")
+        if not self.active_base_index.dates and self.active_base_index.source_system != "lucid":
+            self._show_scan_error("No se inició la búsqueda", "La base activa no contiene fechas válidas en Hoja1.")
             return
         destination = APP_STORAGE_ROOT / "data" / "remote_audio" / "_cache"
-        self._set_scan_busy(True, "Buscando por teléfono y fecha en Issabel…")
+        phone_only = self.active_base_index.source_system == "lucid"
+        self._set_scan_busy(True, "Conectando con Issabel; los audios aparecerán a medida que se encuentren…")
+        self.scan_cancel_button.setText("Detener búsqueda")
+        self.scan_cancel_button.setEnabled(True)
+        self.scan_cancel_button.show()
         self._show_toast(
-            f"Issabel: revisando {len(self.active_base_index.dates)} carpeta(s) de fecha, no todo el año"
+            "Base Lucid: buscando grabaciones out- desde septiembre de 2026 por teléfono"
+            if phone_only else f"Issabel: revisando {len(self.active_base_index.dates)} carpeta(s) de fecha"
         )
         self.issabel_match_worker = IssabelMatchWorker(
             config, self.active_base_index, destination, self.active_base_path, self
         )
         self.issabel_match_worker.succeeded.connect(self._issabel_match_succeeded)
         self.issabel_match_worker.failed.connect(self._issabel_match_failed)
+        self.issabel_match_worker.progress.connect(self._issabel_match_progress)
         self.issabel_match_worker.finished.connect(self._issabel_match_finished)
         self.issabel_match_worker.start()
+
+    def _cancel_issabel_match(self) -> None:
+        if self.issabel_match_worker is None:
+            return
+        self.issabel_match_worker.request_stop()
+        self.scan_cancel_button.setEnabled(False)
+        self.scan_cancel_button.setText("Deteniendo…")
+        self.scan_status_label.setText("Deteniendo búsqueda; se conservarán los audios ya encontrados…")
+
+    def _issabel_match_progress(self, result: object) -> None:
+        payload = result if isinstance(result, dict) else {}
+        result_base = payload.get("base_path")
+        if result_base is not None and self.active_base_path is not None:
+            if Path(result_base).resolve() != self.active_base_path:
+                return
+        if not self._append_remote_records(payload.get("records", ())):
+            return
+        checked = int(payload.get("candidate_count", 0) or 0)
+        matched = int(payload.get("match_count", 0) or 0)
+        count = len(self.detected_audio_files)
+        phase = payload.get("phase", "search")
+        label = "Conectando" if phase == "connecting" else "Descargando" if phase == "download" else "Buscando"
+        message = f"{label} en Issabel · {checked:,} audios revisados · {matched:,} coincidencias · {count:,} disponibles"
+        directory = str(payload.get("directory") or "")
+        self.scan_status_label.setText(message)
+        self.scan_status_label.setToolTip(directory)
+        self.scan_status.show()
+        if not self.call_records:
+            self.empty_detail_title.setText("Buscando grabaciones…")
+            self.empty_detail_text.setText(
+                message + (". Lucid: archivos out- desde el 1 de septiembre de 2026."
+                           if self.active_base_index.source_system == "lucid" else ".")
+            )
+
+    def _append_remote_records(self, records) -> bool:
+        known = set(self.detected_audio_files)
+        fresh = [record for record in records if record.source_path not in known]
+        if not fresh:
+            return True
+        paths = [record.source_path for record in fresh]
+        try:
+            self.database.register_calls(fresh)
+            stored = self.database.call_rows(paths)
+        except (sqlite3.Error, OSError) as exc:
+            self._show_scan_error("No se pudieron guardar los audios encontrados", str(exc))
+            self._cancel_issabel_match()
+            return False
+        self.detected_audio_files += tuple(paths)
+        added = sorted((call_record_from_row(row) for row in stored), key=lambda call: call.call_id)
+        append_only = self.sort_mode == "original" and (
+            not self.call_records or all(call.call_id > self.call_records[-1].call_id for call in added)
+        )
+        self.call_records.extend(added)
+        self.calls = {call.call_id: call for call in self.call_records}
+        selected = self.selected_call_id
+        scroll = self.call_list.verticalScrollBar().value()
+        if append_only:
+            for call in added:
+                self.call_search_cache[call.call_id] = self._searchable_call_text(call)
+                item = QListWidgetItem()
+                item.setData(Qt.ItemDataRole.UserRole, call.call_id)
+                item.setText(call.filename)
+                item.setSizeHint(QSize(0, 118))
+                self.call_list.addItem(item)
+                self.call_items[call.call_id] = item
+        else:
+            self._populate_call_list()
+        if not append_only and selected in self.call_items:
+            # A new download must not restart the audio the user is listening to.
+            self.call_list.blockSignals(True)
+            self.call_list.setCurrentItem(self.call_items[selected])
+            self.call_list.blockSignals(False)
+            self.call_list.verticalScrollBar().setValue(scroll)
+        self._update_category_metrics()
+        self._filter_calls()
+        return True
 
     def _issabel_match_succeeded(self, result: object) -> None:
         payload = result if isinstance(result, dict) else {}
         result_base = payload.get("base_path")
         if result_base is not None and self.active_base_path is not None:
             if Path(result_base).resolve() != self.active_base_path:
-                self.pending_base_scan = True
                 return
-        paths = [Path(path) for path in payload.get("paths", [])]
-        if not paths:
-            checked = int(payload.get("candidate_count", 0) or 0)
-            self._show_toast(
-                f"Issabel: se revisaron {checked} audios en las fechas de la base y no hubo teléfonos coincidentes"
-            )
+        checked = int(payload.get("candidate_count", 0) or 0)
+        count = len(self.detected_audio_files)
+        canceled = bool(payload.get("canceled"))
+        title = "Búsqueda detenida" if canceled else "Búsqueda completada"
+        message = f"{title} · {checked:,} audios revisados · {count:,} grabaciones disponibles"
+        self.scan_status_label.setText(message)
+        self.scan_status.show()
+        self._show_toast(message)
+        if not self.call_records:
             self._show_empty_state(
-                "No se encontraron coincidencias en Issabel",
-                "Se buscaron teléfono y fecha exactos de Hoja1 dentro de las carpetas correspondientes.",
+                "Búsqueda detenida" if canceled else "No se encontraron coincidencias en Issabel",
+                f"Se revisaron {checked:,} audios antes de detenerse. Puedes volver a usar la base para continuar."
+                if canceled else
+                f"Se revisaron {checked:,} audios buscando archivos out- de Lucid desde el 1 de septiembre de 2026."
+                if self.active_base_index.source_system == "lucid"
+                else f"Se revisaron {checked:,} audios buscando teléfono y fecha exactos de Hoja1.",
             )
-            return
-        self._start_local_scan(paths[0].parent, source="issabel", preselected_paths=paths)
 
     def _issabel_match_failed(self, error: str) -> None:
-        self._show_toast(f"No se pudo emparejar con Issabel: {error}")
+        worker = self.sender()
+        if isinstance(worker, IssabelMatchWorker) and worker.base_path != self.active_base_path:
+            return
+        self._show_scan_error("No se pudo completar la búsqueda en Issabel", error)
 
     def _issabel_match_finished(self) -> None:
         worker = self.issabel_match_worker
         self.issabel_match_worker = None
-        if self.pending_base_scan and self.local_scan_worker is None:
+        if self.pending_base_scan and self.local_scan_worker is None and not self.close_after_remote_scan:
             self.pending_base_scan = False
             if worker is not None:
                 worker.deleteLater()
@@ -3140,6 +3264,9 @@ class SentryWindow(QMainWindow):
             self._set_scan_busy(False)
         if worker is not None:
             worker.deleteLater()
+        if self.close_after_remote_scan:
+            self.close_after_remote_scan = False
+            QTimer.singleShot(0, self.close)
 
     def _finish_scan(self, directory: Path) -> None:
         """Ruta síncrona conservada para pruebas y carpetas pequeñas internas."""
@@ -3191,14 +3318,19 @@ class SentryWindow(QMainWindow):
         else:
             self._show_empty_state(
                 "No se encontraron coincidencias",
-                "No hay audios q- cuyo teléfono y fecha aparezcan en Hoja1 de la base seleccionada.",
+                "No hay grabaciones out- desde el 1 de septiembre de 2026 que coincidan con los teléfonos de Lucid."
+                if self.active_base_index.source_system == "lucid"
+                else "No hay audios q- cuyo teléfono y fecha aparezcan en Hoja1 de la base seleccionada.",
             )
         self._filter_calls()
         count = len(self.detected_audio_files)
         noun = "audio encontrado" if count == 1 else "audios encontrados"
         base_note = f" · base {self.active_base_path.name}" if self.active_base_path else ""
         source_label = {"local": "local", "nas": "NAS", "issabel": "Issabel"}.get(source, "")
-        self._show_toast(f"Escaneo {source_label} completado · {count} {noun}{base_note}")
+        message = f"Escaneo {source_label} completado · {count} {noun}{base_note}"
+        self.scan_status_label.setText(message)
+        self.scan_status.show()
+        self._show_toast(message)
 
     def _update_category_metrics(self) -> None:
         counts = {name: sum(call.category_code == name for call in self.call_records)
@@ -3239,6 +3371,7 @@ class SentryWindow(QMainWindow):
             raise ValueError("Configura al menos un término sensible.")
         return {
             "keywords": keywords,
+            "analysis_parallelism": analysis_concurrency(self.analysis_parallelism.currentData()),
             "transcription_provider": str(self.transcription_provider.currentData()),
             "transcription_model": self.transcription_model.currentText().strip(),
             "transcription_key": transcription_key,
@@ -3470,6 +3603,14 @@ class SentryWindow(QMainWindow):
         self._position_toast()
 
     def closeEvent(self, event) -> None:
+        if self.updates_panel.request_close():
+            self._show_toast("Terminando la operación de actualización antes de cerrar…")
+            event.ignore()
+            return
+        if self.bases_page.busy:
+            self._show_toast("Espera a que termine la preparación de la base antes de cerrar Sentry")
+            event.ignore()
+            return
         if self.reports_page.worker is not None:
             self.reports_page.worker.wait()
         if self.local_scan_worker is not None:
@@ -3485,7 +3626,10 @@ class SentryWindow(QMainWindow):
             event.ignore()
             return
         if self.issabel_match_worker is not None:
-            self._show_toast("Espera a que termine el emparejamiento y la descarga desde Issabel")
+            self.close_after_remote_scan = True
+            self.pending_base_scan = False
+            self._cancel_issabel_match()
+            self._show_toast("Deteniendo la búsqueda en Issabel antes de cerrar…")
             event.ignore()
             return
         if self.report_export_worker is not None:
@@ -3502,6 +3646,7 @@ class SentryWindow(QMainWindow):
                     "audio_source": self._source_key(),
                     "keywords": keywords,
                     "theme": self.theme,
+                    "analysis_parallelism": str(self.analysis_parallelism.currentData()),
                 })
             self._persist_credentials()
             self._persist_remote_connection()

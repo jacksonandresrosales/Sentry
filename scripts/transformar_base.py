@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convierte bases de llamadas CSV/XLSX al esquema del archivo NO.xlsx."""
+"""Convierte bases CSV/XLSX de Issabel y Lucid a formatos de trabajo para Sentry."""
 
 from __future__ import annotations
 
@@ -28,6 +28,10 @@ HEADERS = (
 )
 REQUIRED = tuple(HEADERS[i] for i in (0, 1, 2, 3, 4, 5, 6, 8))
 DEFAULT_STATE = "ELIMINAR DE BASE DE DATOS"
+LUCID_HEADERS = ("Teléfono", "Nombre", "ID", "Estado")
+LUCID_REQUIRED = ("Teléfono", "Nombre", "Estado")
+SOURCE_SYSTEMS = ("issabel", "lucid")
+ENTITY_FILTERS = ("all", "people", "companies")
 
 
 class BaseError(ValueError):
@@ -57,13 +61,20 @@ ALIASES = {
     "T BASE": ("tbase", "tipobase", "tipodebase"),
     "N° BASE": ("nbase", "numerobase", "numerodebase", "numbase"),
 }
+LUCID_ALIASES = {
+    "Teléfono": ("celular", "telefono", "phone"),
+    "Nombre": ("nombre", "name"),
+    "ID": ALIASES["ID"],
+    "Estado": ("gestion", "estado"),
+}
 
 
-def column_map(headers: list[object]) -> dict[str, int]:
+def column_map(headers: list[object], source_system: str = "issabel") -> dict[str, int]:
     result = {}
+    available = LUCID_ALIASES if source_system == "lucid" else ALIASES
     for index, header in enumerate(headers):
         key = normalize(header)
-        for canonical, aliases in ALIASES.items():
+        for canonical, aliases in available.items():
             if key in aliases:
                 if canonical in result:
                     raise BaseError(f"La columna {canonical!r} aparece más de una vez.")
@@ -71,21 +82,29 @@ def column_map(headers: list[object]) -> dict[str, int]:
     return result
 
 
-def find_header(rows, label: str, preamble: list | None = None):
+def find_header(rows, label: str, preamble: list | None = None,
+                source_system: str = "issabel"):
     """Omite títulos, FORMULARIO y Column1... hasta hallar la cabecera real."""
     best = set()
+    required = LUCID_REQUIRED if source_system == "lucid" else REQUIRED
     for number, row in enumerate(rows, 1):
-        mapping = column_map(list(row))
+        header_keys = {normalize(value) for value in row}
+        if source_system == "lucid" and {"estadollamada", "fechayhora"} <= header_keys:
+            raise BaseError(f"{label}: la cabecera corresponde a Issabel. Selecciona el sistema Issabel.")
+        if (source_system == "issabel" and {"celular", "nombre"} <= header_keys
+                and header_keys & {"gestion", "estado"}):
+            raise BaseError(f"{label}: la cabecera corresponde a Lucid. Selecciona el sistema Lucid.")
+        mapping = column_map(list(row), source_system)
         if len(mapping) > len(best):
             best = set(mapping)
-        if all(name in mapping for name in REQUIRED):
+        if all(name in mapping for name in required):
             return list(row), mapping, number
         if preamble is not None:
             preamble.append([cell_text(v) for v in row])
         if number >= 50:
             break
-    missing = ", ".join(name for name in REQUIRED if name not in best)
-    raise BaseError(f"{label}: no se encontró la cabecera en las primeras 50 filas. "
+    missing = ", ".join(name for name in required if name not in best)
+    raise BaseError(f"{label}: no se encontró la cabecera de {source_system.title()} en las primeras 50 filas. "
                     f"Columnas faltantes: {missing}.")
 
 
@@ -118,7 +137,8 @@ class Source:
     assigned_base_number: str = ""
 
 
-def read_csv(path: Path, encoding: str | None, delimiter: str | None) -> list[Source]:
+def read_csv(path: Path, encoding: str | None, delimiter: str | None, *,
+             source_system: str = "issabel") -> list[Source]:
     if encoding:
         text = path.read_text(encoding=encoding)
     else:
@@ -135,9 +155,11 @@ def read_csv(path: Path, encoding: str | None, delimiter: str | None) -> list[So
             dialect = csv.Sniffer().sniff(text[:131072], delimiters=",;\t|")
         except csv.Error as exc:
             raise BaseError(f"{path.name}: no se detectó el separador. Usa --separador.") from exc
-        reader = csv.reader(text.splitlines(keepends=True), dialect)
+        # Sniffer marca doublequote=False si la muestra no contiene comillas
+        # escapadas, aunque aparezcan después. CSV usa "" para una comilla literal.
+        reader = csv.reader(text.splitlines(keepends=True), dialect, doublequote=True)
     preamble = []
-    headers, mapping, header_row = find_header(reader, path.name, preamble)
+    headers, mapping, header_row = find_header(reader, path.name, preamble, source_system)
     rows = []
     for number, row in enumerate(reader, header_row + 1):
         if not any(str(v).strip() for v in row):
@@ -149,13 +171,15 @@ def read_csv(path: Path, encoding: str | None, delimiter: str | None) -> list[So
     return [Source(path.stem, [cell_text(h) for h in headers], mapping, rows, header_row, preamble)]
 
 
-def read_xlsx(path: Path, sheet_name: str | None) -> list[Source]:
+def read_xlsx(path: Path, sheet_name: str | None, *,
+              source_system: str = "issabel") -> list[Source]:
     workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
         if sheet_name and sheet_name not in workbook.sheetnames:
             raise BaseError(f"{path.name}: no existe la hoja {sheet_name!r}.")
         sheets = [workbook[sheet_name]] if sheet_name else workbook.worksheets
         candidates = []
+        header_errors = []
         for sheet in sheets:
             iterator = sheet.iter_rows()
             preamble = []
@@ -165,18 +189,23 @@ def read_xlsx(path: Path, sheet_name: str | None) -> list[Source]:
                     (tuple(c.value for c in row) for row in iterator),
                     f"{path.name} / {sheet.title}",
                     preamble,
+                    source_system,
                 )
-            except BaseError:
+            except BaseError as exc:
                 if sheet_name:
                     raise
+                header_errors.append(str(exc))
                 continue
             candidates.append((sheet, headers, mapping, header_row, preamble))
         raw = [entry for entry in candidates
-               if any(normalize(h) in ("uniqueid", "failurecode", "plan") for h in entry[1])]
+               if source_system == "issabel"
+               and any(normalize(h) in ("uniqueid", "failurecode", "plan") for h in entry[1])]
         # En NO.xlsx evita volver a importar BASE*, Validar y Hoja1 como bases originales.
         candidates = raw or candidates
         if not candidates:
-            raise BaseError(f"{path.name}: ninguna hoja contiene las columnas requeridas.")
+            detail = f" {header_errors[0]}" if header_errors else ""
+            raise BaseError(f"{path.name}: ninguna hoja contiene las columnas requeridas "
+                            f"de {source_system.title()}.{detail}")
         if len(candidates) > 1 and not raw and not sheet_name:
             raise BaseError(f"{path.name}: hay varias hojas de resultados. Selecciona una con --hoja.")
         sources = []
@@ -211,6 +240,67 @@ def clean_name(name: str) -> str:
             words = words[:-width]
             break
     return " ".join(words)
+
+
+def normalize_lucid_phone(value: object) -> str:
+    """Devuelve un teléfono ecuatoriano nacional sin duplicar el cero inicial."""
+    text = cell_text(value)
+    if not text:
+        raise BaseError("el teléfono está vacío")
+    if not re.fullmatch(r"\+?[0-9()\s-]+", text, flags=re.ASCII):
+        raise BaseError("el teléfono contiene caracteres no válidos; usa dígitos, no fórmulas ni extensiones")
+    digits = re.sub(r"[^0-9]", "", text)
+    international = text.startswith("+") or digits.startswith("00")
+    if digits.startswith("00593"):
+        digits = digits[5:]
+    elif digits.startswith("593") and (text.startswith("+") or len(digits) > 10):
+        digits = digits[3:]
+    elif international:
+        raise BaseError("el prefijo internacional debe ser +593 o 00593")
+    if digits.startswith("0"):
+        digits = digits[1:]
+    if not re.fullmatch(r"[1-9][0-9]{7,8}", digits):
+        raise BaseError("se esperan 8 o 9 dígitos nacionales, con un cero inicial opcional o prefijo 593")
+    return "0" + digits
+
+
+def is_company_name(name: object) -> bool:
+    """Detecta formas societarias explícitas, no adivina por el RUC o un nombre comercial.
+
+    Nombres sin indicador concluyente permanecen en personas. Abreviaciones
+    punteadas requieren límites de palabra: «S.A.» no coincide con «SARAH».
+    """
+    text = "".join(character for character in unicodedata.normalize("NFKD", cell_text(name).casefold())
+                   if not unicodedata.combining(character))
+    dotted = r"(?<!\w)(?:s\s*\.\s*a(?:\s*\.\s*s)?|s\s*\.\s*c\s*\.\s*c|s\s*\.\s*r\s*\.\s*l|e\s*\.\s*i\s*\.\s*r\s*\.\s*l)\s*\.?(?![\w.])"
+    explicit = r"\b(?:ltda|s\.a\.s|sas|scc|srl|eirl)\b"
+    phrases = (
+        r"\bsociedad\s+(?:anonima|por\s+acciones\s+simplificada|civil\s+y\s+comercial|de\s+responsabilidad\s+limitada)\b",
+        r"\b(?:cia\.?|compania)\s+limitada\b",
+    )
+    return bool(re.search(dotted, text) or re.search(explicit, text)
+                or any(re.search(pattern, text) for pattern in phrases))
+
+
+def transform_lucid(source: Source, *, entity_filter: str = "people") -> list[list[str]]:
+    """Selecciona teléfono, nombre, ID y estado; filtra entidades antes de deduplicar."""
+    selected = []
+    for number, row in enumerate(source.rows, source.header_row + 1):
+        name = row[source.mapping["Nombre"]]
+        company = is_company_name(name)
+        if (entity_filter == "people" and company) or (entity_filter == "companies" and not company):
+            continue
+        try:
+            phone = normalize_lucid_phone(row[source.mapping["Teléfono"]])
+        except BaseError as exc:
+            raise BaseError(f"{source.name}, registro {number}: {exc}.") from exc
+        selected.append([
+            phone,
+            clean_name(name),
+            row[source.mapping["ID"]] if "ID" in source.mapping else "",
+            row[source.mapping["Estado"]],
+        ])
+    return selected
 
 
 def infer_base_number(name: str) -> str:
@@ -292,6 +382,57 @@ def original_table_rows(source: Source) -> list[list[str]]:
     if not preamble:
         preamble = [[""] * (len(source.headers) - 1) + ["FORMULARIO"]]
     return preamble + [source.headers] + source.rows
+
+
+def publish_workbook(temporary: Path, path: Path, overwrite: bool) -> None:
+    """Publica un archivo completo; por defecto no reemplaza ni en una carrera."""
+    if overwrite:
+        temporary.replace(path)
+        return
+    try:
+        if os.name == "nt":
+            temporary.rename(path)
+        else:
+            os.link(temporary, path)
+    except FileExistsError as exc:
+        raise OutputCollisionError(f"El destino {path} ya existe; no se sobrescribió.") from exc
+
+
+def write_lucid_workbook(path: Path, selected: list[list[list[str]]], *,
+                         overwrite: bool = False) -> tuple[int, int]:
+    if path.exists() and not overwrite:
+        raise OutputCollisionError(f"Ya existe {path}. Usa otra salida o --sobrescribir.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    combined = list(chain.from_iterable(selected))
+    deduplicated = unique_phones(combined)
+    if len(deduplicated) > 1_048_575:
+        raise BaseError("Hoja1: excede el límite de filas de Excel.")
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".xlsx", delete=False) as tmp:
+        temporary = Path(tmp.name)
+    try:
+        with xlsxwriter.Workbook(str(temporary), {"constant_memory": True}) as book:
+            book.set_properties({"title": "Base de llamadas Lucid"})
+            text_style = book.add_format({"font_name": "Aptos Narrow", "font_size": 11,
+                                          "num_format": "@"})
+            header_style = book.add_format({"font_name": "Aptos Narrow", "font_size": 11,
+                                            "bold": True, "bg_color": "#B5E6A2"})
+            sheet = book.add_worksheet("Hoja1")
+            for column, width in enumerate((16, 48, 22, 38)):
+                sheet.set_column(column, column, width, text_style)
+            for column, header in enumerate(LUCID_HEADERS):
+                sheet.write_string(0, column, header, header_style)
+            for row_number, row in enumerate(deduplicated, 1):
+                for column, value in enumerate(row):
+                    if len(value) > 32_767:
+                        raise BaseError(f"Hoja1, fila {row_number + 1}: un campo excede "
+                                        "el límite de 32767 caracteres de Excel.")
+                    sheet.write_string(row_number, column, value, text_style)
+            sheet.freeze_panes(1, 0)
+            sheet.autofilter(0, 0, len(deduplicated), len(LUCID_HEADERS) - 1)
+        publish_workbook(temporary, path, overwrite)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return len(combined), len(deduplicated)
 
 
 def write_workbook(path: Path, sources: list[Source], selected: list[list[list[str]]],
@@ -393,18 +534,7 @@ def write_workbook(path: Path, sources: list[Source], selected: list[list[list[s
                 table(sheet_title(filtered_name, used), HEADERS, rows)
             table("Validar", HEADERS, combined, mode="consolidated")
             table("Hoja1", HEADERS, deduplicated, mode="unique")
-        if overwrite:
-            temporary.replace(path)
-        else:
-            try:
-                if os.name == "nt":
-                    # En Windows rename falla si el destino existe, incluso por una carrera.
-                    temporary.rename(path)
-                else:
-                    # Creación atómica sin reemplazo en sistemas con rename sobrescribible.
-                    os.link(temporary, path)
-            except FileExistsError as exc:
-                raise OutputCollisionError(f"El destino {path} ya existe; no se sobrescribió.") from exc
+        publish_workbook(temporary, path, overwrite)
     finally:
         temporary.unlink(missing_ok=True)
     return len(combined), len(deduplicated)
@@ -412,7 +542,16 @@ def write_workbook(path: Path, sources: list[Source], selected: list[list[list[s
 
 def default_output(input_path: Path, folder: Path = Path("outputs"),
                    base_number: str | None = None,
-                   reserved_numbers: set[str] | None = None) -> Path:
+                   reserved_numbers: set[str] | None = None, *,
+                   source_system: str = "issabel") -> Path:
+    if source_system == "lucid":
+        version = 1
+        while True:
+            suffix = "_Lucid" + (f"_{version}" if version > 1 else "")
+            candidate = folder / f"{input_path.stem}{suffix}.xlsx"
+            if not candidate.exists():
+                return candidate
+            version += 1
     explicit = base_number or infer_base_number(input_path.stem)
     number = int(normalize_base_number(explicit)[1:]) if explicit else 1
     version = 1
@@ -437,6 +576,10 @@ class ConversionResult:
     filtered: int
     unique: int
     missing_base_number: bool
+    source_system: str = "issabel"
+    companies: int = 0
+    excluded: int = 0
+    entity_filter: str = "all"
 
 
 def convert_files(input_paths: list[Path], output: Path | None = None, *,
@@ -444,15 +587,25 @@ def convert_files(input_paths: list[Path], output: Path | None = None, *,
                   base_type: str | None = None, base_number: str | None = None,
                   sheet: str | None = None, encoding: str | None = None,
                   delimiter: str | None = None, include_ruc_third_9: bool = False,
-                  overwrite: bool = False, output_folder: Path = Path("outputs")) -> ConversionResult:
+                  overwrite: bool = False, output_folder: Path = Path("outputs"),
+                  source_system: str = "issabel", entity_filter: str = "people") -> ConversionResult:
+    source_system = str(source_system).strip().casefold()
+    if source_system not in SOURCE_SYSTEMS:
+        raise BaseError("Sistema de origen no válido. Selecciona Issabel o Lucid.")
+    if source_system == "lucid":
+        entity_filter = str(entity_filter).strip().casefold()
+        if entity_filter not in ENTITY_FILTERS:
+            raise BaseError("Filtro de entidades no válido. Selecciona todas, personas o empresas.")
     if not input_paths:
         raise BaseError("Selecciona al menos un archivo de entrada.")
     if delimiter is not None and len(delimiter) != 1:
         raise BaseError("El separador debe contener exactamente un carácter.")
     paths = [Path(p).resolve(strict=True) for p in input_paths]
     automatic_output = output is None
-    base_number = normalize_base_number(base_number) if base_number is not None else None
-    output = (output or default_output(paths[0], output_folder, base_number)).resolve()
+    base_number = (normalize_base_number(base_number)
+                   if base_number is not None and source_system == "issabel" else None)
+    output = (output or default_output(paths[0], output_folder, base_number,
+                                       source_system=source_system)).resolve()
     if output.suffix.lower() != ".xlsx":
         raise BaseError("La salida debe tener extensión .xlsx.")
     if output in paths:
@@ -462,11 +615,28 @@ def convert_files(input_paths: list[Path], output: Path | None = None, *,
     sources = []
     for path in paths:
         if path.suffix.lower() == ".csv":
-            sources.extend(read_csv(path, encoding, delimiter))
+            sources.extend(read_csv(path, encoding, delimiter, source_system=source_system))
         elif path.suffix.lower() == ".xlsx":
-            sources.extend(read_xlsx(path, sheet))
+            sources.extend(read_xlsx(path, sheet, source_system=source_system))
         else:
             raise BaseError(f"{path.name}: solo se admiten CSV y XLSX.")
+    if source_system == "lucid":
+        companies = sum(is_company_name(row[source.mapping["Nombre"]])
+                        for source in sources for row in source.rows)
+        selected = [transform_lucid(source, entity_filter=entity_filter) for source in sources]
+        excluded = sum(len(source.rows) - len(rows) for source, rows in zip(sources, selected))
+        for attempt in range(20):
+            try:
+                total, unique = write_lucid_workbook(
+                    output, selected, overwrite=overwrite and not automatic_output)
+                break
+            except OutputCollisionError:
+                if not automatic_output or attempt == 19:
+                    raise
+                output = default_output(paths[0], output_folder, source_system="lucid").resolve()
+        return ConversionResult(output, [(s.name, len(s.rows), len(rows))
+                                         for s, rows in zip(sources, selected)],
+                                total, unique, False, "lucid", companies, excluded, entity_filter)
     if base_number and len(sources) != 1:
         raise BaseError("El número de base manual se aplica a una sola base. Para varias, usa nombres "
                         "B1, B2... o la columna N° BASE de cada origen.")
@@ -527,6 +697,10 @@ def convert_files(input_paths: list[Path], output: Path | None = None, *,
 def parser() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("entradas", nargs="*", type=Path, help="Uno o varios archivos CSV/XLSX.")
+    cli.add_argument("--sistema", choices=SOURCE_SYSTEMS, default="issabel",
+                     help="Sistema de origen: Issabel (predeterminado) o Lucid.")
+    cli.add_argument("--entidades", choices=ENTITY_FILTERS, default="people",
+                     help="Lucid: people conserva personas y omite empresas explícitas (predeterminado); all incluye todas; companies solo empresas.")
     cli.add_argument("-o", "--salida", type=Path,
                      help="Salida automática: outputs/<nombre_original>_DB_delete_B<n>.xlsx, sin reemplazos.")
     cli.add_argument("--estado", default=DEFAULT_STATE, help="Estado del formulario; * incluye todos.")
@@ -572,14 +746,19 @@ def main(argv: list[str] | None = None) -> int:
                                call_state=args.estado_llamada, base_type=args.tipo_base,
                                base_number=args.numero_base, sheet=args.hoja, encoding=args.codificacion,
                                delimiter=args.separador, include_ruc_third_9=args.incluir_ruc_tercer_digito_9,
-                               overwrite=args.sobrescribir)
+                               overwrite=args.sobrescribir, source_system=args.sistema,
+                               entity_filter=args.entidades)
         for name, read_count, filtered_count in result.sources:
             print(f"{name}: {read_count} registros leídos, {filtered_count} seleccionados.")
-        print(f"Validar: {result.filtered}. Hoja1: {result.unique}. "
+        count_label = "Registros Lucid" if result.source_system == "lucid" else "Validar"
+        print(f"{count_label}: {result.filtered}. Hoja1: {result.unique}. "
               f"Duplicados de teléfono retirados: {result.filtered - result.unique}.")
+        if result.source_system == "lucid":
+            print(f"Empresas identificadas por nombre: {result.companies}. "
+                  f"Registros excluidos por filtro: {result.excluded}.")
         if result.missing_base_number:
             print("N° BASE quedó vacío donde no se pudo detectar. Puedes usar --numero-base B1.")
-        if not result.filtered:
+        if not result.filtered and result.source_system == "issabel":
             print("No hay coincidencias con los filtros; el Excel contiene resultados vacíos y las bases originales.")
         print(f"Excel generado: {result.output}")
         return 0

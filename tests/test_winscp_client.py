@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 from types import SimpleNamespace
 import subprocess
 import tempfile
@@ -77,7 +78,7 @@ class WinSCPClientTests(unittest.TestCase):
         environment = run.call_args.kwargs["env"]
         self.assertEqual(environment["SENTRY_SFTP_PATHS"], '["/monitor/2026/07/06/"]')
         self.assertEqual(environment["SENTRY_SFTP_RECURSIVE"], "0")
-        self.assertEqual(environment["SENTRY_SFTP_PHONE_PATTERN"], "0990000001|0980000002")
+        self.assertEqual(json.loads(run.call_args.kwargs["input"])["phones"], ["0990000001", "0980000002"])
 
     @patch("app.services.winscp_client.winscp_dll", return_value=Path(r"C:\WinSCP\WinSCPnet.dll"))
     @patch("app.services.winscp_client.shutil.which", return_value=r"C:\Windows\powershell.exe")
@@ -113,7 +114,8 @@ class WinSCPClientTests(unittest.TestCase):
             self.assertEqual(result["match_count"], 1)
             environment = run.call_args.kwargs["env"]
             self.assertEqual(environment["SENTRY_SFTP_MODE"], "match_download")
-            self.assertEqual(environment["SENTRY_SFTP_PHONE_DATES"], '{"0990000001": ["20260701"]}')
+            self.assertEqual(json.loads(run.call_args.kwargs["input"])["phone_dates"],
+                             [["0990000001", ["20260701"]]])
 
     @patch("app.services.winscp_client.winscp_dll", return_value=Path(r"C:\WinSCP\WinSCPnet.dll"))
     @patch("app.services.winscp_client.shutil.which", return_value=r"C:\Windows\powershell.exe")

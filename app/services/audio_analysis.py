@@ -4,12 +4,15 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
+from concurrent.futures import Future
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 import re
 import threading
 import time
 import unicodedata
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
 
@@ -17,10 +20,84 @@ import requests
 TRANSCRIPTION_VERSION = "2"
 ANALYSIS_VERSION = "3"
 _HTTP = threading.local()
+_IN_FLIGHT: dict[tuple[str, str, str], Future] = {}
+_IN_FLIGHT_LOCK = threading.Lock()
+_PROVIDER_COOLDOWNS: dict[str, float] = {}
+_PROVIDER_LOCK = threading.Lock()
 
 
 class AnalysisError(RuntimeError):
     pass
+
+
+def _cached_computation(database, table: str, key: str, compute):
+    """Comparte una petición en curso entre audios idénticos, incluso de rutas distintas."""
+    cached = database.cache_get(table, key)
+    if cached is not None:
+        return cached, True
+    scope = str(getattr(database, "path", id(database)))
+    flight_key = (scope, table, key)
+    with _IN_FLIGHT_LOCK:
+        future = _IN_FLIGHT.get(flight_key)
+        owner = future is None
+        if owner:
+            future = _IN_FLIGHT[flight_key] = Future()
+    if not owner:
+        return future.result(), True
+    try:
+        # Otro hilo pudo terminar entre la primera lectura y la adquisición del turno.
+        result = database.cache_get(table, key)
+        was_cached = result is not None
+        if result is None:
+            result = compute()
+            database.cache_set(table, key, result)
+        future.set_result(result)
+        return result, was_cached
+    except BaseException as exc:
+        future.set_exception(exc)
+        raise
+    finally:
+        with _IN_FLIGHT_LOCK:
+            _IN_FLIGHT.pop(flight_key, None)
+
+
+def _retry_after_seconds(response) -> float | None:
+    value = str(response.headers.get("Retry-After", "")).strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            seconds = (date - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return max(0.0, seconds) if seconds < float("inf") else None
+
+
+def _defer_provider(url: str, seconds: float):
+    origin = urlsplit(url).netloc.casefold()
+    with _PROVIDER_LOCK:
+        _PROVIDER_COOLDOWNS[origin] = max(
+            _PROVIDER_COOLDOWNS.get(origin, 0), time.monotonic() + seconds,
+        )
+
+
+def _wait_for_provider(url: str):
+    origin = urlsplit(url).netloc.casefold()
+    while True:
+        with _PROVIDER_LOCK:
+            remaining = _PROVIDER_COOLDOWNS.get(origin, 0) - time.monotonic()
+            if remaining <= 0:
+                _PROVIDER_COOLDOWNS.pop(origin, None)
+                return
+            if remaining > 300:
+                raise AnalysisError("La API pidió una pausa superior a cinco minutos. Vuelve a analizar más tarde.")
+        # Revisa extensiones del límite compartido sin bloquear el candado.
+        time.sleep(min(remaining, 1.0))
 
 
 def file_hash(path: Path) -> str:
@@ -44,6 +121,7 @@ def cached_file_hash(database, path: Path) -> str:
 def _request(method, url, *, retries=3, **kwargs):
     last = None
     for attempt in range(retries):
+        _wait_for_provider(url)
         data = kwargs.get("data")
         if hasattr(data, "seek"):
             data.seek(0)
@@ -59,6 +137,8 @@ def _request(method, url, *, retries=3, **kwargs):
             session = getattr(_HTTP, "session", None)
             if session is None:
                 session = _HTTP.session = requests.Session()
+                adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=0)
+                session.mount("https://", adapter)
             response = session.request(method, url, timeout=(15, 300), **kwargs)
         except requests.RequestException as exc:
             last = exc
@@ -76,11 +156,21 @@ def _request(method, url, *, retries=3, **kwargs):
                 message = body.get("error", {}).get("message", "") if isinstance(body.get("error"), dict) else str(body.get("error", ""))
             except ValueError:
                 pass
+            retry_after = _retry_after_seconds(response)
+            if response.status_code == 429:
+                _defer_provider(url, retry_after if retry_after is not None else 2 ** attempt)
             if response.status_code not in {429, 500, 502, 503, 504} or attempt + 1 == retries:
                 if response.status_code in {401, 403}:
                     raise AnalysisError("La API rechazó la clave configurada.")
                 raise AnalysisError(f"La API respondió {response.status_code}: {message or 'solicitud rechazada'}")
             last = AnalysisError(f"Respuesta temporal {response.status_code}")
+            if retry_after is not None and retry_after > 300:
+                raise AnalysisError("La API pidió una pausa superior a cinco minutos. Vuelve a analizar más tarde.")
+            if response.status_code == 429:
+                continue
+            if retry_after is not None:
+                time.sleep(retry_after)
+                continue
         time.sleep(2 ** attempt)
     raise AnalysisError(str(last))
 
@@ -327,22 +417,20 @@ def analyze_file(database, path: Path, config: dict, digest: str | None = None):
         f"{terms_signature}".encode()).hexdigest()
     database.set_call_status(path, "TRANSFIRIENDO")
     transcription_started = time.perf_counter()
-    transcript = database.cache_get("transcription_cache", transcript_key)
-    transcription_cached = transcript is not None
-    if transcript is None:
-        transcript = transcribe(path, config["transcription_provider"], config["transcription_key"],
-                                config["transcription_model"], keywords)
-        database.cache_set("transcription_cache", transcript_key, transcript)
+    transcript, transcription_cached = _cached_computation(
+        database, "transcription_cache", transcript_key,
+        lambda: transcribe(path, config["transcription_provider"], config["transcription_key"],
+                           config["transcription_model"], keywords),
+    )
     transcription_ms = (time.perf_counter() - transcription_started) * 1000
     transcript = assign_roles(transcript)
     database.set_call_status(path, "ANALIZANDO")
     contextual_started = time.perf_counter()
-    result = database.cache_get("analysis_cache", analysis_key)
-    analysis_cached = result is not None
-    if result is None:
-        result = contextual_analysis(transcript, keywords, config["analysis_provider"],
-                                     config["analysis_key"], config["analysis_model"])
-        database.cache_set("analysis_cache", analysis_key, result)
+    result, analysis_cached = _cached_computation(
+        database, "analysis_cache", analysis_key,
+        lambda: contextual_analysis(transcript, keywords, config["analysis_provider"],
+                                    config["analysis_key"], config["analysis_model"]),
+    )
     contextual_ms = (time.perf_counter() - contextual_started) * 1000
     persistence_started = time.perf_counter()
     database.save_call_result(path, analysis_key, terms_signature, transcript, result)

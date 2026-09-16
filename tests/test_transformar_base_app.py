@@ -7,11 +7,64 @@ import time
 import unittest
 from unittest.mock import patch
 
+import openpyxl
+
 from scripts.transformar_base_app import DeleteBaseApp
 from scripts.transformar_base import DEFAULT_STATE
 
 
 class AppTests(unittest.TestCase):
+    def test_lucid_selection_processes_all_states_with_no_base_number(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp).resolve()
+            source = folder / "consolidado.csv"
+            with source.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(["Celular", "Nombre", "GESTION", "ID"])
+                writer.writerow(["990000001", "CLIENTE DE PRUEBA", "No contesta", "0123456789"])
+                writer.writerow(["0980000002", "OTRO CLIENTE", "Venta", "1791234567001"])
+                writer.writerow(["0970000003", "COMERCIAL S.A.", "Venta", "1234567890001"])
+            app = DeleteBaseApp()
+            app.withdraw()
+            try:
+                self.assertEqual(app.source_system.get(), "Issabel")
+                app.base_number.set("B0")
+                app.source_system.set("Lucid")
+                self.assertEqual(app.issabel_options.winfo_manager(), "")
+                self.assertIn("Teléfono, Nombre, ID y Estado", app.source_hint.get())
+                self.assertIn("no por tener RUC", app.source_hint.get())
+                app.input_path.set(str(source))
+                app.output_folder.set(str(folder))
+                app.refresh_output_name()
+                self.assertIn("consolidado_Lucid.xlsx", app.output_name.get())
+                with patch("scripts.transformar_base_app.messagebox.showerror") as errors:
+                    app.start_conversion()
+                    deadline = time.monotonic() + 10
+                    while app.busy and time.monotonic() < deadline:
+                        app.update()
+                        time.sleep(0.01)
+                    errors.assert_not_called()
+                self.assertFalse(app.busy)
+                self.assertIsNotNone(app.result, app.status.get())
+                self.assertEqual(app.result.source_system, "lucid")
+                self.assertEqual(app.result.entity_filter, "people")
+                self.assertEqual(app.result.excluded, 1)
+                self.assertIn("Registros de empresas excluidos: 1", app.status.get())
+                book = openpyxl.load_workbook(app.result.output, read_only=True, data_only=True)
+                try:
+                    self.assertEqual(list(book["Hoja1"].values), [
+                        ("Teléfono", "Nombre", "ID", "Estado"),
+                        ("0990000001", "CLIENTE DE PRUEBA", "0123456789", "No contesta"),
+                        ("0980000002", "OTRO CLIENTE", "1791234567001", "Venta"),
+                    ])
+                finally:
+                    book.close()
+                app.source_system.set("Issabel")
+                self.assertEqual(app.issabel_options.winfo_manager(), "grid")
+                self.assertEqual(app.base_number.get(), "B0")
+            finally:
+                app.destroy()
+
     def test_select_process_and_open_result_folder(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp).resolve()

@@ -12,8 +12,8 @@ import openpyxl
 from openpyxl.utils.exceptions import InvalidFileException
 import xlsxwriter
 
-from app.services.base_conversion import normalize_phone_number
-from scripts.transformar_base import DEFAULT_STATE, cell_text, normalize
+from app.services.base_conversion import hoja1_column_layout, normalize_phone_number
+from scripts.transformar_base import DEFAULT_STATE, LUCID_HEADERS, cell_text
 
 
 EXPORT_MODE_LABELS = {
@@ -29,6 +29,8 @@ class BaseExportRecord:
     phone: str
     customer: str
     identifier: str
+    state: str = DEFAULT_STATE
+    source_system: str = "issabel"
 
 
 @dataclass(frozen=True)
@@ -39,7 +41,7 @@ class ExportResult:
 
 
 def load_base_export_records(path: Path) -> list[BaseExportRecord]:
-    """Lee los cuatro datos necesarios desde Hoja1 y conserva un registro por teléfono."""
+    """Lee Hoja1 en el formato de origen y conserva la primera fila por teléfono."""
     path = Path(path).resolve()
     if not path.is_file() or path.suffix.casefold() != ".xlsx":
         raise ValueError("La base activa no está disponible. Selecciona nuevamente el Excel transformado.")
@@ -51,15 +53,11 @@ def load_base_export_records(path: Path) -> list[BaseExportRecord]:
         if "Hoja1" not in book.sheetnames:
             raise ValueError("La base activa no contiene la hoja Hoja1.")
         sheet = book["Hoja1"]
-        headers = {
-            normalize(cell.value): index
-            for index, cell in enumerate(sheet[1])
-            if cell.value is not None
-        }
-        required = {"telefono": "Teléfono", "nombre": "Nombre", "id": "ID"}
-        missing = [label for key, label in required.items() if key not in headers]
-        if missing:
-            raise ValueError("Hoja1 no contiene las columnas requeridas: " + ", ".join(missing) + ".")
+        source_system, headers = hoja1_column_layout(sheet)
+        required = (("telefono", "nombre", "estado") if source_system == "lucid"
+                    else ("telefono", "nombre", "id"))
+        if "id" in headers and "id" not in required:
+            required += ("id",)
 
         records: list[BaseExportRecord] = []
         seen: set[str] = set()
@@ -72,7 +70,9 @@ def load_base_export_records(path: Path) -> list[BaseExportRecord]:
             records.append(BaseExportRecord(
                 phone=phone,
                 customer=cell_text(values[headers["nombre"]]),
-                identifier=cell_text(values[headers["id"]]),
+                identifier=cell_text(values[headers["id"]]) if "id" in headers else "",
+                state=cell_text(values[headers["estado"]]) if source_system == "lucid" else DEFAULT_STATE,
+                source_system=source_system,
             ))
         return records
     finally:
@@ -114,15 +114,20 @@ def export_audit_excel(
     verified_phones: set[str],
     mode: str,
 ) -> ExportResult:
-    """Genera un Excel compacto: celular, cliente, ID y estado."""
+    """Exporta las columnas de auditoría correspondientes al sistema de la base."""
+    output = Path(output).resolve()
+    if output.suffix.casefold() != ".xlsx":
+        output = output.with_suffix(".xlsx")
+    base_path = Path(base_path).resolve()
+    if output == base_path or (output.exists() and base_path.exists() and output.samefile(base_path)):
+        raise ValueError("La exportación no puede reemplazar la base activa. Selecciona otro archivo de salida.")
     records = load_base_export_records(base_path)
     selected = select_export_records(records, automatic_phones, verified_phones, mode)
     if not selected:
         raise ValueError(f"No hay {EXPORT_MODE_LABELS[mode]} para exportar.")
 
-    output = Path(output).resolve()
-    if output.suffix.casefold() != ".xlsx":
-        output = output.with_suffix(".xlsx")
+    source_system = selected[0][0].source_system
+    verified = {phone for value in verified_phones if (phone := normalize_phone_number(value))}
     output.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=".sentry-export-", suffix=".xlsx", dir=output.parent)
     os.close(descriptor)
@@ -144,19 +149,30 @@ def export_audit_excel(
                 "font_name": "Aptos", "font_size": 11, "font_color": "#006100",
                 "bg_color": "#C6EFCE", "num_format": "@", "valign": "vcenter",
             })
-            headers = ("Número de celular", "Nombre del cliente", "ID", "Estado")
+            headers = (LUCID_HEADERS if source_system == "lucid" else
+                       ("Número de celular", "Nombre del cliente", "ID", "Estado"))
             for column, title in enumerate(headers):
                 sheet.write_string(0, column, title, header)
             complaint_count = 0
             for row_index, (record, is_complaint) in enumerate(selected, 1):
                 row_format = complaint_format if is_complaint else normal_format
                 complaint_count += int(is_complaint)
-                for column, value in enumerate((record.phone, record.customer, record.identifier, DEFAULT_STATE)):
+                if source_system == "lucid":
+                    state = ("Denuncia verificada" if record.phone in verified else
+                             "Denuncia detectada" if is_complaint else record.state)
+                    values = (record.phone, record.customer, record.identifier, state)
+                else:
+                    values = (record.phone, record.customer, record.identifier, DEFAULT_STATE)
+                for column, value in enumerate(values):
                     sheet.write_string(row_index, column, value, row_format)
             sheet.set_column(0, 0, 20)
             sheet.set_column(1, 1, 42)
-            sheet.set_column(2, 2, 22)
-            sheet.set_column(3, 3, 32)
+            if source_system == "lucid":
+                sheet.set_column(2, 2, 22)
+                sheet.set_column(3, 3, 36)
+            else:
+                sheet.set_column(2, 2, 22)
+                sheet.set_column(3, 3, 32)
             sheet.set_row(0, 22)
             sheet.freeze_panes(1, 0)
             sheet.autofilter(0, 0, len(selected), len(headers) - 1)

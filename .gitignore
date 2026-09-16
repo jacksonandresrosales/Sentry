@@ -23,6 +23,9 @@ data/db/*.sqlite3
 data/db/*-journal
 data/db/*-wal
 data/db/*-shm
+data/db/backups/
+backups/
+updates/
 !data/db/.gitkeep
 
 # Grabaciones de audio

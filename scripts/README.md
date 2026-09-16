@@ -1,4 +1,34 @@
-# Transformar bases al formato NO
+# Transformar bases de Issabel y Lucid
+
+## Sistema de origen
+
+Seleccione **Issabel** o **Lucid** antes de cargar la base, tanto en Sentry como en la mini aplicación. Issabel es la opción predeterminada y conserva las reglas del formato NO descritas abajo.
+
+Para Lucid, el formato principal es la exportación `export_base_*.csv`. El conversor lee sus columnas `Celular`, `Nombre`, `ID` y `Estado` y genera una sola hoja `Hoja1` con **Teléfono, Nombre, ID y Estado**. `Sub-Estado` es una columna distinta y no reemplaza ni complementa `Estado`, incluso si este último está vacío. Se mantiene la compatibilidad con el consolidado anterior, cuya columna de estado se llama `GESTION`.
+
+Conserva todos los estados de los registros seleccionados, normaliza el teléfono al formato nacional con un solo cero inicial y retira duplicados conservando la primera aparición. Mantiene el ID como texto y conserva sus ceros iniciales; si el origen no tiene ID, la columna queda vacía. No añade planes, notas, fechas, columnas auxiliares ni copias de las hojas originales. No filtra por `ELIMINAR DE LA BASE` ni aplica los filtros de Issabel a Lucid.
+
+Por defecto, Lucid conserva personas y excluye empresas identificadas por una forma societaria explícita en el nombre, como `S.A.`, `S.A.S.`, `Ltda.` o `S.C.C.`. La regla se basa en la razón social, no en tener un RUC de 13 dígitos: una persona con RUC permanece incluida. Si el nombre no permite identificar una empresa de forma concluyente, se conserva. El filtro se aplica antes de retirar duplicados y el resultado informa cuántos registros fueron excluidos; el archivo original no cambia.
+
+```powershell
+python scripts/transformar_base.py --sistema lucid "C:\Bases\export_base_campana.csv"
+```
+
+La interfaz de Sentry y la mini aplicación utilizan el filtro de personas. Desde la línea de comandos puede seleccionarse explícitamente otro alcance:
+
+```powershell
+python scripts/transformar_base.py --sistema lucid --entidades people "C:\Bases\export_base_campana.csv"
+python scripts/transformar_base.py --sistema lucid --entidades all "C:\Bases\export_base_campana.csv"
+python scripts/transformar_base.py --sistema lucid --entidades companies "C:\Bases\export_base_campana.csv"
+```
+
+`people` es el valor predeterminado; `all` incluye todos los registros y `companies` conserva únicamente las empresas identificadas por la regla anterior. No se realiza una validación legal del tipo de documento o de la entidad.
+
+La salida se llama `<nombre_original>_Lucid.xlsx`; las repeticiones generan `_Lucid_2.xlsx`, `_Lucid_3.xlsx`, etc. Los teléfonos se escriben como texto para conservar el cero. Los prefijos ecuatorianos `593`, `+593` y `00593` se convierten al formato nacional. Una fila con un teléfono vacío o inválido produce un mensaje con el registro que debe corregirse.
+
+Las opciones de estado de llamada, estado del formulario, RUC, tipo y número de base se aplican solamente a Issabel. Lucid no las necesita. Las opciones de hoja Excel, separador y codificación CSV funcionan para ambos sistemas.
+
+En Sentry, las bases de Lucid se relacionan por teléfono exclusivamente con grabaciones `out-` desde el 1 de septiembre de 2026 (`20260901`), inclusive, en el origen de audio configurado. La fecha se toma del nombre de la grabación, no del nombre del CSV ni de `Fecha Rellamada`, que no representa la fecha de una grabación. Los archivos `q-` y los audios anteriores quedan excluidos de Lucid; las reglas de Issabel no cambian. La búsqueda remota muestra el progreso y los resultados encontrados de forma incremental; **Detener búsqueda** interrumpe el recorrido conservando las coincidencias disponibles. La exportación de auditoría conserva las cuatro columnas y actualiza el estado de las denuncias detectadas o verificadas. Las bases Lucid de tres columnas de versiones anteriores siguen siendo compatibles y se exportan con el ID vacío.
 
 ## Mini aplicación
 
@@ -54,6 +84,8 @@ python scripts/transformar_base.py
 El Excel se guarda en `outputs/<nombre_original>_DB_delete_B<n>.xlsx`, con numeración y versiones automáticas para evitar sobrescrituras, incluso ante guardados simultáneos. Si indicas un destino explícito con `-o`, se rechaza si ya existe; solo `-o` junto con `--sobrescribir` permite reemplazarlo deliberadamente. El guardado utiliza un archivo temporal y no publica resultados incompletos.
 
 ## Reglas del modelo
+
+Las siguientes reglas corresponden exclusivamente a Issabel; no sustituyen el filtro de empresas de Lucid descrito anteriormente.
 
 - Detecta la cabecera real aunque antes haya filas como `FORMULARIO` o `Column1...`.
 - Acepta encabezados con acentos o los caracteres dañados que aparecen en el CSV de referencia.
