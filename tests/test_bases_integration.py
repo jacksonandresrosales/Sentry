@@ -41,6 +41,7 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(load_hoja1_phones(result.output), {"0990000001"})
             audio_index = load_hoja1_audio_index(result.output)
             self.assertEqual(audio_index.phone_dates, {"0990000001": frozenset({"20260701"})})
+            self.assertEqual(audio_index.names, {"0990000001": "PERSONA DE PRUEBA"})
             self.assertEqual(audio_index.dates, {"20260701"})
             self.assertEqual(normalize_phone_number("+593 990 000 001"), "0990000001")
             database = Database(database.path)
@@ -136,6 +137,7 @@ class DatabaseTests(unittest.TestCase):
             rows = database.call_rows(paths)
             self.assertEqual(len(rows), len(paths))
             self.assertTrue(all(row["hits"][0]["keyword"] == "demanda" for row in rows))
+            self.assertEqual(database.call_paths(), [str(path.resolve()) for path in paths])
 
 
 class BasesUiTests(unittest.TestCase):

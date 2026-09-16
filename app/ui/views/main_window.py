@@ -15,11 +15,12 @@ import sqlite3
 from app.database import APP_STORAGE_ROOT, Database, DEFAULT_DATABASE
 from app.about import APP_NAME, APP_VERSION, APP_AUTHORS, APP_DESCRIPTION, APP_FEATURES
 from app.secret_store import SecretStoreError, protect, unprotect
-from app.services.audio_analysis import analyze_file, assign_roles, cached_file_hash
+from app.services.audio_analysis import analyze_file, assign_roles, cached_file_hash, keyword_signature
 from app.services.base_conversion import BaseAudioIndex, load_hoja1_audio_index, normalize_phone_number
 from app.services.report_export import EXPORT_MODE_LABELS, export_audit_excel
 from app.services.winscp_client import (
-    WinSCPError, download_remote_audio, scan_host_fingerprint, search_remote_audio, test_connection,
+    match_and_download_remote_audio, scan_host_fingerprint, search_remote_audio,
+    test_connection,
 )
 from app.ui.theme import (
     DEFAULT_THEME, apply_app_theme, normalize_theme, theme_asset, theme_colors,
@@ -70,7 +71,7 @@ def category_pixmap(name: str) -> QPixmap:
     pixmap = _CATEGORY_PIXMAPS.get(name)
     if pixmap is None:
         path = Path(__file__).resolve().parents[1] / "assets" / name
-        pixmap = QIcon(str(path)).pixmap(14, 14)
+        pixmap = QIcon(str(path)).pixmap(16, 16)
         _CATEGORY_PIXMAPS[name] = pixmap
     return pixmap
 
@@ -223,6 +224,7 @@ class CallRecord:
     category_code: str = ""
     tags: tuple[str, ...] = ()
     reviewed: bool = False
+    analysis_terms: str = ""
 
 
 def format_time(seconds: int) -> str:
@@ -371,6 +373,7 @@ def call_record_from_row(row: dict) -> CallRecord:
         category_code=category,
         tags=tuple(dict.fromkeys(str(hit["keyword"]) for hit in hits if hit.get("keyword"))),
         reviewed=bool(row.get("reviewed")),
+        analysis_terms=str(row.get("analysis_terms") or ""),
     )
 
 
@@ -473,6 +476,7 @@ class LocalScanWorker(QThread):
         index: BaseAudioIndex | None,
         source: str,
         preselected_paths: list[Path] | None = None,
+        base_path: Path | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -480,6 +484,7 @@ class LocalScanWorker(QThread):
         self.index = index
         self.source = source
         self.preselected_paths = list(preselected_paths) if preselected_paths is not None else None
+        self.base_path = Path(base_path).resolve() if base_path is not None else None
 
     def run(self):
         try:
@@ -498,6 +503,7 @@ class LocalScanWorker(QThread):
                 "paths": paths,
                 "records": records,
                 "source": self.source,
+                "base_path": self.base_path,
             })
 
 
@@ -573,11 +579,13 @@ class IssabelMatchWorker(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, config: dict, index: BaseAudioIndex, destination: Path, parent=None):
+    def __init__(self, config: dict, index: BaseAudioIndex, destination: Path,
+                 base_path: Path | None = None, parent=None):
         super().__init__(parent)
         self.config = dict(config)
         self.index = index
         self.destination = Path(destination)
+        self.base_path = Path(base_path).resolve() if base_path is not None else None
 
     def run(self):
         try:
@@ -587,22 +595,21 @@ class IssabelMatchWorker(QThread):
             request = dict(self.config)
             request["remote_paths"] = directories
             request["recursive"] = False
-            request["phones"] = issabel_phone_variants(self.index.phones)
-            candidates = search_remote_audio(request, "q-", limit=5000)
-            matches = []
-            for item in candidates:
-                remote_path = str(item.get("path", ""))
-                if audio_matches_index(Path(remote_path), self.index):
-                    matches.append(remote_path)
-            paths = download_remote_audio(request, matches, self.destination)
+            phone_dates = {
+                variant: dates
+                for phone, dates in self.index.phone_dates.items()
+                for variant in issabel_phone_variants({phone})
+            }
+            result = match_and_download_remote_audio(
+                request, phone_dates, self.destination, limit=5000
+            )
         except Exception as exc:
             self.failed.emit(str(exc))
         else:
             self.succeeded.emit({
-                "paths": paths,
-                "candidate_count": len(candidates),
-                "match_count": len(matches),
+                **result,
                 "directories": directories,
+                "base_path": self.base_path,
             })
 
 
@@ -783,13 +790,13 @@ class TranscriptRow(QFrame):
 class CallCard(QFrame):
     clicked = Signal(int)
 
-    def __init__(self, call: CallRecord) -> None:
+    def __init__(self, call: CallRecord, client_name: str = "") -> None:
         super().__init__()
         self.call = call
         self.setObjectName("callCard")
         self.setProperty("sensitive", call.sensitive)
         self.setProperty("selected", False)
-        self.setFixedHeight(100)
+        self.setFixedHeight(118)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 10, 16, 9)
@@ -824,8 +831,8 @@ class CallCard(QFrame):
         badge.setObjectName("classificationBadge")
         badge.setProperty("category", classification)
         badge_layout = QHBoxLayout(badge)
-        badge_layout.setContentsMargins(6, 2, 6, 2)
-        badge_layout.setSpacing(4)
+        badge_layout.setContentsMargins(8, 3, 8, 3)
+        badge_layout.setSpacing(5)
         icon_name = icon_names.get(classification)
         if icon_name:
             icon = QLabel()
@@ -854,6 +861,15 @@ class CallCard(QFrame):
         clock.setObjectName("monoMuted")
         top.addWidget(clock)
         layout.addLayout(top)
+
+        client_row = QHBoxLayout()
+        client_row.setContentsMargins(16, 0, 0, 0)
+        client = QLabel(client_name or "Nombre no disponible")
+        client.setObjectName("callClientName")
+        client.setToolTip(client_name or "La base no contiene un nombre para este teléfono")
+        client_row.addWidget(client)
+        client_row.addStretch()
+        layout.addLayout(client_row)
 
         snippet = QLabel(call.snippet)
         snippet.setObjectName("callSnippet")
@@ -888,7 +904,7 @@ class SentryWindow(QMainWindow):
         if app is not None:
             apply_app_theme(app, self.theme)
         self.setWindowTitle("Sentry · Auditoría de grabaciones")
-        self.setWindowIcon(QIcon(str(Path(__file__).resolve().parents[1] / "assets" / "sentry-app-icon.ico")))
+        self.setWindowIcon(QIcon(str(Path(__file__).resolve().parents[1] / "assets" / "sentry-app-icon.png")))
         self.resize(1440, 860)
         self.setMinimumSize(1080, 680)
 
@@ -915,6 +931,7 @@ class SentryWindow(QMainWindow):
         self.network = QNetworkAccessManager(self)
         self.analysis_worker: AnalysisWorker | None = None
         self.local_scan_worker: LocalScanWorker | None = None
+        self.pending_base_scan = False
         self.winscp_worker: WinSCPWorker | None = None
         self.remote_search_worker: RemoteSearchWorker | None = None
         self.issabel_match_worker: IssabelMatchWorker | None = None
@@ -949,12 +966,14 @@ class SentryWindow(QMainWindow):
             self.keywords_input.setText(settings["keywords"])
         self._restore_credentials()
         self._restore_remote_connection()
-        persisted = self.database.call_rows()
         if self.active_base_path is not None:
-            persisted = [
-                row for row in persisted
-                if audio_matches_index(Path(row["file_path"]), self.active_base_index)
+            matching_paths = [
+                path for value in self.database.call_paths()
+                if audio_matches_index(path := Path(value), self.active_base_index)
             ]
+            persisted = self.database.call_rows(matching_paths)
+        else:
+            persisted = self.database.call_rows()
         if persisted:
             self.call_records = [call_record_from_row(row) for row in persisted]
             self.calls = {call.call_id: call for call in self.call_records}
@@ -1240,10 +1259,10 @@ class SentryWindow(QMainWindow):
                 item = QListWidgetItem()
                 item.setData(Qt.ItemDataRole.UserRole, call.call_id)
                 item.setText(call.filename)
-                item.setSizeHint(QSize(0, 100))
+                item.setSizeHint(QSize(0, 118))
                 self.call_list.addItem(item)
                 self.call_items[call.call_id] = item
-            for row in range(min(60, len(self.call_records))):
+            for row in range(min(24, len(self.call_records))):
                 self._materialize_call_card(row)
         finally:
             self.call_list.blockSignals(False)
@@ -1265,7 +1284,7 @@ class SentryWindow(QMainWindow):
             call = next((record for record in self.call_records if record.call_id == call_id), None)
         if call is None:
             return None
-        card = CallCard(call)
+        card = CallCard(call, self._client_name_for_call(call))
         card.clicked.connect(self._select_call_by_id)
         card.set_selected(call_id == self.selected_call_id)
         self.call_cards[call_id] = card
@@ -1297,10 +1316,14 @@ class SentryWindow(QMainWindow):
             card.deleteLater()
             self.call_cards.pop(call_id, None)
 
-    @staticmethod
-    def _searchable_call_text(call: CallRecord) -> str:
+    def _client_name_for_call(self, call: CallRecord) -> str:
+        phone = audio_phone_from_filename(call.source_path) if call.source_path is not None else None
+        return self.active_base_index.names.get(phone or "", "").strip()
+
+    def _searchable_call_text(self, call: CallRecord) -> str:
         return (
-            f"{call.filename} {call.customer} {call.keyword} {' '.join(call.tags)} {call.snippet}"
+            f"{call.filename} {call.customer} {self._client_name_for_call(call)} "
+            f"{call.keyword} {' '.join(call.tags)} {call.snippet}"
         ).casefold()
 
     def _apply_call_sort(self) -> None:
@@ -2474,10 +2497,23 @@ class SentryWindow(QMainWindow):
             (self.nas_directory if self._source_key() == "nas" else self.config_directory).setFocus()
             return
         self._switch_page("audit")
+        self._prepare_base_refresh()
         self._show_toast(
             f"Buscando {len(self.active_base_phones):,} teléfonos en {len(self.active_base_index.dates):,} fecha(s)"
         )
         self._scan_directory()
+
+    def _prepare_base_refresh(self) -> None:
+        """Retira resultados de la base anterior antes de iniciar el nuevo escaneo."""
+        self.call_records = []
+        self.calls = {}
+        self.detected_audio_files = ()
+        self.selected_call_id = None
+        self._populate_call_list()
+        self._show_empty_state(
+            "Actualizando resultados…",
+            f"Buscando los audios que coinciden con {self.active_base_path.name}.",
+        )
 
     def _filter_calls(self) -> None:
         query = self.search_input.text().strip().casefold()
@@ -2591,7 +2627,11 @@ class SentryWindow(QMainWindow):
             "Quitar verificación" if call.reviewed else "Marcar como verificada"
         )
         self.media_player.setSource(QUrl.fromLocalFile(str(source)) if has_audio else QUrl())
-        self.filename_label.setText(call.filename)
+        associated_name = self._client_name_for_call(call)
+        self.filename_label.setText(associated_name or call.filename)
+        self.filename_label.setToolTip(
+            f"Archivo: {call.filename}" + (f"\n{source}" if source is not None else "")
+        )
         badge_text = ("Etiquetas: " + ", ".join(call.tags)) if call.tags else (
             "Término sensible" if call.sensitive else "Sin alerta crítica")
         self.risk_badge.setText("Pendiente de análisis" if call.risk == "Pendiente" else badge_text)
@@ -2993,6 +3033,8 @@ class SentryWindow(QMainWindow):
         preselected_paths: list[Path] | None = None,
     ) -> None:
         if self.local_scan_worker is not None:
+            self.pending_base_scan = True
+            self._show_toast("La nueva base quedó en cola; se actualizará al terminar el escaneo actual")
             return
         self._set_scan_busy(True, "Leyendo carpetas y metadatos en segundo plano…")
         source_label = "NAS" if source == "nas" else "Issabel" if source == "issabel" else "carpeta local"
@@ -3002,6 +3044,7 @@ class SentryWindow(QMainWindow):
             self.active_base_index if self.active_base_path is not None else None,
             source,
             preselected_paths,
+            self.active_base_path,
             self,
         )
         self.local_scan_worker.succeeded.connect(self._local_scan_succeeded)
@@ -3011,6 +3054,11 @@ class SentryWindow(QMainWindow):
 
     def _local_scan_succeeded(self, result: object) -> None:
         if isinstance(result, dict):
+            result_base = result.get("base_path")
+            if result_base is not None and self.active_base_path is not None:
+                if Path(result_base).resolve() != self.active_base_path:
+                    self.pending_base_scan = True
+                    return
             self._apply_scan_result(result)
 
     def _local_scan_failed(self, error: str) -> None:
@@ -3019,6 +3067,12 @@ class SentryWindow(QMainWindow):
     def _local_scan_finished(self) -> None:
         worker = self.local_scan_worker
         self.local_scan_worker = None
+        if self.pending_base_scan and self.issabel_match_worker is None:
+            self.pending_base_scan = False
+            if worker is not None:
+                worker.deleteLater()
+            self._scan_directory()
+            return
         if self.issabel_match_worker is None:
             self._set_scan_busy(False)
         if worker is not None:
@@ -3026,6 +3080,8 @@ class SentryWindow(QMainWindow):
 
     def _start_issabel_match(self) -> None:
         if self.issabel_match_worker is not None:
+            self.pending_base_scan = True
+            self._show_toast("La nueva base quedó en cola; se actualizará al terminar la búsqueda actual")
             return
         config = self._remote_config()
         if not config["fingerprint"] or not config["password"]:
@@ -3035,15 +3091,13 @@ class SentryWindow(QMainWindow):
         if not self.active_base_index.dates:
             self._show_toast("La base activa no contiene fechas válidas en Hoja1")
             return
-        base_name = re.sub(r"[^A-Za-z0-9._-]+", "_", self.active_base_path.stem)[:80]
-        base_name = re.sub(r"_\d+$", "", base_name)
-        destination = APP_STORAGE_ROOT / "data" / "remote_audio" / base_name
+        destination = APP_STORAGE_ROOT / "data" / "remote_audio" / "_cache"
         self._set_scan_busy(True, "Buscando por teléfono y fecha en Issabel…")
         self._show_toast(
             f"Issabel: revisando {len(self.active_base_index.dates)} carpeta(s) de fecha, no todo el año"
         )
         self.issabel_match_worker = IssabelMatchWorker(
-            config, self.active_base_index, destination, self
+            config, self.active_base_index, destination, self.active_base_path, self
         )
         self.issabel_match_worker.succeeded.connect(self._issabel_match_succeeded)
         self.issabel_match_worker.failed.connect(self._issabel_match_failed)
@@ -3052,6 +3106,11 @@ class SentryWindow(QMainWindow):
 
     def _issabel_match_succeeded(self, result: object) -> None:
         payload = result if isinstance(result, dict) else {}
+        result_base = payload.get("base_path")
+        if result_base is not None and self.active_base_path is not None:
+            if Path(result_base).resolve() != self.active_base_path:
+                self.pending_base_scan = True
+                return
         paths = [Path(path) for path in payload.get("paths", [])]
         if not paths:
             checked = int(payload.get("candidate_count", 0) or 0)
@@ -3071,6 +3130,12 @@ class SentryWindow(QMainWindow):
     def _issabel_match_finished(self) -> None:
         worker = self.issabel_match_worker
         self.issabel_match_worker = None
+        if self.pending_base_scan and self.local_scan_worker is None:
+            self.pending_base_scan = False
+            if worker is not None:
+                worker.deleteLater()
+            self._scan_directory()
+            return
         if self.local_scan_worker is None:
             self._set_scan_busy(False)
         if worker is not None:
@@ -3097,6 +3162,7 @@ class SentryWindow(QMainWindow):
                 "source": self._source_key(),
             })
             return
+        self._set_scan_busy(False)
         self._show_toast(message)
 
     def _apply_scan_result(self, result: dict) -> None:
@@ -3188,12 +3254,18 @@ class SentryWindow(QMainWindow):
             self.analyze_button.setText("Deteniendo…")
             self.analyze_button.setAccessibleName("Deteniendo análisis")
             return
+        keywords = [word.strip() for word in self.keywords_input.text().split(",") if word.strip()]
+        terms_signature = keyword_signature(keywords)
         paths = [
             call.source_path for call in self.call_records
-            if call.source_path is not None and call.category_code in {"PENDIENTE", "ERROR"}
+            if call.source_path is not None
+            and (
+                call.category_code in {"PENDIENTE", "ERROR"}
+                or call.analysis_terms != terms_signature
+            )
         ]
         if not paths:
-            self._show_toast("No hay llamadas pendientes de análisis")
+            self._show_toast("No hay llamadas pendientes ni términos nuevos para analizar")
             return
         try:
             config = self._analysis_config()
@@ -3641,14 +3713,19 @@ class SentryWindow(QMainWindow):
             QFrame#normalDot {{ background: {PALETTE['border_strong']}; border-radius: 4px; }}
             QLabel#callAgent {{ color: {PALETTE['text']}; font-weight: 600; }}
             QLabel#callCustomer {{ color: {PALETTE['text']}; font-weight: 600; }}
+            QLabel#callClientName {{
+                color: {PALETTE['text_soft']};
+                font-size: 11px;
+                font-weight: 550;
+            }}
             QFrame#classificationBadge {{
                 background: {PALETTE['neutral_badge_bg']};
                 border: 1px solid {PALETTE['border_strong']};
-                border-radius: 5px;
+                border-radius: 6px;
             }}
             QFrame#classificationBadge QLabel#classificationText {{
                 color: {PALETTE['gray']};
-                font-size: 9px;
+                font-size: 10px;
                 font-weight: 600;
             }}
             QFrame#classificationBadge[category="ALERTA"] {{
@@ -3657,7 +3734,7 @@ class SentryWindow(QMainWindow):
             }}
             QFrame#classificationBadge[category="ALERTA"] QLabel#classificationText {{
                 color: {PALETTE['alert_text']};
-                font-size: 9px;
+                font-size: 10px;
                 font-weight: 650;
             }}
             QFrame#classificationBadge[category="BUZON"] {{
@@ -3666,7 +3743,7 @@ class SentryWindow(QMainWindow):
             }}
             QFrame#classificationBadge[category="BUZON"] QLabel#classificationText {{
                 color: {PALETTE['gray']};
-                font-size: 9px;
+                font-size: 10px;
                 font-weight: 600;
             }}
             QFrame#classificationBadge[category="NORMAL"] {{
@@ -3675,7 +3752,7 @@ class SentryWindow(QMainWindow):
             }}
             QFrame#classificationBadge[category="NORMAL"] QLabel#classificationText {{
                 color: {PALETTE['green_accessible']};
-                font-size: 9px;
+                font-size: 10px;
                 font-weight: 600;
             }}
             QLabel#classificationIcon {{ background: transparent; border: none; }}

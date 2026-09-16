@@ -1,5 +1,5 @@
 """El mismo motor del script, con registro transaccional de sus resultados."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 import re
@@ -44,6 +44,7 @@ def normalize_call_date(value) -> str:
 @dataclass(frozen=True)
 class BaseAudioIndex:
     phone_dates: dict[str, frozenset[str]]
+    names: dict[str, str] = field(default_factory=dict)
 
     @property
     def phones(self) -> set[str]:
@@ -55,7 +56,7 @@ class BaseAudioIndex:
 
 
 def load_hoja1_audio_index(path: Path) -> BaseAudioIndex:
-    """Lee teléfonos y fechas de Hoja1 para emparejar teléfono + día."""
+    """Lee teléfonos, fechas y nombres de Hoja1 para relacionarlos con los audios."""
     path = Path(path).resolve()
     if not path.is_file() or path.suffix.casefold() != ".xlsx":
         raise ValueError("Selecciona un Excel transformado que todavía exista.")
@@ -70,17 +71,24 @@ def load_hoja1_audio_index(path: Path) -> BaseAudioIndex:
         if normalize(sheet.cell(1, 1).value) != "telefono":
             raise ValueError("Hoja1 no tiene la columna Teléfono en la primera posición.")
         phone_dates: dict[str, set[str]] = {}
-        for phone_value, _state, _agent, date_value in sheet.iter_rows(
-            min_row=2, min_col=1, max_col=4, values_only=True
+        names: dict[str, str] = {}
+        for phone_value, _state, _agent, date_value, _duration, name_value in sheet.iter_rows(
+            min_row=2, min_col=1, max_col=6, values_only=True
         ):
             phone = normalize_phone_number(phone_value)
             if not phone:
                 continue
             phone_dates.setdefault(phone, set())
+            name = cell_text(name_value).strip()
+            if name and phone not in names:
+                names[phone] = name
             day = normalize_call_date(date_value)
             if day:
                 phone_dates[phone].add(day)
-        return BaseAudioIndex({phone: frozenset(days) for phone, days in phone_dates.items()})
+        return BaseAudioIndex(
+            {phone: frozenset(days) for phone, days in phone_dates.items()},
+            names,
+        )
     finally:
         book.close()
 

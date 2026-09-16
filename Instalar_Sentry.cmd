@@ -70,7 +70,7 @@ echo WinSCP detectado: la conexion con Issabel esta disponible.
 echo.
 choice /C SN /N /M "Deseas abrir Sentry ahora? [S/N]: "
 if errorlevel 2 exit /b 0
-call Sentry.cmd
+start "" wscript.exe "%~dp0Sentry.vbs"
 exit /b 0
 
 :error_instalacion

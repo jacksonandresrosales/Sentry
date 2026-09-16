@@ -24,11 +24,11 @@ El script [scripts/transformar_base.py](scripts/transformar_base.py) convierte b
 
 En Windows, haz doble clic en `DB_delete.cmd` para abrir la mini aplicación, cargar tu base y abrir el resultado o la carpeta de salida.
 
-La funcionalidad también está integrada en Sentry: abre `Sentry.cmd` y pulsa **Bases**, en el header junto al directorio. Permite cargar una o varias bases, consolidarlas, elegir carpeta, configurar V/R y número de base, usar opciones avanzadas y abrir el Excel o su carpeta. Conserva el modelo NO y la numeración sin sobrescrituras. El procesamiento trabaja en segundo plano y el historial permanece al reiniciar. Al terminar, **Usar base para buscar audios** toma teléfono y fecha de `Hoja1`: solo incorpora WAV/MP3 `q-<cola>-<teléfono>-<AAAAMMDD>-...` cuando coinciden ambos valores. La selección también puede hacerse desde una ejecución del historial y se conserva entre sesiones.
+La funcionalidad también está integrada en Sentry: abre `Sentry.vbs` y pulsa **Bases**, en el header junto al directorio. Permite cargar una o varias bases, consolidarlas, elegir carpeta, configurar V/R y número de base, usar opciones avanzadas y abrir el Excel o su carpeta. Conserva el modelo NO y la numeración sin sobrescrituras. El procesamiento trabaja en segundo plano y el historial permanece al reiniciar. Al terminar, **Usar base para buscar audios** toma teléfono y fecha de `Hoja1`: solo incorpora WAV/MP3 `q-<cola>-<teléfono>-<AAAAMMDD>-...` cuando coinciden ambos valores. La selección también puede hacerse desde una ejecución del historial y se conserva entre sesiones.
 
 ## Base de datos local
 
-En desarrollo se crea en `data/db/sentry_audit.db`; el ejecutable usa `%LOCALAPPDATA%\Ecuaconexion\Sentry\data\db\sentry_audit.db` para que Windows no elimine los datos al cerrar. Incluye `calls`, `keyword_hits`, `app_settings`, `base_jobs`, `base_records` y la configuración única `remote_connection`. Guarda los audios detectados, ajustes no secretos, ejecuciones y registros únicos procesados; mantiene teléfonos y documentos como texto. La aplicación inicia sin llamadas ficticias y recupera los análisis reales guardados. Las claves API y la contraseña SFTP se almacenan cifradas mediante DPAPI.
+En desarrollo se crea en `data/db/sentry_audit.db`; la aplicación instalada usa `%LOCALAPPDATA%\Ecuaconexion\Sentry\data\db\sentry_audit.db`, fuera de la carpeta protegida del programa. Incluye `calls`, `keyword_hits`, `app_settings`, `base_jobs`, `base_records` y la configuración única `remote_connection`. Guarda los audios detectados, ajustes no secretos, ejecuciones y registros únicos procesados; mantiene teléfonos y documentos como texto. La aplicación inicia sin llamadas ficticias y recupera los análisis reales guardados. Las claves API y la contraseña SFTP se almacenan cifradas mediante DPAPI.
 
 Para preparar el esquema sin abrir la interfaz:
 
@@ -46,7 +46,7 @@ Software desarrollado para uso interno exclusivo de la empresa. Todos los derech
 
 ## Ejecutar la interfaz de escritorio
 
-Sentry está preparado para Windows 10/11 y requiere Python 3.10 o superior. En un equipo nuevo, descarga el repositorio y haz doble clic en `Instalar_Sentry.cmd`: crea un entorno aislado, instala las dependencias e inicializa la base SQLite. Después se abre normalmente con `Sentry.cmd`.
+Sentry está preparado para Windows 10/11 y requiere Python 3.10 o superior. En un equipo nuevo, descarga el repositorio y haz doble clic en `Instalar_Sentry.cmd`: crea un entorno aislado, instala las dependencias e inicializa la base SQLite. Después se abre normalmente con `Sentry.vbs`, que evita mostrar una consola de comandos. `Sentry.cmd` se conserva como acceso compatible y delega en el mismo lanzador silencioso.
 
 Para buscar en carpetas locales o NAS no hace falta instalar otro componente. La conexión con Issabel requiere [WinSCP](https://winscp.net/eng/download.php) con `WinSCPnet.dll`; se admite la instalación para todos los usuarios y la instalación local. Cada equipo debe introducir sus propias credenciales y claves API desde **Configuración**, ya que se cifran con el usuario de Windows y nunca se distribuyen mediante Git.
 
@@ -59,6 +59,18 @@ python -m pip install -r requirements.txt
 python -m app.main
 ```
 
+## Construir el instalador EXE
+
+El ejecutable incluye Python, Qt, WinSCP y una base SQLite nueva con el esquema vigente, sin llamadas, bases procesadas, configuración ni credenciales de la PC de construcción. Instala una vez las dependencias de construcción y ejecuta el generador:
+
+```powershell
+python -m pip install -r requirements-build.txt
+winget install --id JRSoftware.InnoSetup --exact
+.\Construir_EXE.cmd
+```
+
+El resultado se llama `dist\Sentry_Setup_<versión>.exe`; el nombre, los metadatos y el panel de instalación toman automáticamente la misma versión indicada en `app/about.py`. El instalador crea los accesos directos y coloca la aplicación con todas sus DLL; los datos se guardan en `%LOCALAPPDATA%\Ecuaconexion\Sentry`. La nueva instalación comienza vacía y solicita sus propias claves y datos de conexión.
+
 En **Configuración → Directorio de grabaciones** se elige **Carpeta local**, **NAS / carpeta compartida** o **Issabel / SFTP**. Local y NAS buscan en la ruta elegida y, cuando existe una estructura por fecha, entran directamente en `año/mes/día`. Issabel filtra primero en el servidor por las fechas y teléfonos de la base, descarga únicamente las coincidencias a `data/remote_audio` y reutiliza esas copias en búsquedas posteriores. Los archivos originales del servidor nunca se eliminan. **Analizar** transcribe los audios resultantes y los separa en **Demandas / alertas**, **Buzones** y **Llamadas normales**. A la derecha de **Llamadas detectadas** se puede filtrar por clasificación y ordenar por prioridad de términos, duración, fecha, nombre u orden original. La diarización distingue las voces y Sentry usa localmente expresiones habituales de atención para rotularlas como **Asesor** y **Cliente**, sin una consulta adicional a la IA. Cada palabra o frase configurada que aparezca se añade como etiqueta visible y buscable en la llamada.
 
 Los recorridos de carpetas locales y NAS se ejecutan en segundo plano para mantener la ventana disponible. La cola crea visualmente solo las filas necesarias conforme se desplaza, SQLite agrupa la lectura de llamadas y etiquetas, y la reproducción actualiza únicamente la línea activa de la transcripción. Sentry también conserva la huella de cada archivo junto con su tamaño y fecha de modificación: si el audio no cambió, evita volver a leerlo completo antes de consultar las cachés.
@@ -67,7 +79,7 @@ La transcripción acompaña la reproducción y desplaza automáticamente la lín
 
 Se guarda cada llamada apenas termina; al reiniciar se recuperan lista, transcripción, resumen, categoría, etiquetas, evidencias y estado de revisión. Los trabajos interrumpidos quedan marcados para reintentar.
 
-Para reducir tiempo y consumo, Sentry procesa hasta tres audios distintos en paralelo, reutiliza conexiones HTTP y agrupa por huella SHA-256: dos copias del mismo audio consumen una sola transcripción. **Analizar** toma únicamente llamadas pendientes o con error; las completadas no vuelven a entrar en la cola. Las cachés separadas de transcripción y análisis evitan nuevas llamadas a las APIs cuando coinciden audio, modelos y términos, y SQLite conserva tiempos por etapa para diagnosticar futuras demoras. Si no hay términos sensibles, la clasificación normal se hace localmente y no consume la API contextual; esta solo recibe fragmentos cercanos a posibles coincidencias. Un audio sin conversación o con un único hablante detectado se clasifica como buzón.
+Para reducir tiempo y consumo, Sentry procesa hasta tres audios distintos en paralelo, reutiliza conexiones HTTP y agrupa por huella SHA-256: dos copias del mismo audio consumen una sola transcripción. **Analizar** toma llamadas pendientes, con error o cuyo análisis no incluya la lista actual de palabras y frases clave. Al agregar términos, las llamadas completadas se vuelven a evaluar reutilizando su transcripción, sin consumir otra transcripción del mismo audio. Las cachés separadas de transcripción y análisis evitan nuevas llamadas a las APIs cuando coinciden audio, modelos y términos, y SQLite conserva tiempos por etapa para diagnosticar futuras demoras. Si no hay términos sensibles, la clasificación normal se hace localmente y no consume la API contextual; esta solo recibe fragmentos cercanos a posibles coincidencias. Un audio sin conversación o con un único hablante detectado se clasifica como buzón.
 
 Las alertas detectadas por términos sensibles aparecen como denuncias automáticas. El botón **Marcar como verificada** confirma o revierte esa clasificación manual sin perderla al cerrar la aplicación. Desde **Exportar Excel** se pueden generar archivos de denuncias automáticas pendientes, denuncias verificadas, todas las denuncias o toda la base activa. La salida contiene únicamente número de celular, nombre del cliente, ID y estado; las denuncias se resaltan en rojo y los demás registros en verde.
 

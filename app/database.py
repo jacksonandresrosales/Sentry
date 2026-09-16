@@ -5,17 +5,37 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import sys
 
 
+_configured_storage = os.environ.get("SENTRY_STORAGE_ROOT", "").strip()
+_local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
 APP_STORAGE_ROOT = (
-    Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-    / "Ecuaconexion" / "Sentry"
+    Path(_configured_storage).expanduser().resolve()
+    if _configured_storage
+    else (Path(_local_app_data) / "Ecuaconexion" / "Sentry").resolve()
+    if getattr(sys, "frozen", False) and _local_app_data
+    else Path(sys.executable).resolve().parent
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parents[1]
 )
-DEFAULT_DATABASE = APP_STORAGE_ROOT / "data" / "db" / "sentry_audit.db"
+def _bundled_database() -> Path:
+    """Copia la base inicial junto al EXE durante el primer arranque."""
+    destination = APP_STORAGE_ROOT / "data" / "db" / "sentry_audit.db"
+    if not getattr(sys, "frozen", False) or destination.exists():
+        return destination
+
+    bundle_root = Path(getattr(sys, "_MEIPASS", APP_STORAGE_ROOT))
+    bundled_database = bundle_root / "data" / "db" / "sentry_audit.db"
+    if bundled_database.is_file() and bundled_database.resolve() != destination.resolve():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(bundled_database, destination)
+    return destination
+
+
+DEFAULT_DATABASE = _bundled_database()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls (
@@ -113,7 +133,7 @@ class Database:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=NORMAL")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version > 5:
+            if version > 6:
                 raise RuntimeError("La base de datos pertenece a una versión más nueva de Sentry.")
             connection.executescript(SCHEMA)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(calls)")}
@@ -123,6 +143,7 @@ class Database:
                 "analysis_error": "TEXT",
                 "cache_key": "TEXT",
                 "reviewed": "INTEGER NOT NULL DEFAULT 0",
+                "analysis_terms": "TEXT",
             }
             for name, definition in additions.items():
                 if name not in columns:
@@ -131,7 +152,7 @@ class Database:
             connection.execute("UPDATE calls SET status='ERROR', analysis_error="
                                "'El análisis fue interrumpido al cerrar la aplicación.' "
                                "WHERE status IN ('TRANSFIRIENDO','ANALIZANDO')")
-            connection.execute("PRAGMA user_version=5")
+            connection.execute("PRAGMA user_version=6")
 
     @contextmanager
     def connect(self):
@@ -230,6 +251,11 @@ class Database:
                 item["hits"] = hits_by_call[item["id"]]
             return result
 
+    def call_paths(self) -> list[str]:
+        """Devuelve solo rutas para filtrar grandes historiales sin cargar transcripciones."""
+        with self.connect() as connection:
+            return [str(row[0]) for row in connection.execute("SELECT file_path FROM calls ORDER BY id")]
+
     def cached_file_digest(self, file_path, file_size: int, modified_ns: int) -> str | None:
         path = str(Path(file_path).resolve())
         with self.connect() as connection:
@@ -271,7 +297,7 @@ class Database:
                                f"ON CONFLICT(cache_key) DO UPDATE SET {column}=excluded.{column}",
                                (key, json.dumps(payload, ensure_ascii=False)))
 
-    def save_call_result(self, file_path, cache_key: str, transcript, result):
+    def save_call_result(self, file_path, cache_key: str, analysis_terms: str, transcript, result):
         path = str(Path(file_path).resolve())
         hits = result.get("hits", [])
         with self.connect() as connection:
@@ -290,10 +316,10 @@ class Database:
             connection.execute(
                 "UPDATE calls SET status='COMPLETADO',transcript=?,transcript_json=?,summary=?,sentiment=?,"
                 "risk_level=?,has_sensitive_keyword=?,category=?,analysis_error=NULL,cache_key=?,"
-                "processed_at=CURRENT_TIMESTAMP WHERE id=?",
+                "analysis_terms=?,processed_at=CURRENT_TIMESTAMP WHERE id=?",
                 (transcript.get("text", ""), json.dumps(transcript, ensure_ascii=False),
                  result.get("summary", ""), result.get("sentiment", "NEUTRAL"), result.get("risk", "BAJO"),
-                 int(category == "ALERTA"), category, cache_key, call_id),
+                 int(category == "ALERTA"), category, cache_key, analysis_terms, call_id),
             )
 
     def save_analysis_timing(self, file_path, metrics: dict) -> None:

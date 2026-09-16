@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import sys
 import sqlite3
+import ctypes
 from pathlib import Path
 from app.about import APP_NAME, APP_VERSION
 
 def main() -> int:
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Ecuaconexion.Sentry")
+        except (AttributeError, OSError):
+            pass
     try:
         from PySide6.QtGui import QIcon
         from PySide6.QtWidgets import QApplication, QMessageBox
@@ -22,7 +28,9 @@ def main() -> int:
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName("Ecuaconexión")
-    icon_path = Path(__file__).resolve().parent / "ui" / "assets" / "sentry-app-icon.ico"
+    # Qt obtiene mejores versiones pequeñas para la barra de título desde el PNG.
+    # El ejecutable conserva el ICO multirresolución como icono nativo de Windows.
+    icon_path = Path(__file__).resolve().parent / "ui" / "assets" / "sentry-app-icon.png"
     window_icon = QIcon(str(icon_path))
     app.setWindowIcon(window_icon)
     app.setStyle("Fusion")

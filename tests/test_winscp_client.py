@@ -8,7 +8,8 @@ import unittest
 from unittest.mock import patch
 
 from app.services.winscp_client import (
-    WinSCPError, download_remote_audio, scan_host_fingerprint, search_remote_audio, test_connection,
+    WinSCPError, match_and_download_remote_audio, scan_host_fingerprint,
+    search_remote_audio, test_connection,
 )
 
 
@@ -43,6 +44,10 @@ class WinSCPClientTests(unittest.TestCase):
         self.assertNotIn("secreto-prueba", " ".join(arguments))
         self.assertNotIn("usuario-prueba", " ".join(arguments))
         self.assertEqual(run.call_args.kwargs["env"]["SENTRY_SFTP_PASSWORD"], "")
+        self.assertEqual(
+            run.call_args.kwargs["creationflags"],
+            getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
 
     def test_connection_requires_verified_fingerprint(self):
         with self.assertRaisesRegex(WinSCPError, "huella SSH"):
@@ -86,18 +91,29 @@ class WinSCPClientTests(unittest.TestCase):
     @patch("app.services.winscp_client.winscp_dll", return_value=Path(r"C:\WinSCP\WinSCPnet.dll"))
     @patch("app.services.winscp_client.shutil.which", return_value=r"C:\Windows\powershell.exe")
     @patch("app.services.winscp_client.subprocess.run")
-    def test_download_keeps_remote_file_and_reuses_local_target(self, run, _which, _dll):
+    def test_match_and_download_uses_one_session_with_phone_dates(self, run, _which, _dll):
         with tempfile.TemporaryDirectory() as temp:
             target = Path(temp) / "q-000-0990000001-20260701-120000.wav"
             target.touch()
-            run.return_value = SimpleNamespace(returncode=0, stdout=f'"{str(target).replace(chr(92), chr(92)*2)}"', stderr="")
-
-            downloaded = download_remote_audio(
-                config(), ["/monitor/2026/07/01/q-000-0990000001-20260701-120000.wav"], Path(temp)
+            escaped = str(target).replace(chr(92), chr(92) * 2)
+            run.return_value = SimpleNamespace(
+                returncode=0,
+                stdout=(f'{{"paths":["{escaped}"],"candidate_count":3,"match_count":1}}'),
+                stderr="",
             )
 
-            self.assertEqual(downloaded, [target.resolve()])
-            self.assertIn("q-000-0990000001", run.call_args.kwargs["env"]["SENTRY_SFTP_FILES"])
+            result = match_and_download_remote_audio(
+                {**config(), "remote_paths": ["/monitor/2026/07/01/"], "recursive": False},
+                {"0990000001": frozenset({"20260701"})},
+                Path(temp),
+            )
+
+            self.assertEqual(result["paths"], [target.resolve()])
+            self.assertEqual(result["candidate_count"], 3)
+            self.assertEqual(result["match_count"], 1)
+            environment = run.call_args.kwargs["env"]
+            self.assertEqual(environment["SENTRY_SFTP_MODE"], "match_download")
+            self.assertEqual(environment["SENTRY_SFTP_PHONE_DATES"], '{"0990000001": ["20260701"]}')
 
     @patch("app.services.winscp_client.winscp_dll", return_value=Path(r"C:\WinSCP\WinSCPnet.dll"))
     @patch("app.services.winscp_client.shutil.which", return_value=r"C:\Windows\powershell.exe")

@@ -142,6 +142,11 @@ class SentryWindowSmokeTest(unittest.TestCase):
         self.assertIn(">demanda</span>", highlighted)
         self.assertIn(">abogado</span>", highlighted)
 
+    def test_native_window_shows_the_sentry_icon(self) -> None:
+        self.assertFalse(self.window.windowIcon().isNull())
+        self.assertFalse(self.window.windowIcon().pixmap(16, 16).isNull())
+        self.assertIsNone(self.window.findChild(QLabel, "windowBrandIcon"))
+
     def test_call_classifications_have_distinct_vector_icons(self) -> None:
         self._load_sample_calls()
         expected = {"ALERTA": "Demanda / alerta", "BUZON": "Buzón", "NORMAL": "Llamada normal"}
@@ -203,6 +208,12 @@ class SentryWindowSmokeTest(unittest.TestCase):
         self.assertEqual(self.window.nav_buttons["config"].accessibleName(), "Configuración")
         self.assertFalse(self.window.bases_button.icon().isNull())
         self.assertFalse(hasattr(self.window, "scan_button"))
+        self.window._set_scan_busy(True, "Buscando audios…")
+        self.assertFalse(self.window.analyze_button.isEnabled())
+        self.assertFalse(self.window.audio_source.isEnabled())
+        self.window._set_scan_busy(False)
+        self.assertTrue(self.window.analyze_button.isEnabled())
+        self.assertTrue(self.window.audio_source.isEnabled())
         self.assertEqual(self.window.directory_label.text(), "Sin directorio")
         self.assertEqual(self.window.directory_label.toolTip(), "No se ha configurado una carpeta")
         self.assertIn("QComboBox::down-arrow", self.window.styleSheet())
@@ -311,6 +322,48 @@ class SentryWindowSmokeTest(unittest.TestCase):
             (matching,),
         )
         self.assertEqual(scan_audio_files(folder, phone_dates={"0990000001": frozenset({"20260529"})}), ())
+
+    def test_base_name_replaces_audio_filename_in_detail_heading(self) -> None:
+        path = Path(self.temp.name) / "q-000-0990000001-20260528-162746-1.wav"
+        path.touch()
+        self.window.active_base_index = BaseAudioIndex(
+            {"0990000001": frozenset({"20260528"})},
+            {"0990000001": "PERSONA DE PRUEBA"},
+        )
+        call = call_record_from_audio(path, 1)
+
+        self.window._show_call(call)
+        self.window.call_records = [call]
+        self.window.calls = {call.call_id: call}
+        self.window._populate_call_list()
+
+        self.assertEqual(self.window.filename_label.text(), "PERSONA DE PRUEBA")
+        self.assertIn(path.name, self.window.filename_label.toolTip())
+        client_name = self.window.call_cards[call.call_id].findChild(QLabel, "callClientName")
+        self.assertEqual(client_name.text(), "PERSONA DE PRUEBA")
+        self.assertEqual(self.window.call_cards[call.call_id].height(), 118)
+
+    def test_activating_base_clears_previous_results_and_refreshes(self) -> None:
+        old_audio = Path(self.temp.name) / "q-000-0990000002-20260528-162746-1.wav"
+        old_audio.touch()
+        old_call = call_record_from_audio(old_audio, 1)
+        self.window.call_records = [old_call]
+        self.window.calls = {old_call.call_id: old_call}
+        self.window._populate_call_list()
+        self.window.config_directory.setText(self.temp.name)
+        selected = Path(self.temp.name) / "base-seleccionada.xlsx"
+        index = BaseAudioIndex(
+            {"0990000001": frozenset({"20260528"})},
+            {"0990000001": "PERSONA DE PRUEBA"},
+        )
+
+        with patch.object(self.window, "_scan_directory") as scan:
+            self.window._activate_audio_base(str(selected), index)
+
+        self.assertEqual(self.window.call_records, [])
+        self.assertEqual(self.window.call_list.count(), 0)
+        self.assertEqual(self.window.empty_detail_title.text(), "Actualizando resultados…")
+        scan.assert_called_once_with()
 
     def test_local_nas_and_issabel_sources_use_date_folders(self) -> None:
         root = Path(self.temp.name) / "recordings"

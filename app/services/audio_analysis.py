@@ -222,6 +222,12 @@ def detected_keyword_hits(transcript: dict, keywords: list[str], validated=()):
     return hits
 
 
+def keyword_signature(keywords) -> str:
+    """Huella estable: ignora mayúsculas, acentos, duplicados y el orden."""
+    normalized = sorted({_normalized(str(word).strip()) for word in keywords if str(word).strip()})
+    return hashlib.sha256("\n".join(normalized).encode()).hexdigest()
+
+
 RESULT_SCHEMA = {
     "type": "object", "additionalProperties": False,
     "properties": {
@@ -313,11 +319,12 @@ def analyze_file(database, path: Path, config: dict, digest: str | None = None):
     digest = digest or cached_file_hash(database, path)
     hash_ms = (time.perf_counter() - hash_started) * 1000
     keywords = [word.strip() for word in config["keywords"] if word.strip()]
+    terms_signature = keyword_signature(keywords)
     transcript_key = hashlib.sha256(
         f"{TRANSCRIPTION_VERSION}|{digest}|{config['transcription_provider']}|{config['transcription_model']}".encode()).hexdigest()
     analysis_key = hashlib.sha256(
         f"{ANALYSIS_VERSION}|{transcript_key}|{config['analysis_provider']}|{config['analysis_model']}|"
-        f"{'|'.join(word.casefold() for word in keywords)}".encode()).hexdigest()
+        f"{terms_signature}".encode()).hexdigest()
     database.set_call_status(path, "TRANSFIRIENDO")
     transcription_started = time.perf_counter()
     transcript = database.cache_get("transcription_cache", transcript_key)
@@ -338,7 +345,7 @@ def analyze_file(database, path: Path, config: dict, digest: str | None = None):
         database.cache_set("analysis_cache", analysis_key, result)
     contextual_ms = (time.perf_counter() - contextual_started) * 1000
     persistence_started = time.perf_counter()
-    database.save_call_result(path, analysis_key, transcript, result)
+    database.save_call_result(path, analysis_key, terms_signature, transcript, result)
     persistence_ms = (time.perf_counter() - persistence_started) * 1000
     database.save_analysis_timing(path, {
         "hash_ms": hash_ms,

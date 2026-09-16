@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import sqlite3
 from types import SimpleNamespace
 import tempfile
 import threading
@@ -301,6 +300,48 @@ class AnalysisUiTests(unittest.TestCase):
                     [row["status"] for row in window.database.call_rows()],
                     ["COMPLETADO", "COMPLETADO"],
                 )
+            finally:
+                window.media_player.stop()
+                window.media_player.setSource(QUrl())
+                window.close()
+                self.app.processEvents()
+
+    def test_completed_call_is_reanalyzed_when_keywords_change(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            path = folder / "llamada.wav"
+            audio(path)
+            window = SentryWindow(folder / "audit.db")
+            updated = {
+                **ALERT,
+                "summary": "El cliente menciona un posible fraude.",
+                "validated_keywords": ["fraude"],
+                "hits": [{"keyword": "fraude", "speaker": "Cliente", "second": 5,
+                          "snippet": "Reportaré este fraude.", "validated": True}],
+            }
+            try:
+                window._finish_scan(folder)
+                window.transcription_api_key.setText("transcripcion-ficticia")
+                window.analysis_api_key.setText("analisis-ficticia")
+                with patch("app.services.audio_analysis.transcribe", return_value=TRANSCRIPT) as transcription, \
+                     patch("app.services.audio_analysis.contextual_analysis",
+                           side_effect=[ALERT, updated]) as analysis:
+                    window.analyze_button.click()
+                    self.wait(window)
+                    first_terms = window.call_records[0].analysis_terms
+
+                    window.keywords_input.setText(window.keywords_input.text() + ", fraude")
+                    window.analyze_button.click()
+                    self.wait(window)
+                    second_terms = window.call_records[0].analysis_terms
+
+                    window.analyze_button.click()
+
+                self.assertEqual(transcription.call_count, 1)
+                self.assertEqual(analysis.call_count, 2)
+                self.assertNotEqual(first_terms, second_terms)
+                self.assertEqual(window.call_records[0].tags, ("fraude",))
+                self.assertIsNone(window.analysis_worker)
             finally:
                 window.media_player.stop()
                 window.media_player.setSource(QUrl())
