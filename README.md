@@ -223,6 +223,7 @@ Las pruebas utilizan archivos y bases temporales y no deben modificar la informa
 | `SentryInstaller.iss` | Configuración de Inno Setup |
 | `ARQUITECTURA.md` | Diseño técnico y flujo de procesamiento |
 | `SPECS.md` | Reglas funcionales y de producto |
+| `LICENSE` | Licencia propietaria y condiciones de uso |
 
 ## Seguridad y confidencialidad
 
@@ -231,3 +232,11 @@ Sentry es software de uso interno exclusivo de Ecuaconexión. Configura las cred
 Para reportar un problema o proponer una mejora, abre un [Issue](https://github.com/jacksonandresrosales/Sentry/issues) sin incluir claves, grabaciones, teléfonos completos ni transcripciones de clientes.
 
 Software desarrollado para uso interno de Ecuaconexión.
+
+## Licencia y propiedad
+
+Sentry es software propietario desarrollado por **Jackson Ocaña** y **Jeremy Godoy** para **Ecuaconexión**.
+
+Queda prohibido utilizar, copiar, modificar, distribuir, sublicenciar o comercializar este software, total o parcialmente, fuera de Ecuaconexión sin autorización previa y por escrito de sus titulares. La publicación del código en GitHub no concede derechos de uso externo ni lo convierte en software de código abierto.
+
+Consulta todos los términos en [`LICENSE`](LICENSE).

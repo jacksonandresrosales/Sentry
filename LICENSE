@@ -1,0 +1,37 @@
+LICENCIA PROPIETARIA DE SENTRY
+
+Copyright (c) 2026 Jackson Ocaña y Jeremy Godoy.
+Todos los derechos reservados.
+
+1. TITULARIDAD
+
+Sentry, su código fuente, interfaz, documentación, recursos visuales y demás componentes son propiedad de sus autores y están destinados al uso interno de Ecuaconexión.
+
+2. USO AUTORIZADO
+
+Ecuaconexión y las personas expresamente autorizadas por ella pueden ejecutar y utilizar Sentry para sus operaciones internas de auditoría de llamadas. El uso autorizado no transfiere la propiedad del software.
+
+3. RESTRICCIONES
+
+Sin autorización previa y por escrito de los titulares, queda prohibido:
+
+- utilizar Sentry fuera de Ecuaconexión;
+- copiar, publicar, redistribuir o sublicenciar el software;
+- modificar, adaptar o crear trabajos derivados;
+- vender, alquilar, ofrecer como servicio o explotar comercialmente el software;
+- retirar avisos de propiedad, autoría o derechos reservados;
+- compartir el código, instaladores o recursos con terceros.
+
+4. INFORMACIÓN CONFIDENCIAL
+
+Las grabaciones, transcripciones, bases de clientes, credenciales, reportes y cualquier dato procesado por Sentry son confidenciales y deben mantenerse bajo los controles de acceso de Ecuaconexión. No deben publicarse ni compartirse fuera de la organización.
+
+5. AUTORIZACIONES ADICIONALES
+
+Cualquier permiso que no esté expresamente concedido en esta licencia requiere autorización escrita de los titulares.
+
+6. SIN GARANTÍA
+
+Sentry se distribuye para uso interno y en estado beta. Se proporciona "tal cual", sin garantías expresas o implícitas en la medida permitida por la legislación aplicable.
+
+Si existe una contradicción entre este archivo y una autorización escrita posterior, prevalece la autorización posterior para el alcance que indique.
