@@ -1,56 +1,67 @@
-﻿# 🛡️ Sentry (Centinela) - Auditoría Inteligente de Llamadas
+# Sentry
 
-Aplicación de escritorio para la auditoría, transcripción y análisis automatizado de llamadas grabadas en el NAS empresarial, con detección de palabras clave críticas (*"demanda"*, *"abogado"*, *"quejas"*), análisis de sentimiento y alertas en tiempo real.
+Sentry es una aplicación de escritorio para Windows orientada a la auditoría de llamadas. Centraliza la búsqueda de grabaciones, la transcripción, el análisis contextual, la revisión de evidencias y la generación de reportes.
 
----
+La aplicación relaciona grabaciones con bases de clientes mediante teléfono y fecha, identifica palabras o frases sensibles y clasifica cada llamada como alerta, buzón o llamada normal.
 
-## 🚀 Stack Tecnológico
-* **Interfaz de Escritorio:** PySide6 (Qt 6)
-* **Transcripción (STT):** Deepgram Nova-3 u OpenAI GPT-4o Transcribe Diarize
-* **Inteligencia y Resúmenes (LLM):** Google Gemini Flash-Lite u OpenAI
-* **Base de Datos:** SQLite 3
+Versión actual: `0.1.0-beta.1`
 
----
+## Funcionalidades principales
 
-## 📚 Documentación de Arquitectura
-Para consultar el diseño detallado del sistema, el flujo de procesamiento, el esquema de base de datos y el análisis de costos, revisa el archivo:
-👉 **[ARQUITECTURA.md](ARQUITECTURA.md)**
+- Búsqueda de grabaciones en carpetas locales, unidades NAS e Issabel mediante SFTP.
+- Asociación de audios con clientes por número telefónico y fecha.
+- Transcripción mediante Deepgram u OpenAI.
+- Análisis contextual mediante Google Gemini u OpenAI.
+- Clasificación de llamadas en alertas, buzones y llamadas normales.
+- Identificación visual de términos sensibles y fragmentos de evidencia.
+- Reproducción sincronizada con la transcripción.
+- Verificación manual de denuncias detectadas.
+- Transformación y consolidación de bases CSV y Excel.
+- Historial persistente de llamadas, bases procesadas y resultados.
+- Reportes por día, semana o mes con exportación a Excel.
+- Temas claro y oscuro.
 
----
+## Requisitos del sistema
 
-## Transformación de bases de llamadas
+### Aplicación instalada
 
-El script [scripts/transformar_base.py](scripts/transformar_base.py) convierte bases CSV o Excel al formato NO, con clasificación de cédula/RUC y consolidación sin teléfonos repetidos. Consulta instalación, uso y reglas en [scripts/README.md](scripts/README.md).
+- Windows 10 u 11 de 64 bits.
+- Acceso a Internet para los servicios de transcripción y análisis.
+- Credenciales válidas para los proveedores de inteligencia artificial seleccionados.
+- Acceso de red al NAS o servidor Issabel cuando corresponda.
 
-En Windows, haz doble clic en `DB_delete.cmd` para abrir la mini aplicación, cargar tu base y abrir el resultado o la carpeta de salida.
+El instalador incluye Python, Qt, WinSCP y las dependencias necesarias para ejecutar la aplicación.
 
-La funcionalidad también está integrada en Sentry: abre `Sentry.vbs` y pulsa **Bases**, en el header junto al directorio. Permite cargar una o varias bases, consolidarlas, elegir carpeta, configurar V/R y número de base, usar opciones avanzadas y abrir el Excel o su carpeta. Conserva el modelo NO y la numeración sin sobrescrituras. El procesamiento trabaja en segundo plano y el historial permanece al reiniciar. Al terminar, **Usar base para buscar audios** toma teléfono y fecha de `Hoja1`: solo incorpora WAV/MP3 `q-<cola>-<teléfono>-<AAAAMMDD>-...` cuando coinciden ambos valores. La selección también puede hacerse desde una ejecución del historial y se conserva entre sesiones.
+### Entorno de desarrollo
 
-## Base de datos local
+- Python 3.10 o superior.
+- Dependencias incluidas en `requirements.txt`.
+- Inno Setup 6 para construir el instalador de Windows.
 
-En desarrollo se crea en `data/db/sentry_audit.db`; la aplicación instalada usa `%LOCALAPPDATA%\Ecuaconexion\Sentry\data\db\sentry_audit.db`, fuera de la carpeta protegida del programa. Incluye `calls`, `keyword_hits`, `app_settings`, `base_jobs`, `base_records` y la configuración única `remote_connection`. Guarda los audios detectados, ajustes no secretos, ejecuciones y registros únicos procesados; mantiene teléfonos y documentos como texto. La aplicación inicia sin llamadas ficticias y recupera los análisis reales guardados. Las claves API y la contraseña SFTP se almacenan cifradas mediante DPAPI.
+## Instalación recomendada
 
-Para preparar el esquema sin abrir la interfaz:
+Descarga el instalador más reciente desde la sección [Releases](https://github.com/jacksonandresrosales/Sentry/releases) del repositorio y ejecútalo.
+
+El instalador:
+
+- instala Sentry en la ubicación seleccionada;
+- crea accesos directos en el menú Inicio y, opcionalmente, en el escritorio;
+- incorpora una base de datos inicial vacía;
+- conserva los datos del usuario fuera de la carpeta protegida del programa.
+
+Cada equipo debe configurar sus propias claves API y credenciales de conexión desde la pantalla **Configuración**.
+
+## Ejecución desde el código fuente
+
+En Windows, puede utilizarse el instalador de desarrollo incluido:
 
 ```powershell
-python -m app.database
+.\Instalar_Sentry.cmd
 ```
 
-La base SQLite y los Excel de `outputs` son privados y no se suben a Git. Contienen información sensible: deben guardarse en un equipo y carpetas con acceso restringido. El SQLite no está cifrado; no sustituye los controles de acceso del equipo. Para respaldarlo, cierra Sentry y copia la base SQLite indicada arriba, además de los Excel si quieres conservarlos.
+Este comando crea un entorno virtual, instala las dependencias e inicializa el esquema local. Después puede iniciarse la aplicación con `Sentry.vbs`, que evita mostrar una ventana de consola.
 
-## 🔒 Confidencialidad
-
-Software desarrollado para uso interno exclusivo de la empresa. Todos los derechos reservados.
-
----
-
-## Ejecutar la interfaz de escritorio
-
-Sentry está preparado para Windows 10/11 y requiere Python 3.10 o superior. En un equipo nuevo, descarga el repositorio y haz doble clic en `Instalar_Sentry.cmd`: crea un entorno aislado, instala las dependencias e inicializa la base SQLite. Después se abre normalmente con `Sentry.vbs`, que evita mostrar una consola de comandos. `Sentry.cmd` se conserva como acceso compatible y delega en el mismo lanzador silencioso.
-
-Para buscar en carpetas locales o NAS no hace falta instalar otro componente. La conexión con Issabel requiere [WinSCP](https://winscp.net/eng/download.php) con `WinSCPnet.dll`; se admite la instalación para todos los usuarios y la instalación local. Cada equipo debe introducir sus propias credenciales y claves API desde **Configuración**, ya que se cifran con el usuario de Windows y nunca se distribuyen mediante Git.
-
-Instalación manual equivalente:
+La instalación manual equivalente es:
 
 ```powershell
 python -m venv .venv
@@ -59,40 +70,153 @@ python -m pip install -r requirements.txt
 python -m app.main
 ```
 
-## Construir el instalador EXE
+## Configuración de servicios
 
-El ejecutable incluye Python, Qt, WinSCP y una base SQLite nueva con el esquema vigente, sin llamadas, bases procesadas, configuración ni credenciales de la PC de construcción. Instala una vez las dependencias de construcción y ejecuta el generador:
+Sentry permite seleccionar de forma independiente el proveedor de transcripción y el proveedor de análisis contextual.
+
+Las credenciales pueden introducirse desde la interfaz o suministrarse mediante variables de entorno:
+
+| Servicio | Variables admitidas |
+| --- | --- |
+| Deepgram | `DEEPGRAM_API_KEY` |
+| Google Gemini | `GEMINI_API_KEY`, `GOOGLE_API_KEY` |
+| OpenAI | `OPENAI_API_KEY` |
+
+También pueden definirse `SENTRY_TRANSCRIPTION_PROVIDER`, `SENTRY_TRANSCRIPTION_MODEL`, `SENTRY_ANALYSIS_PROVIDER` y `SENTRY_ANALYSIS_MODEL` para seleccionar proveedores y modelos al iniciar.
+
+Las claves guardadas desde la interfaz se protegen mediante DPAPI y sólo pueden descifrarse con el mismo usuario de Windows.
+
+## Fuentes de grabaciones
+
+### Carpeta local o NAS
+
+Sentry recorre la ruta configurada en segundo plano. Cuando detecta una estructura por fecha, accede directamente a las carpetas de año, mes y día requeridas por la base activa.
+
+### Issabel mediante SFTP
+
+La configuración solicita dirección del servidor, usuario, contraseña, ruta remota y huella SSH. La ruta recomendada es:
+
+```text
+/var/spool/asterisk/monitor/
+```
+
+La búsqueda limita el recorrido a las fechas y teléfonos de la base activa. Sólo descarga las coincidencias y conserva una copia local para búsquedas posteriores. Los archivos originales del servidor no se modifican ni eliminan.
+
+La contraseña SFTP se entrega a WinSCP mediante una variable de entorno temporal; no se incluye en los argumentos del proceso ni en los registros de Sentry.
+
+## Bases de clientes
+
+La herramienta **Bases** permite cargar uno o varios archivos CSV o Excel, consolidar registros, eliminar teléfonos duplicados y generar el formato de trabajo utilizado por Sentry.
+
+También puede utilizarse el conversor independiente:
+
+```powershell
+python scripts\transformar_base.py archivo.xlsx
+```
+
+La documentación específica del conversor se encuentra en [scripts/README.md](scripts/README.md).
+
+Al seleccionar **Usar base para buscar audios**, Sentry toma el teléfono y la fecha de `Hoja1`. Los archivos con nombres compatibles, como `q-<cola>-<teléfono>-<AAAAMMDD>-...`, se incorporan únicamente cuando ambos datos coinciden.
+
+## Análisis y reutilización de resultados
+
+Sentry procesa hasta tres audios en paralelo y guarda cada resultado al finalizar. Las cachés de transcripción y análisis se administran por separado para reducir tiempo y consumo de API.
+
+Cuando el usuario agrega o modifica palabras y frases clave, las llamadas completadas vuelven a evaluarse con la configuración actual. La transcripción existente se reutiliza, por lo que no se solicita nuevamente al proveedor si el audio no cambió.
+
+La aplicación también conserva una huella SHA-256, el tamaño y la fecha de modificación de cada archivo. Si el contenido no cambió, evita volver a leer y transcribir el audio innecesariamente.
+
+## Datos y almacenamiento
+
+Durante el desarrollo, la base SQLite se guarda en:
+
+```text
+data/db/sentry_audit.db
+```
+
+En una instalación de Windows se guarda en:
+
+```text
+%LOCALAPPDATA%\Ecuaconexion\Sentry\data\db\sentry_audit.db
+```
+
+La base registra llamadas, términos detectados, transcripciones, análisis, configuraciones, trabajos de transformación y relaciones con bases de clientes.
+
+Los siguientes elementos se excluyen del repositorio porque pueden contener información sensible:
+
+- bases SQLite locales;
+- archivos de audio;
+- reportes y archivos Excel generados;
+- variables de entorno y credenciales.
+
+Para preparar el esquema sin abrir la interfaz:
+
+```powershell
+python -m app.database
+```
+
+Para realizar un respaldo, cierre Sentry y copie la base SQLite y los reportes que desee conservar. SQLite no está cifrado; la protección del equipo y los permisos del sistema de archivos continúan siendo necesarios.
+
+## Construcción del instalador
+
+Instale las dependencias de construcción:
 
 ```powershell
 python -m pip install -r requirements-build.txt
 winget install --id JRSoftware.InnoSetup --exact
+```
+
+Después ejecute:
+
+```powershell
 .\Construir_EXE.cmd
 ```
 
-El resultado se llama `dist\Sentry_Setup_<versión>.exe`; el nombre, los metadatos y el panel de instalación toman automáticamente la misma versión indicada en `app/about.py`. El instalador crea los accesos directos y coloca la aplicación con todas sus DLL; los datos se guardan en `%LOCALAPPDATA%\Ecuaconexion\Sentry`. La nueva instalación comienza vacía y solicita sus propias claves y datos de conexión.
+El resultado se genera en:
 
-En **Configuración → Directorio de grabaciones** se elige **Carpeta local**, **NAS / carpeta compartida** o **Issabel / SFTP**. Local y NAS buscan en la ruta elegida y, cuando existe una estructura por fecha, entran directamente en `año/mes/día`. Issabel filtra primero en el servidor por las fechas y teléfonos de la base, descarga únicamente las coincidencias a `data/remote_audio` y reutiliza esas copias en búsquedas posteriores. Los archivos originales del servidor nunca se eliminan. **Analizar** transcribe los audios resultantes y los separa en **Demandas / alertas**, **Buzones** y **Llamadas normales**. A la derecha de **Llamadas detectadas** se puede filtrar por clasificación y ordenar por prioridad de términos, duración, fecha, nombre u orden original. La diarización distingue las voces y Sentry usa localmente expresiones habituales de atención para rotularlas como **Asesor** y **Cliente**, sin una consulta adicional a la IA. Cada palabra o frase configurada que aparezca se añade como etiqueta visible y buscable en la llamada.
+```text
+dist\Sentry_Setup_<versión>.exe
+```
 
-Los recorridos de carpetas locales y NAS se ejecutan en segundo plano para mantener la ventana disponible. La cola crea visualmente solo las filas necesarias conforme se desplaza, SQLite agrupa la lectura de llamadas y etiquetas, y la reproducción actualiza únicamente la línea activa de la transcripción. Sentry también conserva la huella de cada archivo junto con su tamaño y fecha de modificación: si el audio no cambió, evita volver a leerlo completo antes de consultar las cachés.
+La versión, el nombre del instalador y sus metadatos se obtienen de `app/about.py`. El proceso de construcción crea una base nueva con el esquema vigente y comprueba que no contenga llamadas, configuraciones ni credenciales del equipo de desarrollo.
 
-La transcripción acompaña la reproducción y desplaza automáticamente la línea activa. Cuando el proveedor entrega tiempos por palabra, el texto progresa con esas marcas exactas; los análisis anteriores usan una interpolación local sin consumir nuevamente la API. También se puede pulsar cualquier bloque para mover el audio a ese segundo, y **Ir al momento** centra tanto la evidencia escrita como el audio.
+## Pruebas y validación
 
-Se guarda cada llamada apenas termina; al reiniciar se recuperan lista, transcripción, resumen, categoría, etiquetas, evidencias y estado de revisión. Los trabajos interrumpidos quedan marcados para reintentar.
-
-Para reducir tiempo y consumo, Sentry procesa hasta tres audios distintos en paralelo, reutiliza conexiones HTTP y agrupa por huella SHA-256: dos copias del mismo audio consumen una sola transcripción. **Analizar** toma llamadas pendientes, con error o cuyo análisis no incluya la lista actual de palabras y frases clave. Al agregar términos, las llamadas completadas se vuelven a evaluar reutilizando su transcripción, sin consumir otra transcripción del mismo audio. Las cachés separadas de transcripción y análisis evitan nuevas llamadas a las APIs cuando coinciden audio, modelos y términos, y SQLite conserva tiempos por etapa para diagnosticar futuras demoras. Si no hay términos sensibles, la clasificación normal se hace localmente y no consume la API contextual; esta solo recibe fragmentos cercanos a posibles coincidencias. Un audio sin conversación o con un único hablante detectado se clasifica como buzón.
-
-Las alertas detectadas por términos sensibles aparecen como denuncias automáticas. El botón **Marcar como verificada** confirma o revierte esa clasificación manual sin perderla al cerrar la aplicación. Desde **Exportar Excel** se pueden generar archivos de denuncias automáticas pendientes, denuncias verificadas, todas las denuncias o toda la base activa. La salida contiene únicamente número de celular, nombre del cliente, ID y estado; las denuncias se resaltan en rojo y los demás registros en verde.
-
-En **Configuración** se cambian proveedor, modelo y claves. **Validar** comprueba la credencial y carga modelos. Al guardar ajustes, al validar o al cerrar Sentry, las claves se cifran mediante la protección DPAPI de Windows y se almacenan en SQLite; no quedan en texto plano y solo el mismo usuario de Windows puede recuperarlas. También pueden suministrarse mediante `DEEPGRAM_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY` u `OPENAI_API_KEY`.
-
-En **Configuración → Apariencia** se puede alternar inmediatamente entre el tema claro y **Oscuro · Zinc / Noche**. La selección queda guardada para el siguiente inicio y Sentry mantiene una paleta propia, independiente del modo de Windows.
-
-En esa misma vista, **Servidor de grabaciones (WinSCP / SFTP)** solicita únicamente los mismos datos del inicio de sesión habitual: IP, usuario y contraseña. La raíz recomendada es `/var/spool/asterisk/monitor/`, sin fijar el año. **Conectar servidor** utiliza el puerto SFTP estándar 22, obtiene la huella SSH, comprueba el acceso a la carpeta inicial y guarda la contraseña cifrada para el usuario actual de Windows. Tras conectarse, **Buscar audios en Issabel** admite un teléfono o parte del nombre; con una base activa limita la consulta a sus carpetas de fecha en `/var/spool/asterisk/monitor/<año>/<mes>/<día>/`, evitando recorrer el año completo y cambiando de año automáticamente según `Hoja1`. La contraseña viaja al proceso local de WinSCP mediante una variable de entorno temporal, nunca como argumento de consola ni dentro de los registros de Sentry.
-
-La transformación de bases y su Excel siguen disponibles desde **Bases**. Reportes consulta exclusivamente el historial global de SQLite, independientemente del directorio activo. Permite elegir un día, una semana (lunes a domingo) o un mes calendario y una fecha de referencia. Muestra llamadas analizadas, incidentes, denuncias verificadas, bases, actividad diaria y palabras frecuentes; incluye registros y exportación a Excel. Un incidente es una llamada clasificada como alerta. Cada llamada cuenta una vez según su último análisis, en hora local; no es un historial de cada reintento. La relación llamada/base se registra a partir de esta versión y no se infiere para registros anteriores. Las bases preparadas se presentan por separado de las bases con llamadas analizadas. Si el período no contiene registros, Reportes muestra un estado vacío. Las tablas muestran hasta 500 filas y el Excel exporta todas.
-
-Pruebas automatizadas con archivos y bases temporales:
+Ejecute la suite completa con:
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+Validación estática utilizada por el proyecto:
+
+```powershell
+python -m ruff check app scripts tests --select F
+python -m compileall -q app scripts
+```
+
+Las pruebas trabajan con archivos y bases temporales; no deben modificar la base local del usuario.
+
+## Estructura del proyecto
+
+| Ruta | Contenido |
+| --- | --- |
+| `app/` | Aplicación, interfaz, persistencia y servicios |
+| `app/ui/assets/` | Iconos, fuentes y recursos visuales |
+| `scripts/` | Conversión de bases y construcción del instalador |
+| `tests/` | Pruebas unitarias y de integración |
+| `Sentry.spec` | Configuración de PyInstaller |
+| `SentryInstaller.iss` | Configuración de Inno Setup |
+| `ARQUITECTURA.md` | Diseño técnico y flujo de procesamiento |
+
+## Seguridad y confidencialidad
+
+Sentry está diseñado para uso interno y puede procesar grabaciones, teléfonos, identificadores y transcripciones. El acceso al equipo, a la base de datos y a las carpetas de salida debe limitarse al personal autorizado.
+
+Las credenciales no deben añadirse al repositorio ni incluirse en archivos distribuidos. Antes de publicar una versión deben ejecutarse las pruebas, comprobarse que la base incorporada esté vacía y verificarse el instalador en una instalación limpia.
+
+## Estado del proyecto
+
+La versión actual es beta. Se recomienda validar el instalador y los proveedores configurados en un entorno controlado antes de utilizarlo en producción.
+
+Software desarrollado para uso interno de Ecuaconexión.
