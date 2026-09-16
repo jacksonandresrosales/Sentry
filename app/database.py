@@ -79,6 +79,12 @@ CREATE TABLE IF NOT EXISTS base_records (
     UNIQUE(job_id, row_number)
 );
 CREATE INDEX IF NOT EXISTS idx_base_records_job ON base_records(job_id);
+CREATE TABLE IF NOT EXISTS call_bases (
+    call_id INTEGER NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+    base_path TEXT NOT NULL,
+    analyzed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(call_id, base_path)
+);
 """
 
 
@@ -277,6 +283,14 @@ class Database:
         with self.connect() as connection:
             connection.execute("UPDATE calls SET reviewed=? WHERE file_path=?",
                                (int(reviewed), str(Path(file_path).resolve())))
+
+    def record_analysis_base(self, call_id: int, base_path: str):
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT INTO call_bases(call_id,base_path) VALUES (?,?) "
+                "ON CONFLICT(call_id,base_path) DO UPDATE SET analyzed_at=CURRENT_TIMESTAMP",
+                (call_id, str(Path(base_path).resolve())),
+            )
 
     def start_job(self, paths, options) -> int:
         with self.connect() as connection:

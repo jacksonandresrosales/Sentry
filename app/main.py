@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import sqlite3
 from pathlib import Path
+from app.about import APP_NAME, APP_VERSION
 
 def main() -> int:
     try:
@@ -18,7 +19,8 @@ def main() -> int:
         raise
 
     app = QApplication(sys.argv)
-    app.setApplicationName("Sentry")
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName("Ecuaconexión")
     icon_path = Path(__file__).resolve().parent / "ui" / "assets" / "sentry-app-icon.ico"
     window_icon = QIcon(str(icon_path))

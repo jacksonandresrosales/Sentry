@@ -65,15 +65,14 @@ class SentryWindowSmokeTest(unittest.TestCase):
     def test_filters_selection_and_evidence_jump(self) -> None:
         self.assertEqual(self.window.call_list.count(), 0)
         self.assertEqual(self.window.detail_pages.currentIndex(), 0)
-        self.assertEqual(self.window.report_total_value.text(), "0")
+        self.assertIsNone(self.window.reports_page.result)
         self.assertEqual(len(self.window.sort_button.menu().actions()), 7)
         self.assertFalse(self.window.play_button.isEnabled())
         self.assertFalse(self.window.original_button.isEnabled())
         self.assertEqual(self.window.status_filter.parentWidget().objectName(), "sectionHeader")
 
         self._load_sample_calls()
-        self.assertEqual(self.window.report_total_value.text(), "4")
-        self.assertEqual(self.window.report_sensitive_value.text(), "2")
+        self.assertIsNone(self.window.reports_page.result)  # Reports read SQLite, not the visible queue.
         self.window.status_filter.setCurrentIndex(1)
         visible = sum(
             not self.window.call_list.item(row).isHidden()

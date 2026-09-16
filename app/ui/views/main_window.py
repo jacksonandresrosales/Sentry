@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 import sqlite3
 
 from app.database import Database, DEFAULT_DATABASE
+from app.about import APP_NAME, APP_VERSION, APP_AUTHORS, APP_DESCRIPTION, APP_FEATURES
 from app.secret_store import SecretStoreError, protect, unprotect
 from app.services.audio_analysis import analyze_file, assign_roles
 from app.services.base_conversion import BaseAudioIndex, load_hoja1_audio_index, normalize_phone_number
@@ -24,6 +25,7 @@ from app.ui.theme import (
     theme_options,
 )
 from app.ui.views.bases_page import BasesPage
+from app.ui.views.reports_page import ReportsPage
 
 from PySide6.QtCore import (
     QByteArray, QEasingCurve, QPoint, QRectF, QSize, Qt, QThread, QTimer, QUrl,
@@ -36,6 +38,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -373,6 +376,8 @@ class AnalysisWorker(QThread):
                 break
             try:
                 row = analyze_file(self.database, Path(path), self.config)
+                if self.config.get("base_path"):
+                    self.database.record_analysis_base(row["id"], self.config["base_path"])
             except Exception as exc:
                 try:
                     self.database.set_call_status(path, "ERROR", str(exc))
@@ -1461,60 +1466,8 @@ class SentryWindow(QMainWindow):
         return actions
 
     def _build_reports_page(self) -> QWidget:
-        page = QWidget()
-        page.setObjectName("reportsPage")
-        outer = QVBoxLayout(page)
-        outer.setContentsMargins(28, 24, 28, 28)
-        outer.setSpacing(18)
-
-        title_row = QHBoxLayout()
-        titles = QVBoxLayout()
-        title = QLabel("Reportes y estadísticas")
-        title.setObjectName("pageTitle")
-        subtitle = QLabel("Resumen del directorio seleccionado")
-        subtitle.setObjectName("pageSubtitle")
-        titles.addWidget(title)
-        titles.addWidget(subtitle)
-        title_row.addLayout(titles)
-        title_row.addStretch()
-        self.report_download = QPushButton("Descargar informe")
-        self.report_download.setObjectName("primaryButton")
-        self.report_download.setEnabled(False)
-        self.report_download.clicked.connect(lambda: self._show_toast("La descarga se conectará en la etapa de reportes"))
-        title_row.addWidget(self.report_download)
-        outer.addLayout(title_row)
-
-        metrics = QHBoxLayout()
-        metrics.setSpacing(12)
-        metrics.addWidget(self._report_metric("report_total_value", "Llamadas encontradas", "Archivos del directorio"))
-        metrics.addWidget(self._report_metric("report_sensitive_value", "Alertas sensibles", "Términos detectados", True))
-        metrics.addWidget(self._report_metric("report_normal_value", "Llamadas normales", "Análisis completados"))
-        outer.addLayout(metrics)
-
-        self.report_empty = QLabel("Escanea una carpeta para generar estadísticas reales.")
-        self.report_empty.setObjectName("emptyReport")
-        self.report_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.report_empty.setMinimumHeight(180)
-        outer.addWidget(self.report_empty)
-        outer.addStretch()
-        return page
-
-    def _report_metric(self, attribute: str, label: str, note: str, accent: bool = False) -> QWidget:
-        frame = QFrame()
-        frame.setObjectName("reportMetricAccent" if accent else "reportMetric")
-        layout = QVBoxLayout(frame)
-        layout.setContentsMargins(18, 16, 18, 16)
-        number = QLabel("0")
-        number.setObjectName("reportValueAccent" if accent else "reportValue")
-        setattr(self, attribute, number)
-        caption = QLabel(label)
-        caption.setObjectName("reportLabel")
-        hint = QLabel(note)
-        hint.setObjectName("mutedLabel")
-        layout.addWidget(number)
-        layout.addWidget(caption)
-        layout.addWidget(hint)
-        return frame
+        self.reports_page = ReportsPage(self.database, self)
+        return self.reports_page
 
     def _build_config_page(self) -> QWidget:
         scroll = QScrollArea()
@@ -1533,7 +1486,14 @@ class SentryWindow(QMainWindow):
         title.setObjectName("pageTitle")
         subtitle = QLabel("Define grabaciones, términos sensibles y servicios de IA")
         subtitle.setObjectName("pageSubtitle")
-        outer.addWidget(title)
+        heading = QHBoxLayout()
+        heading.addWidget(title)
+        heading.addStretch()
+        about_link = QPushButton("Acerca de Sentry")
+        about_link.setObjectName("secondaryButton")
+        about_link.clicked.connect(self._show_about)
+        heading.addWidget(about_link)
+        outer.addLayout(heading)
         outer.addWidget(subtitle)
 
         appearance = QFrame()
@@ -1850,9 +1810,93 @@ class SentryWindow(QMainWindow):
         save.clicked.connect(self._save_settings)
         save_row.addWidget(save)
         outer.addLayout(save_row)
+
         outer.addStretch()
         scroll.setWidget(page)
         return scroll
+
+    def _show_about(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Acerca de {APP_NAME}")
+        dialog.setObjectName("aboutDialog")
+        dialog.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        colors = theme_colors(self.theme)
+        dialog.setStyleSheet(f"""
+            QDialog#aboutDialog {{ background: {colors['panel']}; }}
+            QWidget#aboutContent {{ background: {colors['panel']}; }}
+            QLabel#aboutName {{ font-size: 28px; font-weight: 600; color: {colors['text']}; }}
+            QLabel#aboutVersion {{ color: {colors['green_accessible']}; background: {colors['green_soft']};
+                border-radius: 5px; padding: 5px 10px; font-weight: 600; }}
+            QFrame#aboutDivider {{ background: {colors['border']}; border: none; }}
+        """)
+        outer = QVBoxLayout(dialog)
+        outer.setContentsMargins(28, 24, 28, 24)
+        outer.setSpacing(20)
+        header = QHBoxLayout()
+        header.setSpacing(14)
+        icon = QLabel()
+        icon.setPixmap(QPixmap(str(Path(__file__).resolve().parents[1] / "assets" / "sentry-app-icon.png"))
+                       .scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        header.addWidget(icon)
+        name = QLabel(APP_NAME)
+        name.setObjectName("aboutName")
+        header.addWidget(name)
+        header.addStretch()
+        version = QLabel(f"v{APP_VERSION}")
+        version.setObjectName("aboutVersion")
+        header.addWidget(version)
+        outer.addLayout(header)
+
+        content = QWidget()
+        content.setObjectName("aboutContent")
+        body = QVBoxLayout(content)
+        body.setContentsMargins(0, 0, 8, 0)
+        body.setSpacing(16)
+        description = QLabel(APP_DESCRIPTION)
+        description.setObjectName("pageSubtitle")
+        description.setWordWrap(True)
+        body.addWidget(description)
+        authors = QLabel(f"Diseño y desarrollo<br><b>{html.escape(APP_AUTHORS)}</b>")
+        authors.setWordWrap(True)
+        authors.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        body.addWidget(authors)
+        divider = QFrame()
+        divider.setObjectName("aboutDivider")
+        divider.setFixedHeight(1)
+        body.addWidget(divider)
+        section = QLabel("Funcionalidades de esta versión")
+        section.setObjectName("formTitle")
+        body.addWidget(section)
+        for heading, description in APP_FEATURES:
+            group = QVBoxLayout()
+            group.setSpacing(4)
+            title = QLabel(heading)
+            title.setObjectName("apiGroupTitle")
+            title.setWordWrap(True)
+            detail = QLabel(description)
+            detail.setObjectName("pageSubtitle")
+            detail.setWordWrap(True)
+            group.addWidget(title)
+            group.addWidget(detail)
+            body.addLayout(group)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
+        footer = QHBoxLayout()
+        footer.addStretch()
+        close = QPushButton("Cerrar")
+        close.setObjectName("primaryButton")
+        close.setDefault(True)
+        close.clicked.connect(dialog.accept)
+        footer.addWidget(close)
+        outer.addLayout(footer)
+        available = self.screen().availableGeometry()
+        dialog.resize(min(620, available.width() - 40), min(650, available.height() - 60))
+        dialog.move(available.center() - dialog.rect().center())
+        dialog.exec()
 
     def _add_api_fields(
         self,
@@ -2334,6 +2378,8 @@ class SentryWindow(QMainWindow):
     def _switch_page(self, key: str) -> None:
         page_index = {"audit": 0, "reports": 1, "config": 2, "bases": 3}[key]
         self.pages.setCurrentIndex(page_index)
+        if key == "reports":
+            self.reports_page.refresh()
         for name, button in self.nav_buttons.items():
             button.setChecked(name == key)
 
@@ -3029,12 +3075,6 @@ class SentryWindow(QMainWindow):
         self.mailbox_metric.setText(str(counts["BUZON"]))
         self.normal_metric.setText(str(counts["NORMAL"]))
         self.normal_metric_label.setText("Normales")
-        if hasattr(self, "report_total_value"):
-            self.report_total_value.setText(str(len(self.call_records)))
-            self.report_sensitive_value.setText(str(counts["ALERTA"]))
-            self.report_normal_value.setText(str(counts["NORMAL"]))
-            self.report_empty.setVisible(not self.call_records)
-            self.report_download.setEnabled(bool(self.call_records))
         pending = sum(call.category_code in {"PENDIENTE", "ERROR", ""} for call in self.call_records)
         current = self.status_filter.currentData()
         labels = {
@@ -3092,6 +3132,7 @@ class SentryWindow(QMainWindow):
             self._show_toast(str(exc))
             self._switch_page("config")
             return
+        config["base_path"] = str(self.active_base_path) if self.active_base_path else ""
         self.analysis_worker = AnalysisWorker(self.database, paths, config, self)
         self.analysis_worker.progress.connect(self._analysis_progress)
         self.analysis_worker.row_ready.connect(self._analysis_row_ready)
@@ -3287,6 +3328,8 @@ class SentryWindow(QMainWindow):
         self._position_toast()
 
     def closeEvent(self, event) -> None:
+        if self.reports_page.worker is not None:
+            self.reports_page.worker.wait()
         if self.local_scan_worker is not None:
             self._show_toast("Espera a que termine el escaneo local o del NAS antes de cerrar Sentry")
             event.ignore()
@@ -3660,6 +3703,54 @@ class SentryWindow(QMainWindow):
                 background: {PALETTE['panel']};
                 border: 1px solid {PALETTE['border']};
                 border-radius: 10px;
+            }}
+            QFrame#reportToolbar, QFrame#reportSection {{
+                background: {PALETTE['panel']};
+                border: 1px solid {PALETTE['border']};
+                border-radius: 10px;
+            }}
+            QLabel#reportNotice {{
+                color: {PALETTE['text_soft']};
+                background: {PALETTE['surface']};
+                border: 1px solid {PALETTE['border']};
+                border-radius: 7px;
+                padding: 9px 12px;
+                font-weight: 550;
+            }}
+            QLabel#reportNotice[demo="true"] {{
+                color: {PALETTE['green_accessible']};
+                background: {PALETTE['green_soft']};
+                border-color: {PALETTE['nav_checked_border']};
+            }}
+            QTabWidget#reportTabs::pane {{
+                background: {PALETTE['panel']};
+                border: 1px solid {PALETTE['border']};
+                top: -1px;
+            }}
+            QTabWidget#reportTabs QTabBar::tab {{
+                background: {PALETTE['surface']};
+                color: {PALETTE['muted']};
+                border: 1px solid {PALETTE['border']};
+                padding: 8px 13px;
+                margin-right: 3px;
+            }}
+            QTabWidget#reportTabs QTabBar::tab:selected {{
+                background: {PALETTE['panel']};
+                color: {PALETTE['green_accessible']};
+                border-bottom-color: {PALETTE['panel']};
+                font-weight: 600;
+            }}
+            QTableWidget#reportTable {{
+                border: none;
+                gridline-color: transparent;
+            }}
+            QTableWidget#reportTable::item {{
+                padding: 7px 9px;
+                border-bottom: 1px solid {PALETTE['border']};
+            }}
+            QTableWidget#reportTable::item:hover {{
+                background: {PALETTE['surface_hover']};
+                color: {PALETTE['text']};
             }}
             QFrame#reportMetricAccent {{ background: {PALETTE['panel']}; }}
             QLabel#reportValue, QLabel#reportValueAccent {{ color: {PALETTE['text']}; font-size: 28px; font-weight: 600; }}

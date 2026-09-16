@@ -9,7 +9,7 @@ DEFAULT_THEME = "light"
 THEMES: dict[str, dict[str, object]] = {
     "light": {
         "label": "Claro",
-        "description": "La Mesa de Revisión Clara",
+        "description": "",
         "colors": {
             "green_deep": "#27953c",
             "green_accessible": "#1f7830",
@@ -129,7 +129,7 @@ def theme_asset(theme_name: str | None, asset: str) -> str:
 
 def theme_options() -> tuple[tuple[str, str], ...]:
     return tuple(
-        (key, f"{value['label']} · {value['description']}")
+        (key, " · ".join(part for part in (value["label"], value["description"]) if part))
         for key, value in THEMES.items()
     )
 
