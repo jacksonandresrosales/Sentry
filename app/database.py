@@ -3,10 +3,19 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 import sqlite3
+import sys
 
-DEFAULT_DATABASE = Path(__file__).resolve().parents[1] / "data" / "db" / "sentry_audit.db"
+
+APP_STORAGE_ROOT = (
+    Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    / "Ecuaconexion" / "Sentry"
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parents[1]
+)
+DEFAULT_DATABASE = APP_STORAGE_ROOT / "data" / "db" / "sentry_audit.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls (
@@ -50,6 +59,14 @@ CREATE TABLE IF NOT EXISTS transcription_cache (
 CREATE TABLE IF NOT EXISTS analysis_cache (
     cache_key TEXT PRIMARY KEY, result_json TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS analysis_timings (
+    call_id INTEGER PRIMARY KEY REFERENCES calls(id) ON DELETE CASCADE,
+    hash_ms REAL NOT NULL, transcription_ms REAL NOT NULL,
+    contextual_ms REAL NOT NULL, persistence_ms REAL NOT NULL, total_ms REAL NOT NULL,
+    transcription_cached INTEGER NOT NULL CHECK(transcription_cached IN (0,1)),
+    analysis_cached INTEGER NOT NULL CHECK(analysis_cached IN (0,1)),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS file_fingerprints (
     file_path TEXT PRIMARY KEY,
@@ -96,7 +113,7 @@ class Database:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=NORMAL")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version > 4:
+            if version > 5:
                 raise RuntimeError("La base de datos pertenece a una versión más nueva de Sentry.")
             connection.executescript(SCHEMA)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(calls)")}
@@ -114,7 +131,7 @@ class Database:
             connection.execute("UPDATE calls SET status='ERROR', analysis_error="
                                "'El análisis fue interrumpido al cerrar la aplicación.' "
                                "WHERE status IN ('TRANSFIRIENDO','ANALIZANDO')")
-            connection.execute("PRAGMA user_version=4")
+            connection.execute("PRAGMA user_version=5")
 
     @contextmanager
     def connect(self):
@@ -277,6 +294,26 @@ class Database:
                 (transcript.get("text", ""), json.dumps(transcript, ensure_ascii=False),
                  result.get("summary", ""), result.get("sentiment", "NEUTRAL"), result.get("risk", "BAJO"),
                  int(category == "ALERTA"), category, cache_key, call_id),
+            )
+
+    def save_analysis_timing(self, file_path, metrics: dict) -> None:
+        path = str(Path(file_path).resolve())
+        with self.connect() as connection:
+            row = connection.execute("SELECT id FROM calls WHERE file_path=?", (path,)).fetchone()
+            if row is None:
+                return
+            connection.execute(
+                "INSERT INTO analysis_timings(call_id,hash_ms,transcription_ms,contextual_ms,"
+                "persistence_ms,total_ms,transcription_cached,analysis_cached) VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(call_id) DO UPDATE SET hash_ms=excluded.hash_ms,"
+                "transcription_ms=excluded.transcription_ms,contextual_ms=excluded.contextual_ms,"
+                "persistence_ms=excluded.persistence_ms,total_ms=excluded.total_ms,"
+                "transcription_cached=excluded.transcription_cached,analysis_cached=excluded.analysis_cached,"
+                "updated_at=CURRENT_TIMESTAMP",
+                (row[0], float(metrics["hash_ms"]), float(metrics["transcription_ms"]),
+                 float(metrics["contextual_ms"]), float(metrics["persistence_ms"]),
+                 float(metrics["total_ms"]), int(bool(metrics["transcription_cached"])),
+                 int(bool(metrics["analysis_cached"]))),
             )
 
     def set_reviewed(self, file_path, reviewed=True):

@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 from types import SimpleNamespace
 import tempfile
+import threading
 import time
 import unittest
 import wave
@@ -110,11 +111,13 @@ class AnalysisPersistenceTests(unittest.TestCase):
             self.assertEqual(_gemini_analysis("texto", ["demanda"], "k", "gemini-3.5-flash-lite"), result)
             generation = request.call_args.kwargs["json"]["generationConfig"]
             self.assertEqual(generation["temperature"], 0)
+            self.assertEqual(generation["maxOutputTokens"], 160)
             self.assertEqual(generation["responseJsonSchema"], RESULT_SCHEMA)
             self.assertNotIn("responseSchema", generation)
         with patch("app.services.audio_analysis._request", return_value=openai) as request:
             self.assertEqual(_openai_analysis("texto", ["demanda"], "k", "gpt-4o-mini"), result)
             self.assertEqual(request.call_args.kwargs["json"]["response_format"]["type"], "json_schema")
+            self.assertEqual(request.call_args.kwargs["json"]["max_completion_tokens"], 160)
 
     def test_openai_diarization_requests_speaker_segments(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -150,6 +153,11 @@ class AnalysisPersistenceTests(unittest.TestCase):
             reopened = Database(database.path).call_rows([path])[0]
             self.assertEqual(reopened["transcript"], TRANSCRIPT["text"])
             self.assertEqual(reopened["summary"], ALERT["summary"])
+            with database.connect() as connection:
+                timing = dict(connection.execute("SELECT * FROM analysis_timings").fetchone())
+            self.assertEqual(timing["transcription_cached"], 1)
+            self.assertEqual(timing["analysis_cached"], 1)
+            self.assertGreaterEqual(timing["total_ms"], 0)
 
     def test_failed_contextual_analysis_reuses_saved_transcription_on_retry(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -267,6 +275,72 @@ class AnalysisUiTests(unittest.TestCase):
                 reopened.media_player.stop()
                 reopened.media_player.setSource(QUrl())
                 reopened.close()
+                self.app.processEvents()
+
+    def test_analysis_deduplicates_content_and_skips_completed_calls(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            first = folder / "primera.wav"
+            second = folder / "segunda.wav"
+            audio(first)
+            second.write_bytes(first.read_bytes())
+            window = SentryWindow(folder / "audit.db")
+            try:
+                window._finish_scan(folder)
+                window.transcription_api_key.setText("transcripcion-ficticia")
+                window.analysis_api_key.setText("analisis-ficticia")
+                with patch("app.services.audio_analysis.transcribe", return_value=TRANSCRIPT) as transcription, \
+                     patch("app.services.audio_analysis.contextual_analysis", return_value=ALERT) as analysis:
+                    window.analyze_button.click()
+                    self.wait(window)
+                    window.analyze_button.click()
+                self.assertEqual(transcription.call_count, 1)
+                self.assertEqual(analysis.call_count, 1)
+                self.assertIsNone(window.analysis_worker)
+                self.assertEqual(
+                    [row["status"] for row in window.database.call_rows()],
+                    ["COMPLETADO", "COMPLETADO"],
+                )
+            finally:
+                window.media_player.stop()
+                window.media_player.setSource(QUrl())
+                window.close()
+                self.app.processEvents()
+
+    def test_analysis_processes_distinct_audios_concurrently(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            for index in range(3):
+                path = folder / f"llamada-{index}.wav"
+                audio(path)
+                path.write_bytes(path.read_bytes() + bytes([index]))
+            window = SentryWindow(folder / "audit.db")
+            active = peak = 0
+            lock = threading.Lock()
+
+            def slow_transcription(*_args, **_kwargs):
+                nonlocal active, peak
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                time.sleep(0.08)
+                with lock:
+                    active -= 1
+                return TRANSCRIPT
+
+            try:
+                window._finish_scan(folder)
+                window.transcription_api_key.setText("transcripcion-ficticia")
+                window.analysis_api_key.setText("analisis-ficticia")
+                with patch("app.services.audio_analysis.transcribe", side_effect=slow_transcription), \
+                     patch("app.services.audio_analysis.contextual_analysis", return_value=ALERT):
+                    window.analyze_button.click()
+                    self.wait(window)
+                self.assertGreaterEqual(peak, 2)
+            finally:
+                window.media_player.stop()
+                window.media_player.setSource(QUrl())
+                window.close()
                 self.app.processEvents()
 
 

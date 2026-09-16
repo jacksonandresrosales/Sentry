@@ -6,15 +6,16 @@ import os
 import re
 import wave
 from bisect import bisect_right
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 import sqlite3
 
-from app.database import Database, DEFAULT_DATABASE
+from app.database import APP_STORAGE_ROOT, Database, DEFAULT_DATABASE
 from app.about import APP_NAME, APP_VERSION, APP_AUTHORS, APP_DESCRIPTION, APP_FEATURES
 from app.secret_store import SecretStoreError, protect, unprotect
-from app.services.audio_analysis import analyze_file, assign_roles
+from app.services.audio_analysis import analyze_file, assign_roles, cached_file_hash
 from app.services.base_conversion import BaseAudioIndex, load_hoja1_audio_index, normalize_phone_number
 from app.services.report_export import EXPORT_MODE_LABELS, export_audit_excel
 from app.services.winscp_client import (
@@ -140,17 +141,34 @@ def scan_audio_files(
 
 def issabel_directories(remote_root: str, dates: set[str]) -> list[str]:
     root = PurePosixPath(remote_root or "/var/spool/asterisk/monitor")
+    if (
+        re.fullmatch(r"20\d{2}", root.parent.parent.name)
+        and re.fullmatch(r"0[1-9]|1[0-2]", root.parent.name)
+        and re.fullmatch(r"0[1-9]|[12]\d|3[01]", root.name)
+    ):
+        root = root.parent.parent.parent
+    elif (
+        re.fullmatch(r"20\d{2}", root.parent.name)
+        and re.fullmatch(r"0[1-9]|1[0-2]", root.name)
+    ):
+        root = root.parent.parent
+    elif re.fullmatch(r"20\d{2}", root.name):
+        root = root.parent
     directories = []
     for value in sorted(dates):
         if not re.fullmatch(r"20\d{6}", value):
             continue
         year, month, day = value[:4], value[4:6], value[6:8]
-        if re.fullmatch(r"20\d{2}", root.name):
-            base = root if root.name == year else root.parent / year
-        else:
-            base = root / year
-        directories.append(f"{base / month / day}/")
+        directories.append(f"{root / year / month / day}/")
     return directories
+
+
+def issabel_phone_variants(phones: set[str]) -> list[str]:
+    variants = set(phones)
+    for phone in phones:
+        if len(phone) == 10 and phone.startswith("0"):
+            variants.update((phone[1:], f"593{phone[1:]}"))
+    return sorted(variants)
 
 
 def dated_local_directories(root: Path, dates: set[str]) -> tuple[Path, ...]:
@@ -370,25 +388,78 @@ class AnalysisWorker(QThread):
         self._stop = True
 
     def run(self):
-        completed = failures = 0
-        for index, path in enumerate(self.paths, 1):
+        completed = failures = processed = 0
+        total = len(self.paths)
+        groups: dict[str, list[Path]] = {}
+        for raw_path in self.paths:
             if self._stop:
                 break
+            path = Path(raw_path)
             try:
-                row = analyze_file(self.database, Path(path), self.config)
-                if self.config.get("base_path"):
-                    self.database.record_analysis_base(row["id"], self.config["base_path"])
+                digest = cached_file_hash(self.database, path)
             except Exception as exc:
                 try:
                     self.database.set_call_status(path, "ERROR", str(exc))
                 except Exception:
                     pass
                 failures += 1
-            else:
-                completed += 1
-                self.row_ready.emit(row)
-            finally:
-                self.progress.emit(index, len(self.paths), Path(path).name)
+                processed += 1
+                self.progress.emit(processed, total, path.name)
+                continue
+            groups.setdefault(digest, []).append(path)
+
+        work = iter(groups.items())
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="sentry-analysis") as pool:
+            pending = {}
+
+            def fill_workers() -> None:
+                while not self._stop and len(pending) < 3:
+                    try:
+                        digest, paths = next(work)
+                    except StopIteration:
+                        break
+                    pending[pool.submit(analyze_file, self.database, paths[0], self.config, digest)] = (
+                        digest, paths
+                    )
+
+            fill_workers()
+            while pending:
+                done, _remaining = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    digest, paths = pending.pop(future)
+                    try:
+                        rows = [future.result()]
+                    except Exception as exc:
+                        rows = []
+                        for path in paths:
+                            try:
+                                self.database.set_call_status(path, "ERROR", str(exc))
+                            except Exception:
+                                pass
+                            failures += 1
+                            processed += 1
+                            self.progress.emit(processed, total, path.name)
+                    else:
+                        if not self._stop:
+                            for path in paths[1:]:
+                                try:
+                                    rows.append(analyze_file(self.database, path, self.config, digest))
+                                except Exception as exc:
+                                    try:
+                                        self.database.set_call_status(path, "ERROR", str(exc))
+                                    except Exception:
+                                        pass
+                                    failures += 1
+                                    processed += 1
+                                    self.progress.emit(processed, total, path.name)
+                        for row in rows:
+                            if self.config.get("base_path"):
+                                self.database.record_analysis_base(row["id"], self.config["base_path"])
+                            completed += 1
+                            processed += 1
+                            self.row_ready.emit(row)
+                            self.progress.emit(processed, total, row["filename"])
+                fill_workers()
         self.completed.emit(completed, failures, self._stop)
 
 
@@ -516,7 +587,7 @@ class IssabelMatchWorker(QThread):
             request = dict(self.config)
             request["remote_paths"] = directories
             request["recursive"] = False
-            request["phones"] = sorted(self.index.phones)
+            request["phones"] = issabel_phone_variants(self.index.phones)
             candidates = search_remote_audio(request, "q-", limit=5000)
             matches = []
             for item in candidates:
@@ -2910,12 +2981,9 @@ class SentryWindow(QMainWindow):
         self._start_local_scan(directory, source=source)
 
     def _set_scan_busy(self, busy: bool, message: str = "") -> None:
-        self.scan_button.setEnabled(not busy)
         self.analyze_button.setEnabled(not busy)
         self.audio_source.setEnabled(not busy)
-        if busy:
-            self.scan_button.setToolTip(message or "Escaneando audios en segundo plano…")
-        else:
+        if not busy:
             self._source_changed()
 
     def _start_local_scan(
@@ -2968,7 +3036,8 @@ class SentryWindow(QMainWindow):
             self._show_toast("La base activa no contiene fechas válidas en Hoja1")
             return
         base_name = re.sub(r"[^A-Za-z0-9._-]+", "_", self.active_base_path.stem)[:80]
-        destination = Path(__file__).resolve().parents[3] / "data" / "remote_audio" / base_name
+        base_name = re.sub(r"_\d+$", "", base_name)
+        destination = APP_STORAGE_ROOT / "data" / "remote_audio" / base_name
         self._set_scan_busy(True, "Buscando por teléfono y fecha en Issabel…")
         self._show_toast(
             f"Issabel: revisando {len(self.active_base_index.dates)} carpeta(s) de fecha, no todo el año"
@@ -3028,8 +3097,6 @@ class SentryWindow(QMainWindow):
                 "source": self._source_key(),
             })
             return
-        self.scan_button.setEnabled(True)
-        self.scan_button.setToolTip("Escanear carpeta")
         self._show_toast(message)
 
     def _apply_scan_result(self, result: dict) -> None:
@@ -3121,9 +3188,12 @@ class SentryWindow(QMainWindow):
             self.analyze_button.setText("Deteniendo…")
             self.analyze_button.setAccessibleName("Deteniendo análisis")
             return
-        paths = [call.source_path for call in self.call_records if call.source_path is not None]
+        paths = [
+            call.source_path for call in self.call_records
+            if call.source_path is not None and call.category_code in {"PENDIENTE", "ERROR"}
+        ]
         if not paths:
-            self._show_toast("Escanea primero una carpeta con audios")
+            self._show_toast("No hay llamadas pendientes de análisis")
             return
         try:
             config = self._analysis_config()

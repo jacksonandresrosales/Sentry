@@ -19,7 +19,8 @@ from app.secret_store import unprotect
 from app.ui.theme import apply_app_theme
 from app.ui.views.main_window import (
     CallRecord, SentryWindow, TranscriptLine, audio_filename_metadata, audio_phone_from_filename, call_record_from_audio,
-    call_record_from_row, dated_local_directories, install_ui_font, issabel_directories, scan_audio_files,
+    call_record_from_row, dated_local_directories, install_ui_font, issabel_directories,
+    issabel_phone_variants, scan_audio_files,
 )
 
 
@@ -324,6 +325,18 @@ class SentryWindowSmokeTest(unittest.TestCase):
             issabel_directories("/var/spool/asterisk/monitor/2026/", {"20270102"}),
             ["/var/spool/asterisk/monitor/2027/01/02/"],
         )
+        self.assertEqual(
+            issabel_directories("/var/spool/asterisk/monitor/2026/07/06/", {"20260707"}),
+            ["/var/spool/asterisk/monitor/2026/07/07/"],
+        )
+        self.assertEqual(
+            issabel_directories("/var/spool/asterisk/monitor/2026/07/", {"20260801"}),
+            ["/var/spool/asterisk/monitor/2026/08/01/"],
+        )
+        self.assertEqual(
+            issabel_phone_variants({"0990000001"}),
+            ["0990000001", "593990000001", "990000001"],
+        )
         self.assertEqual(self.window.remote_path.text(), "/var/spool/asterisk/monitor/")
         self.assertEqual(self.window.audio_source.count(), 3)
         self.assertEqual(
@@ -398,6 +411,15 @@ class SentryWindowSmokeTest(unittest.TestCase):
         with patch.object(self.window, "_start_local_scan") as start:
             self.window._scan_directory()
         start.assert_called_once_with(Path(self.temp.name), source="local")
+
+    def test_scan_state_does_not_depend_on_removed_refresh_button(self) -> None:
+        self.assertFalse(hasattr(self.window, "scan_button"))
+
+        self.window._set_scan_busy(True, "Buscando en Issabel")
+
+        self.assertFalse(self.window.analyze_button.isEnabled())
+        self.assertFalse(self.window.audio_source.isEnabled())
+        self.window._set_scan_busy(False)
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QPushButton, QScrollArea, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from app.database import Database
+from app.database import APP_STORAGE_ROOT, Database
 from app.services.base_conversion import BaseAudioIndex, load_hoja1_audio_index, process_bases
 from scripts.transformar_base import BaseError, DEFAULT_STATE, default_output, normalize_base_number
 
@@ -86,7 +86,7 @@ class BasesPage(QWidget):
         fields.setHorizontalSpacing(12)
         fields.setVerticalSpacing(10)
         self.output_folder = QLineEdit(database.settings().get(
-            "base_output_folder", str(Path(__file__).resolve().parents[3] / "outputs")))
+            "base_output_folder", str(APP_STORAGE_ROOT / "outputs")))
         self.folder_button = self.button("Examinar…", self.choose_folder)
         folder_label = QLabel("Carpeta de resultados")
         folder_label.setBuddy(self.output_folder)

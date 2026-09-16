@@ -28,7 +28,7 @@ La funcionalidad también está integrada en Sentry: abre `Sentry.cmd` y pulsa *
 
 ## Base de datos local
 
-Se crea automáticamente en `data/db/sentry_audit.db`. Incluye `calls`, `keyword_hits`, `app_settings`, `base_jobs`, `base_records` y la configuración única `remote_connection`. Guarda los audios detectados, ajustes no secretos, ejecuciones y registros únicos procesados; mantiene teléfonos y documentos como texto. La aplicación inicia sin llamadas ficticias y recupera los análisis reales guardados. Las claves API y la contraseña SFTP se almacenan cifradas mediante DPAPI.
+En desarrollo se crea en `data/db/sentry_audit.db`; el ejecutable usa `%LOCALAPPDATA%\Ecuaconexion\Sentry\data\db\sentry_audit.db` para que Windows no elimine los datos al cerrar. Incluye `calls`, `keyword_hits`, `app_settings`, `base_jobs`, `base_records` y la configuración única `remote_connection`. Guarda los audios detectados, ajustes no secretos, ejecuciones y registros únicos procesados; mantiene teléfonos y documentos como texto. La aplicación inicia sin llamadas ficticias y recupera los análisis reales guardados. Las claves API y la contraseña SFTP se almacenan cifradas mediante DPAPI.
 
 Para preparar el esquema sin abrir la interfaz:
 
@@ -36,7 +36,7 @@ Para preparar el esquema sin abrir la interfaz:
 python -m app.database
 ```
 
-La base SQLite y los Excel de `outputs` son privados y no se suben a Git. Contienen información sensible: deben guardarse en un equipo y carpetas con acceso restringido. El SQLite no está cifrado; no sustituye los controles de acceso del equipo. Para respaldarlo, cierra Sentry y copia `data/db/sentry_audit.db`, además de los Excel si quieres conservarlos.
+La base SQLite y los Excel de `outputs` son privados y no se suben a Git. Contienen información sensible: deben guardarse en un equipo y carpetas con acceso restringido. El SQLite no está cifrado; no sustituye los controles de acceso del equipo. Para respaldarlo, cierra Sentry y copia la base SQLite indicada arriba, además de los Excel si quieres conservarlos.
 
 ## 🔒 Confidencialidad
 
@@ -67,7 +67,7 @@ La transcripción acompaña la reproducción y desplaza automáticamente la lín
 
 Se guarda cada llamada apenas termina; al reiniciar se recuperan lista, transcripción, resumen, categoría, etiquetas, evidencias y estado de revisión. Los trabajos interrumpidos quedan marcados para reintentar.
 
-Para reducir consumo, Sentry calcula una huella SHA-256 y conserva cachés separadas de transcripción y análisis: repetir el botón con el mismo audio, modelos y términos no vuelve a llamar a las APIs. Si no hay términos sensibles, la clasificación normal se hace localmente y no consume la API contextual; esta solo recibe fragmentos cercanos a posibles coincidencias. Un audio sin conversación o con un único hablante detectado se clasifica como buzón.
+Para reducir tiempo y consumo, Sentry procesa hasta tres audios distintos en paralelo, reutiliza conexiones HTTP y agrupa por huella SHA-256: dos copias del mismo audio consumen una sola transcripción. **Analizar** toma únicamente llamadas pendientes o con error; las completadas no vuelven a entrar en la cola. Las cachés separadas de transcripción y análisis evitan nuevas llamadas a las APIs cuando coinciden audio, modelos y términos, y SQLite conserva tiempos por etapa para diagnosticar futuras demoras. Si no hay términos sensibles, la clasificación normal se hace localmente y no consume la API contextual; esta solo recibe fragmentos cercanos a posibles coincidencias. Un audio sin conversación o con un único hablante detectado se clasifica como buzón.
 
 Las alertas detectadas por términos sensibles aparecen como denuncias automáticas. El botón **Marcar como verificada** confirma o revierte esa clasificación manual sin perderla al cerrar la aplicación. Desde **Exportar Excel** se pueden generar archivos de denuncias automáticas pendientes, denuncias verificadas, todas las denuncias o toda la base activa. La salida contiene únicamente número de celular, nombre del cliente, ID y estado; las denuncias se resaltan en rojo y los demás registros en verde.
 

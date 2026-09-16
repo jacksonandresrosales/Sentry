@@ -6,6 +6,7 @@ import json
 import mimetypes
 from pathlib import Path
 import re
+import threading
 import time
 import unicodedata
 from urllib.parse import quote
@@ -15,6 +16,7 @@ import requests
 
 TRANSCRIPTION_VERSION = "2"
 ANALYSIS_VERSION = "3"
+_HTTP = threading.local()
 
 
 class AnalysisError(RuntimeError):
@@ -27,6 +29,16 @@ def file_hash(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def cached_file_hash(database, path: Path) -> str:
+    path = Path(path).resolve(strict=True)
+    stat = path.stat()
+    digest = database.cached_file_digest(path, stat.st_size, stat.st_mtime_ns)
+    if digest is None:
+        digest = file_hash(path)
+        database.save_file_digest(path, stat.st_size, stat.st_mtime_ns, digest)
+    return digest
 
 
 def _request(method, url, *, retries=3, **kwargs):
@@ -44,7 +56,10 @@ def _request(method, url, *, retries=3, **kwargs):
                         stream.seek(0)
                         break
         try:
-            response = requests.request(method, url, timeout=(15, 300), **kwargs)
+            session = getattr(_HTTP, "session", None)
+            if session is None:
+                session = _HTTP.session = requests.Session()
+            response = session.request(method, url, timeout=(15, 300), **kwargs)
         except requests.RequestException as exc:
             last = exc
             if attempt + 1 == retries:
@@ -231,7 +246,7 @@ def _gemini_analysis(text: str, keywords: list[str], key: str, model: str):
     payload = _request("POST", f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model)}:generateContent",
                        headers={"x-goog-api-key": key, "Content-Type": "application/json"},
                        json={"contents": [{"parts": [{"text": _prompt(text, keywords)}]}],
-                             "generationConfig": {"temperature": 0, "maxOutputTokens": 450,
+                             "generationConfig": {"temperature": 0, "maxOutputTokens": 160,
                                                    "responseMimeType": "application/json",
                                                    "responseJsonSchema": RESULT_SCHEMA}})
     try:
@@ -245,7 +260,7 @@ def _openai_analysis(text: str, keywords: list[str], key: str, model: str):
     payload = _request("POST", "https://api.openai.com/v1/chat/completions",
                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                        json={"model": model, "messages": [{"role": "user", "content": _prompt(text, keywords)}],
-                             "temperature": 0, "max_completion_tokens": 450,
+                             "temperature": 0, "max_completion_tokens": 160,
                              "response_format": {"type": "json_schema", "json_schema": {
                                  "name": "clasificacion_llamada", "strict": True, "schema": RESULT_SCHEMA}}})
     try:
@@ -291,13 +306,12 @@ def contextual_analysis(transcript, keywords: list[str], provider: str, key: str
     return result
 
 
-def analyze_file(database, path: Path, config: dict):
+def analyze_file(database, path: Path, config: dict, digest: str | None = None):
+    started = time.perf_counter()
     path = Path(path).resolve(strict=True)
-    stat = path.stat()
-    digest = database.cached_file_digest(path, stat.st_size, stat.st_mtime_ns)
-    if digest is None:
-        digest = file_hash(path)
-        database.save_file_digest(path, stat.st_size, stat.st_mtime_ns, digest)
+    hash_started = time.perf_counter()
+    digest = digest or cached_file_hash(database, path)
+    hash_ms = (time.perf_counter() - hash_started) * 1000
     keywords = [word.strip() for word in config["keywords"] if word.strip()]
     transcript_key = hashlib.sha256(
         f"{TRANSCRIPTION_VERSION}|{digest}|{config['transcription_provider']}|{config['transcription_model']}".encode()).hexdigest()
@@ -305,19 +319,36 @@ def analyze_file(database, path: Path, config: dict):
         f"{ANALYSIS_VERSION}|{transcript_key}|{config['analysis_provider']}|{config['analysis_model']}|"
         f"{'|'.join(word.casefold() for word in keywords)}".encode()).hexdigest()
     database.set_call_status(path, "TRANSFIRIENDO")
+    transcription_started = time.perf_counter()
     transcript = database.cache_get("transcription_cache", transcript_key)
+    transcription_cached = transcript is not None
     if transcript is None:
         transcript = transcribe(path, config["transcription_provider"], config["transcription_key"],
                                 config["transcription_model"], keywords)
         database.cache_set("transcription_cache", transcript_key, transcript)
+    transcription_ms = (time.perf_counter() - transcription_started) * 1000
     transcript = assign_roles(transcript)
     database.set_call_status(path, "ANALIZANDO")
+    contextual_started = time.perf_counter()
     result = database.cache_get("analysis_cache", analysis_key)
+    analysis_cached = result is not None
     if result is None:
         result = contextual_analysis(transcript, keywords, config["analysis_provider"],
                                      config["analysis_key"], config["analysis_model"])
         database.cache_set("analysis_cache", analysis_key, result)
+    contextual_ms = (time.perf_counter() - contextual_started) * 1000
+    persistence_started = time.perf_counter()
     database.save_call_result(path, analysis_key, transcript, result)
+    persistence_ms = (time.perf_counter() - persistence_started) * 1000
+    database.save_analysis_timing(path, {
+        "hash_ms": hash_ms,
+        "transcription_ms": transcription_ms,
+        "contextual_ms": contextual_ms,
+        "persistence_ms": persistence_ms,
+        "total_ms": (time.perf_counter() - started) * 1000,
+        "transcription_cached": transcription_cached,
+        "analysis_cached": analysis_cached,
+    })
     return database.call_rows([path])[0]
 
 

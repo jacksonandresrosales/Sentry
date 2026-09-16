@@ -79,8 +79,12 @@ try {
                 [WinSCP.EnumerationOptions]::AllDirectories
             } else { [WinSCP.EnumerationOptions]0 }
             $found = New-Object System.Collections.Generic.List[object]
+            $accessiblePathCount = 0
             :pathLoop foreach ($path in $paths) {
-                try { $files = $session.EnumerateRemoteFiles($path, "*", $enumeration) }
+                try {
+                    $files = $session.EnumerateRemoteFiles($path, "*", $enumeration)
+                    $accessiblePathCount++
+                }
                 catch { continue }
                 foreach ($file in $files) {
                     $phoneMatch = [string]::IsNullOrWhiteSpace($phonePattern) -or
@@ -100,6 +104,9 @@ try {
                         if ($found.Count -ge $limit) { break pathLoop }
                     }
                 }
+            }
+            if ($accessiblePathCount -eq 0 -and $paths.Count -gt 0) {
+                throw "No se pudo acceder a ninguna carpeta de fecha en Issabel. Revisa la carpeta remota configurada."
             }
             $resultArray = [object[]]$found
             ConvertTo-Json -InputObject $resultArray -Compress
