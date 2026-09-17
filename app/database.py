@@ -40,6 +40,12 @@ def _bundled_database() -> Path:
 
 DEFAULT_DATABASE = _bundled_database()
 
+
+def effective_call_category(category: str | None, reviewed: bool) -> str:
+    """La decisión humana prevalece sin sustituir la clasificación automática."""
+    return "ALERTA" if reviewed else category or "PENDIENTE"
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -263,6 +269,13 @@ class Database:
             return dict(row) if row else None
 
     def call_rows(self, paths=None):
+        """Devuelve categoría efectiva y conserva la automática como dato explícito.
+
+        `calls.category` es siempre el último resultado del análisis automático;
+        la verificación manual se guarda por separado en `reviewed`. Así un nuevo
+        análisis no borra la decisión del usuario y quitarla restaura el resultado
+        automático más reciente, sin migrar ni duplicar columnas persistentes.
+        """
         with self.connect() as connection:
             if paths is None:
                 result = [dict(row) for row in connection.execute("SELECT * FROM calls ORDER BY id")]
@@ -292,6 +305,8 @@ class Database:
                     hits_by_call[call_id].append(payload)
             for item in result:
                 item["hits"] = hits_by_call[item["id"]]
+                item["automatic_category"] = item["category"] or "PENDIENTE"
+                item["category"] = effective_call_category(item["category"], bool(item["reviewed"]))
             return result
 
     def call_paths(self) -> list[str]:
@@ -341,6 +356,7 @@ class Database:
                                (key, json.dumps(payload, ensure_ascii=False)))
 
     def save_call_result(self, file_path, cache_key: str, analysis_terms: str, transcript, result):
+        """Guarda la clasificación automática sin modificar una revisión manual."""
         path = str(Path(file_path).resolve())
         hits = result.get("hits", [])
         with self.connect() as connection:
@@ -386,9 +402,10 @@ class Database:
             )
 
     def set_reviewed(self, file_path, reviewed=True):
+        """Activa o retira la denuncia manual sin alterar resultados de la IA."""
         with self.connect() as connection:
             connection.execute("UPDATE calls SET reviewed=? WHERE file_path=?",
-                               (int(reviewed), str(Path(file_path).resolve())))
+                               (int(bool(reviewed)), str(Path(file_path).resolve())))
 
     def record_analysis_base(self, call_id: int, base_path: str):
         with self.connect() as connection:

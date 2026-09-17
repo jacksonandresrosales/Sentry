@@ -18,7 +18,7 @@ import requests
 
 
 TRANSCRIPTION_VERSION = "2"
-ANALYSIS_VERSION = "3"
+ANALYSIS_VERSION = "4"
 _HTTP = threading.local()
 _IN_FLIGHT: dict[tuple[str, str, str], Future] = {}
 _IN_FLIGHT_LOCK = threading.Lock()
@@ -369,12 +369,14 @@ def contextual_analysis(transcript, keywords: list[str], provider: str, key: str
     text = transcript.get("text", "").strip()
     word_count = len(re.findall(r"\w+", text, re.UNICODE))
     detected = detected_keyword_hits(transcript, keywords)
-    if word_count < 5 or transcript.get("speaker_count") == 1:
-        return {"category": "BUZON", "summary": "No se detectó una conversación entre cliente y asesor.",
-                "sentiment": "NEUTRAL", "risk": "BAJO", "validated_keywords": [], "hits": detected}
+    likely_mailbox = word_count < 5 or transcript.get("speaker_count") == 1
+    mailbox_result = {"category": "BUZON", "summary": "No se detectó una conversación entre cliente y asesor.",
+                      "sentiment": "NEUTRAL", "risk": "BAJO", "validated_keywords": [], "hits": detected}
     candidates = [hit["keyword"] for hit in detected]
     # Sin términos candidatos no se consume una segunda API.
     if not candidates:
+        if likely_mailbox:
+            return mailbox_result
         return {"category": "NORMAL", "summary": "Llamada sin términos sensibles detectados.",
                 "sentiment": "NEUTRAL", "risk": "BAJO", "validated_keywords": [], "hits": detected}
     excerpts = []
@@ -392,6 +394,10 @@ def contextual_analysis(transcript, keywords: list[str], provider: str, key: str
         raise AnalysisError(f"Proveedor de análisis no compatible: {provider}")
     if result.get("category") not in {"ALERTA", "NORMAL"}:
         raise AnalysisError("La API devolvió una categoría inválida.")
+    # Un solo hablante o una transcripción breve no descartan una amenaza real.
+    # Si el contexto no confirma riesgo, conserva la clasificación de buzón.
+    if likely_mailbox and result["category"] == "NORMAL":
+        return mailbox_result
     validated = {str(word).casefold() for word in result.get("validated_keywords", [])}
     accepted = validated or ({word.casefold() for word in candidates} if result["category"] == "ALERTA" else set())
     accepted_normalized = {_normalized(word) for word in accepted}

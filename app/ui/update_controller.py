@@ -184,6 +184,8 @@ class UpdatePanel(QFrame):
             self.status.setText(f"Disponible {self.release.version}. La instalación automática se usa desde el .exe instalado.")
         if self.closing or self.install_started:
             QTimer.singleShot(0, self.window.close)
+        else:
+            QTimer.singleShot(0, self.window._run_pending_keyword_reanalysis)
 
     def _work_is_active(self):
         return any(getattr(self.window, name, None) is not None for name in (

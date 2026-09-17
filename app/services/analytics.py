@@ -19,7 +19,9 @@ def load_report(database, start, end):
     args = (start.isoformat(), end.isoformat())
     with database.connect() as db:
         calls = [dict(r) for r in db.execute("""
-            SELECT id, filename, status, category, reviewed, duration_seconds,
+            SELECT id, filename, status,
+                   CASE WHEN reviewed <> 0 THEN 'ALERTA' ELSE category END AS category,
+                   category AS automatic_category, reviewed, duration_seconds,
                    datetime(COALESCE(processed_at,created_at),'localtime') AS occurred_at
             FROM calls WHERE date(COALESCE(processed_at,created_at),'localtime') >= ?
             AND date(COALESCE(processed_at,created_at),'localtime') < ?
@@ -30,11 +32,11 @@ def load_report(database, start, end):
             JOIN calls c ON c.id=h.call_id
             WHERE date(COALESCE(c.processed_at,c.created_at),'localtime') >= ?
             AND date(COALESCE(c.processed_at,c.created_at),'localtime') < ?
-            AND c.status='COMPLETADO'
+            AND (c.status='COMPLETADO' OR c.reviewed<>0)
         """, args)]
         bases = [dict(r) for r in db.execute("""
             SELECT b.base_path, COUNT(*) AS calls,
-                SUM(c.category='ALERTA') AS incidents,
+                SUM(c.category='ALERTA' OR c.reviewed<>0) AS incidents,
                 datetime(MAX(b.analyzed_at),'localtime') AS last_analysis
             FROM call_bases b JOIN calls c ON c.id=b.call_id
             WHERE date(b.analyzed_at,'localtime') >= ? AND date(b.analyzed_at,'localtime') < ?
@@ -51,7 +53,10 @@ def load_report(database, start, end):
 
 def summarize(calls, hits, bases, jobs, start, end):
     completed = [c for c in calls if c['status'] == 'COMPLETADO']
-    incidents = [c for c in completed if c['category'] == 'ALERTA']
+    # Una denuncia confirmada no desaparece si un reanálisis posterior falla.
+    # El estado técnico y la decisión humana se contabilizan por separado.
+    evaluated = [c for c in calls if c['status'] == 'COMPLETADO' or c['reviewed']]
+    incidents = [c for c in evaluated if c['category'] == 'ALERTA']
     keywords = Counter(h['keyword'].strip().casefold() for h in hits if h['keyword'].strip())
     keyword_calls = {}
     for hit in hits:
@@ -70,7 +75,7 @@ def summarize(calls, hits, bases, jobs, start, end):
         day += timedelta(days=1)
     return dict(calls=calls, bases=bases, jobs=jobs, daily=daily,
                 keywords=[(k,n,len(keyword_calls[k])) for k,n in keywords.most_common()],
-                total=len(calls), completed=len(completed), incidents=len(incidents),
+                total=len(calls), completed=len(completed), evaluated=len(evaluated), incidents=len(incidents),
                 verified=sum(bool(c['reviewed']) for c in incidents),
                 normal=sum(c['category']=='NORMAL' for c in completed),
                 mailbox=sum(c['category']=='BUZON' for c in completed),

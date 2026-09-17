@@ -6,7 +6,7 @@ import os
 import re
 import wave
 from bisect import bisect_left, bisect_right
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 import sqlite3
@@ -346,7 +346,9 @@ def collect_audio_records(
 
 def call_record_from_row(row: dict) -> CallRecord:
     category = row.get("category") or "PENDIENTE"
-    if row.get("status") == "ERROR":
+    if row.get("reviewed"):
+        category = "ALERTA"
+    elif row.get("status") == "ERROR":
         category = "ERROR"
     segments = []
     try:
@@ -927,6 +929,11 @@ class SentryWindow(QMainWindow):
         self.report_export_worker: ReportExportWorker | None = None
         self.close_after_analysis = False
         self.close_after_remote_scan = False
+        self._keyword_reanalysis_pending = False
+        self.keyword_reanalysis_timer = QTimer(self)
+        self.keyword_reanalysis_timer.setSingleShot(True)
+        self.keyword_reanalysis_timer.setInterval(1500)
+        self.keyword_reanalysis_timer.timeout.connect(self._commit_sensitive_terms)
 
         self.audio_output = QAudioOutput(self)
         self.audio_output.setVolume(1.0)
@@ -974,6 +981,13 @@ class SentryWindow(QMainWindow):
             self.call_list.setCurrentRow(0)
         else:
             self._show_empty_state()
+        # Connect only after restoring settings: opening Sentry never starts paid analysis.
+        self._committed_keyword_signature = keyword_signature(self.keywords_input.text().split(","))
+        self._committed_keywords_text = ", ".join(
+            word.strip() for word in self.keywords_input.text().split(",") if word.strip()
+        )
+        self.keywords_input.textEdited.connect(lambda _text: self.keyword_reanalysis_timer.start())
+        self.keywords_input.editingFinished.connect(self._commit_sensitive_terms)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -1566,7 +1580,10 @@ class SentryWindow(QMainWindow):
         actions = QHBoxLayout()
         self.reviewed_button = QPushButton("Marcar como verificada")
         self.reviewed_button.setObjectName("secondaryButton")
-        self.reviewed_button.setToolTip("Confirma manualmente una denuncia detectada por términos sensibles")
+        self.reviewed_button.setToolTip(
+            "Marca esta llamada como denuncia verificada, incluso si era normal o buzón. "
+            "Al quitar la verificación se recupera su última clasificación automática."
+        )
         self.reviewed_button.clicked.connect(self._mark_reviewed)
         self.original_button = QPushButton("Abrir audio original")
         self.original_button.setObjectName("linkButton")
@@ -1824,7 +1841,12 @@ class SentryWindow(QMainWindow):
         keywords_layout.setSpacing(8)
         keywords_title = QLabel("Términos sensibles")
         keywords_title.setObjectName("formTitle")
-        keywords_help = QLabel("Sepáralos con comas. Las coincidencias validadas se mostrarán en verde.")
+        keywords_help = QLabel(
+            "Sepáralos con comas. Al terminar de editar se vuelven a evaluar automáticamente "
+            "las llamadas ya analizadas, reutilizando sus transcripciones. "
+            "La validación contextual puede consumir API."
+        )
+        keywords_help.setWordWrap(True)
         keywords_help.setObjectName("pageSubtitle")
         self.keywords_input = QLineEdit("demanda, abogado, denuncia, queja, estafa")
         keywords_title.setBuddy(self.keywords_input)
@@ -2649,7 +2671,9 @@ class SentryWindow(QMainWindow):
         self.play_button.setEnabled(not locked and has_audio)
         self.original_button.setEnabled(not locked and has_audio)
         self.reviewed_button.setEnabled(
-            not locked and self.current_call is not None and self.current_call.sensitive
+            not locked and self.current_call is not None
+            and self.current_call.source_path is not None
+            and (self.current_call.reviewed or self.current_call.category_code in {"ALERTA", "NORMAL", "BUZON"})
         )
         self.jump_button.setEnabled(
             not locked and self.current_call is not None and self.current_call.hit_second is not None
@@ -2671,7 +2695,6 @@ class SentryWindow(QMainWindow):
         has_audio = source is not None and source.is_file()
         self.play_button.setEnabled(has_audio)
         self.original_button.setEnabled(has_audio)
-        self.reviewed_button.setEnabled(call.sensitive)
         self.reviewed_button.setText(
             "Quitar verificación" if call.reviewed else "Marcar como verificada"
         )
@@ -2682,6 +2705,7 @@ class SentryWindow(QMainWindow):
             f"Archivo: {call.filename}" + (f"\n{source}" if source is not None else "")
         )
         badge_text = ("Etiquetas: " + ", ".join(call.tags)) if call.tags else (
+            "Denuncia verificada manualmente" if call.reviewed else
             "Término sensible" if call.sensitive else "Sin alerta crítica")
         self.risk_badge.setText("Pendiente de análisis" if call.risk == "Pendiente" else badge_text)
         self.risk_badge.setProperty("sensitive", call.sensitive)
@@ -3050,6 +3074,7 @@ class SentryWindow(QMainWindow):
             return
         remote_note = " · WinSCP protegido" if remote_count else ""
         self._show_toast(f"Ajustes guardados · {api_count}/2 claves API protegidas{remote_note}")
+        self._commit_sensitive_terms()
 
     def _scan_directory(self) -> None:
         if self.active_base_path is None or not self.active_base_phones:
@@ -3079,6 +3104,7 @@ class SentryWindow(QMainWindow):
         if not busy:
             self.scan_cancel_button.hide()
             self._source_changed()
+            QTimer.singleShot(0, self._run_pending_keyword_reanalysis)
 
     def _show_scan_error(self, title: str, message: str) -> None:
         self.scan_status_label.setText(f"{title}: {message}")
@@ -3411,8 +3437,53 @@ class SentryWindow(QMainWindow):
             "analysis_key": analysis_key,
         }
 
-    def _start_analysis(self) -> None:
+    def _commit_sensitive_terms(self) -> None:
+        """Coalesce edits, persist just the terms and refresh already analyzed calls."""
+        self.keyword_reanalysis_timer.stop()
+        if self.close_after_analysis or self.close_after_remote_scan:
+            return
+        keywords = [word.strip() for word in self.keywords_input.text().split(",") if word.strip()]
+        if not keywords:
+            return
+        signature = keyword_signature(keywords)
+        terms_text = ", ".join(keywords)
+        if terms_text != self._committed_keywords_text:
+            try:
+                self.database.save_settings({"keywords": terms_text})
+            except (sqlite3.Error, OSError) as exc:
+                self._show_toast(f"No se pudieron guardar los términos sensibles: {exc}")
+                return
+            self._committed_keywords_text = terms_text
+        if signature != self._committed_keyword_signature:
+            self._committed_keyword_signature = signature
+            self._keyword_reanalysis_pending = True
+        # Let the current click (Save/Analyze/Close) finish before starting a worker.
+        QTimer.singleShot(0, self._run_pending_keyword_reanalysis)
+
+    def _run_pending_keyword_reanalysis(self) -> None:
+        if not self._keyword_reanalysis_pending or self.close_after_analysis or self.close_after_remote_scan:
+            return
+        if self.analysis_worker is not None or self.local_scan_worker is not None or self.issabel_match_worker is not None:
+            return
+        if self.pending_base_scan or self.updates_panel.closing or self.updates_panel.install_started:
+            return
+        if self.bases_page.busy:
+            if self.bases_page.worker is not None:
+                self.bases_page.worker.finished.connect(
+                    self._run_pending_keyword_reanalysis, Qt.ConnectionType.SingleShotConnection
+                )
+            return
+        if self.updates_panel.worker is not None and self.updates_panel.worker.mode == "backup":
+            return
+        self._start_analysis(automatic=True)
+
+    def _start_analysis(self, automatic: bool = False) -> None:
         if self.analysis_worker is not None:
+            if automatic:
+                self._keyword_reanalysis_pending = True
+                return
+            self.keyword_reanalysis_timer.stop()
+            self._keyword_reanalysis_pending = False
             self.analysis_worker.request_stop()
             self.analyze_button.setEnabled(False)
             self.analyze_button.setText("Deteniendo…")
@@ -3427,17 +3498,29 @@ class SentryWindow(QMainWindow):
                 call.category_code in {"PENDIENTE", "ERROR"}
                 or call.analysis_terms != terms_signature
             )
+            and (not automatic or (
+                call.analysis_terms != terms_signature
+                and (call.category_code in {"ALERTA", "NORMAL", "BUZON"} or bool(call.analysis_terms))
+            ))
         ]
         if not paths:
-            self._show_toast("No hay llamadas pendientes ni términos nuevos para analizar")
+            self._keyword_reanalysis_pending = False
+            if not automatic:
+                self._show_toast("No hay llamadas pendientes ni términos nuevos para analizar")
             return
         try:
             config = self._analysis_config()
             self._persist_credentials()
+            self.database.save_settings({"keywords": ", ".join(keywords)})
         except (ValueError, SecretStoreError, sqlite3.Error, OSError) as exc:
-            self._show_toast(str(exc))
-            self._switch_page("config")
+            self._show_toast(f"Reevaluación pendiente: {exc}" if automatic else str(exc))
+            if not automatic:
+                self._switch_page("config")
             return
+        self.keyword_reanalysis_timer.stop()
+        self._committed_keyword_signature = terms_signature
+        self._committed_keywords_text = ", ".join(keywords)
+        self._keyword_reanalysis_pending = False
         config["base_path"] = str(self.active_base_path) if self.active_base_path else ""
         self.analysis_worker = AnalysisWorker(self.database, paths, config, self)
         self.analysis_worker.progress.connect(self._analysis_progress)
@@ -3447,6 +3530,8 @@ class SentryWindow(QMainWindow):
         self.analyze_button.setToolTip(f"Analizando 0/{len(paths)} llamadas")
         self._set_analysis_controls_locked(True)
         self.analysis_worker.start()
+        if automatic:
+            self._show_toast(f"Actualizando {len(paths)} llamadas con los términos sensibles actuales…")
 
     def _analysis_progress(self, current: int, total: int, filename: str) -> None:
         self.analyze_button.set_progress(current, total)
@@ -3507,6 +3592,8 @@ class SentryWindow(QMainWindow):
         if self.close_after_analysis:
             self.close_after_analysis = False
             QTimer.singleShot(0, self.close)
+        elif not stopped:
+            QTimer.singleShot(0, self._run_pending_keyword_reanalysis)
 
     def _mark_reviewed(self) -> None:
         if self.analysis_worker is not None:
@@ -3514,16 +3601,18 @@ class SentryWindow(QMainWindow):
         if self.current_call is None or self.current_call.source_path is None:
             self._show_toast("Selecciona una llamada antes de marcarla")
             return
-        if not self.current_call.sensitive:
-            self._show_toast("Solo las denuncias automáticas pueden verificarse")
+        if not self.current_call.reviewed and self.current_call.category_code not in {"ALERTA", "NORMAL", "BUZON"}:
+            self._show_toast("Analiza la llamada antes de marcarla como denuncia verificada")
             return
         reviewed = not self.current_call.reviewed
         try:
             self.database.set_reviewed(self.current_call.source_path, reviewed)
+            stored = self.database.call_rows([self.current_call.source_path])
         except sqlite3.Error as exc:
             self._show_toast(f"No se pudo guardar la revisión: {exc}")
             return
-        self._replace_call_record(replace(self.current_call, reviewed=reviewed))
+        if stored:
+            self._replace_call_record(call_record_from_row(stored[0]))
         self._show_toast(
             "Denuncia marcada como verificada" if reviewed else "Se quitó la verificación de la denuncia"
         )
@@ -3657,6 +3746,8 @@ class SentryWindow(QMainWindow):
             event.ignore()
             return
         if self.issabel_match_worker is not None:
+            self.keyword_reanalysis_timer.stop()
+            self._keyword_reanalysis_pending = False
             self.close_after_remote_scan = True
             self.pending_base_scan = False
             self._cancel_issabel_match()
@@ -3688,11 +3779,15 @@ class SentryWindow(QMainWindow):
             event.ignore()
             return
         if self.analysis_worker is not None:
+            self.keyword_reanalysis_timer.stop()
+            self._keyword_reanalysis_pending = False
             self.close_after_analysis = True
             self.analysis_worker.request_stop()
             self._show_toast("Guardando el audio actual; Sentry se cerrará cuando termine")
             event.ignore()
             return
+        self.keyword_reanalysis_timer.stop()
+        self._keyword_reanalysis_pending = False
         self.media_player.stop()
         self.media_player.setSource(QUrl())
         super().closeEvent(event)

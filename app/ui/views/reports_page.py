@@ -45,7 +45,7 @@ class ActivityChart(QWidget):
         painter = QPainter(self)
         colors = theme_colors(self.window().theme)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        maximum = max((n for _, n, _ in self.rows), default=0) or 1
+        maximum = max((max(total, incidents) for _, total, incidents in self.rows), default=0) or 1
         width = (self.width() - 30) / max(1,len(self.rows))
         height = self.height() - 40
         for i,(day,total,incidents) in enumerate(self.rows):
@@ -70,11 +70,10 @@ class ActivityChart(QWidget):
         if 0 <= index < len(self.rows):
             self.hovered_index = index
             day, total, incidents = self.rows[index]
-            rate = incidents / total * 100 if total else 0
             QToolTip.showText(
                 event.globalPosition().toPoint(),
                 f"<b>{html.escape(day)}</b><br>{total} llamadas analizadas<br>"
-                f"{incidents} incidentes · {rate:.1f}%",
+                f"{incidents} incidentes, incluidas las denuncias verificadas manualmente",
                 self,
             )
         else:
@@ -309,10 +308,11 @@ class ReportsPage(QScrollArea):
         }
         for key, panel in self.metric_cards.items():
             panel.setToolTip(metric_help[key])
-        rate=result['incidents']/result['completed']*100 if result['completed'] else 0
+        evaluated=result.get('evaluated',result['completed'])
+        rate=result['incidents']/evaluated*100 if evaluated else 0
         self.summary.setText(f"{result['total']} llamadas registradas · {result['normal']} normales · {result['mailbox']} buzones · "
                              f"{result['pending']} pendientes · {result['errors']} con error · {result['seconds']/60:.0f} min analizados · "
-                             f"{rate:.1f}% de incidentes" if result['total'] else
+                             f"{rate:.1f}% de incidentes entre llamadas analizadas o verificadas" if result['total'] else
                              'No hay llamadas registradas en este período. Cambia la fecha o el período para consultar otro intervalo.')
         self.chart.setAccessibleDescription('; '.join(f'{day}: {total} analizadas, {alerts} incidentes' for day,total,alerts in result['daily']))
         self.chart.rows=result['daily']
@@ -322,7 +322,7 @@ class ReportsPage(QScrollArea):
             'Bases analizadas': [(Path(b['base_path']).name,b['last_analysis'],b['calls'],b['incidents']) for b in result['bases']],
             'Llamadas': [(c['occurred_at'],c['filename'],c['status'],c['category'],'Sí' if c['reviewed'] else 'No') for c in result['calls']],
             'Incidentes': [(c['occurred_at'],c['filename'],c['keywords'],'Verificada' if c['reviewed'] else 'Pendiente')
-                          for c in result['calls'] if c['status']=='COMPLETADO' and c['category']=='ALERTA'],
+                          for c in result['calls'] if (c['status']=='COMPLETADO' or c['reviewed']) and c['category']=='ALERTA'],
             'Bases preparadas': [(Path(j['output_path']).name if j['output_path'] else f"Base #{j['id']}",j['created_at'],j['status'],j['unique_count']) for j in result['jobs']],
             'Detalle diario': result['daily'],
         }
