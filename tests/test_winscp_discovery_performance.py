@@ -110,7 +110,8 @@ ConvertTo-Json @{visited=[string[]][WinSCP.Session]::Visited;
                    "phone_dates": [["0990000001", []]], "phones": [], "fixtures": fixtures}
         completed = subprocess.run(
             _powershell_command(shutil.which("powershell.exe"), script),
-            input=json.dumps(payload), capture_output=True, text=True, env=environment,
+            input=json.dumps(payload), capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=environment,
             timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)

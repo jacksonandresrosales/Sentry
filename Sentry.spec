@@ -10,6 +10,7 @@ datas = [
     (str(root / "app" / "ui" / "assets"), "app/ui/assets"),
     (str(database), "data/db"),
     (str(winscp / "license.txt"), "WinSCP"),
+    (str(root / "LICENSE"), "."),
 ]
 binaries = [
     (str(winscp / "WinSCP.exe"), "WinSCP"),

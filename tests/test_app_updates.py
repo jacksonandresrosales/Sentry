@@ -26,6 +26,7 @@ def release(version="0.1.0-beta.10", **changes):
     result = {
         "tag_name": "v" + version, "name": "Sentry " + version,
         "draft": False, "prerelease": "-" in version, "body": "Cambios de prueba",
+        "published_at": "2026-09-17T12:00:00Z",
         "assets": [{"name": name, "size": len(PAYLOAD), "digest": "sha256:" + DIGEST,
                     "browser_download_url": f"https://github.com/{updates.REPOSITORY}/releases/download/v{version}/{name}"}],
     }
@@ -68,6 +69,18 @@ class UpdateVersionTests(unittest.TestCase):
     def test_equal_and_older_versions_not_installed(self, read):
         read.return_value = [release("0.1.0-beta.4"), release("0.1.0-beta.5")]
         self.assertIsNone(updates.check_for_update("0.1.0-beta.5"))
+
+    def test_release_history_uses_github_notes_and_ignores_future_or_drafts(self):
+        history = updates.parse_release_history([
+            release("0.1.0-beta.9"),
+            release("0.1.0-beta.8", body="Novedades de beta.8"),
+            release("0.1.0-beta.7", body="Novedades de beta.7"),
+            release("0.1.0-beta.6", draft=True),
+            {"tag_name": "versión-inválida"},
+        ], "0.1.0-beta.8")
+        self.assertEqual([item.version for item in history], ["0.1.0-beta.8", "0.1.0-beta.7"])
+        self.assertEqual(history[0].notes, "Novedades de beta.8")
+        self.assertEqual(history[0].published_at, "2026-09-17T12:00:00Z")
 
     @patch.object(updates, "_read_json")
     def test_pagination_and_invalid_tags(self, read):

@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 import sqlite3
 
 from app.database import APP_STORAGE_ROOT, Database, DEFAULT_DATABASE
-from app.about import APP_NAME, APP_VERSION, APP_AUTHORS, APP_DESCRIPTION, APP_FEATURES
+from app.about import APP_NAME, APP_VERSION, APP_AUTHORS, APP_DESCRIPTION, APP_FEATURES, license_text
 from app.secret_store import SecretStoreError, protect, unprotect
 from app.services.audio_analysis import assign_roles, keyword_signature
 from app.services.analysis_batch import analysis_concurrency, run_analysis_batch
@@ -21,6 +21,13 @@ from app.services.base_conversion import (
     LUCID_AUDIO_SINCE, BaseAudioIndex, load_hoja1_audio_index, normalize_phone_number,
 )
 from app.services.report_export import EXPORT_MODE_LABELS, export_audit_excel
+from app.services.app_updates import (
+    MAX_JSON_BYTES,
+    RELEASES_URL,
+    ReleaseNotesInfo,
+    UpdateError,
+    parse_release_history,
+)
 from app.services.winscp_client import (
     match_and_download_remote_audio, scan_host_fingerprint, search_remote_audio,
     test_connection,
@@ -60,6 +67,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QStyle,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -934,6 +942,7 @@ class SentryWindow(QMainWindow):
         self.keyword_reanalysis_timer.setSingleShot(True)
         self.keyword_reanalysis_timer.setInterval(1500)
         self.keyword_reanalysis_timer.timeout.connect(self._commit_sensitive_terms)
+        self.about_release_history: tuple[ReleaseNotesInfo, ...] = ()
 
         self.audio_output = QAudioOutput(self)
         self.audio_output.setVolume(1.0)
@@ -1981,8 +1990,11 @@ class SentryWindow(QMainWindow):
             QDialog#aboutDialog {{ background: {colors['panel']}; }}
             QWidget#aboutContent {{ background: {colors['panel']}; }}
             QLabel#aboutName {{ font-size: 28px; font-weight: 600; color: {colors['text']}; }}
-            QLabel#aboutVersion {{ color: {colors['green_accessible']}; background: {colors['green_soft']};
-                border-radius: 5px; padding: 5px 10px; font-weight: 600; }}
+            QComboBox#aboutVersion {{ color: {colors['green_accessible']}; background: {colors['green_soft']};
+                border: 1px solid {colors['nav_checked_border']}; border-radius: 5px;
+                padding: 5px 28px 5px 10px; font-weight: 600; min-height: 22px; }}
+            QTextBrowser#aboutNotes {{ background: {colors['surface']}; color: {colors['text']};
+                border: 1px solid {colors['border']}; border-radius: 7px; padding: 10px; }}
             QFrame#aboutDivider {{ background: {colors['border']}; border: none; }}
         """)
         outer = QVBoxLayout(dialog)
@@ -1998,8 +2010,11 @@ class SentryWindow(QMainWindow):
         name.setObjectName("aboutName")
         header.addWidget(name)
         header.addStretch()
-        version = QLabel(f"v{APP_VERSION}")
+        version = QComboBox()
         version.setObjectName("aboutVersion")
+        version.setAccessibleName("Historial de versiones de Sentry")
+        version.setMinimumWidth(178)
+        version.addItem(f"v{APP_VERSION} · instalada")
         header.addWidget(version)
         outer.addLayout(header)
 
@@ -2020,21 +2035,28 @@ class SentryWindow(QMainWindow):
         divider.setObjectName("aboutDivider")
         divider.setFixedHeight(1)
         body.addWidget(divider)
-        section = QLabel("Funcionalidades de esta versión")
+        section = QLabel("Cambios de esta versión")
         section.setObjectName("formTitle")
         body.addWidget(section)
-        for heading, description in APP_FEATURES:
-            group = QVBoxLayout()
-            group.setSpacing(4)
-            title = QLabel(heading)
-            title.setObjectName("apiGroupTitle")
-            title.setWordWrap(True)
-            detail = QLabel(description)
-            detail.setObjectName("pageSubtitle")
-            detail.setWordWrap(True)
-            group.addWidget(title)
-            group.addWidget(detail)
-            body.addLayout(group)
+        notes = QTextBrowser()
+        notes.setObjectName("aboutNotes")
+        notes.setOpenExternalLinks(True)
+        notes.setMinimumHeight(250)
+        notes.setAccessibleName("Cambios de la versión seleccionada")
+        fallback = "\n\n".join(f"**{heading}**\n\n{detail}" for heading, detail in APP_FEATURES)
+        notes.setMarkdown(fallback)
+        body.addWidget(notes)
+        history_status = QLabel("Consultando el historial publicado en GitHub…")
+        history_status.setObjectName("pageSubtitle")
+        history_status.setWordWrap(True)
+        body.addWidget(history_status)
+        version.currentIndexChanged.connect(
+            lambda: self._render_about_release(version, notes, history_status, fallback)
+        )
+        if self.about_release_history:
+            self._populate_about_history(version, notes, history_status, fallback, self.about_release_history)
+        else:
+            self._request_about_history(dialog, version, notes, history_status, fallback)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -2042,6 +2064,11 @@ class SentryWindow(QMainWindow):
         scroll.setWidget(content)
         outer.addWidget(scroll, 1)
         footer = QHBoxLayout()
+        license_button = QPushButton("Ver licencia")
+        license_button.setObjectName("secondaryButton")
+        license_button.setAccessibleName("Ver licencia de Sentry")
+        license_button.clicked.connect(lambda: self._show_license(dialog))
+        footer.addWidget(license_button)
         footer.addStretch()
         close = QPushButton("Cerrar")
         close.setObjectName("primaryButton")
@@ -2052,6 +2079,90 @@ class SentryWindow(QMainWindow):
         available = self.screen().availableGeometry()
         dialog.resize(min(620, available.width() - 40), min(650, available.height() - 60))
         dialog.move(available.center() - dialog.rect().center())
+        dialog.exec()
+
+    def _request_about_history(self, dialog, version, notes, status, fallback) -> None:
+        request = QNetworkRequest(QUrl(f"{RELEASES_URL}?per_page=100&page=1"))
+        request.setTransferTimeout(15000)
+        request.setRawHeader(QByteArray(b"User-Agent"), QByteArray(b"Sentry-About"))
+        request.setRawHeader(QByteArray(b"Accept"), QByteArray(b"application/vnd.github+json"))
+        request.setRawHeader(QByteArray(b"X-GitHub-Api-Version"), QByteArray(b"2022-11-28"))
+        reply = self.network.get(request)
+        reply.finished.connect(
+            lambda: self._finish_about_history(reply, dialog, version, notes, status, fallback)
+        )
+
+    def _finish_about_history(self, reply, dialog, version, notes, status, fallback) -> None:
+        status_code = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        raw = bytes(reply.readAll().data())
+        error = reply.error()
+        reply.deleteLater()
+        if not dialog.isVisible():
+            return
+        if (error != QNetworkReply.NetworkError.NoError or not isinstance(status_code, int)
+                or status_code >= 400 or len(raw) > MAX_JSON_BYTES):
+            status.setText("No se pudo consultar GitHub. Se muestran los cambios incluidos con la aplicación.")
+            return
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            history = parse_release_history(payload, APP_VERSION)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, UpdateError):
+            status.setText("GitHub devolvió un historial no válido. Se muestran los cambios incluidos.")
+            return
+        self.about_release_history = history
+        self._populate_about_history(version, notes, status, fallback, history)
+
+    def _populate_about_history(self, combo, notes, status, fallback, history) -> None:
+        combo.blockSignals(True)
+        combo.clear()
+        current_index = -1
+        for entry in history:
+            suffix = " · instalada" if entry.version == APP_VERSION else ""
+            combo.addItem(f"v{entry.version}{suffix}", entry)
+            if entry.version == APP_VERSION:
+                current_index = combo.count() - 1
+        if current_index < 0:
+            combo.insertItem(0, f"v{APP_VERSION} · instalada")
+            current_index = 0
+        combo.setCurrentIndex(current_index)
+        combo.blockSignals(False)
+        self._render_about_release(combo, notes, status, fallback)
+
+    @staticmethod
+    def _render_about_release(combo, notes, status, fallback) -> None:
+        entry = combo.currentData()
+        if not isinstance(entry, ReleaseNotesInfo):
+            notes.setMarkdown(fallback)
+            status.setText("Cambios incluidos con esta instalación; GitHub aún no publicó notas para esta versión.")
+            return
+        body = entry.notes.strip() or "Esta publicación no incluye notas de cambios."
+        notes.setMarkdown(f"## {entry.title}\n\n{body}")
+        published = entry.published_at[:10] if entry.published_at else "fecha no disponible"
+        status.setText(f"Publicada el {published} · notas obtenidas de GitHub")
+
+    def _show_license(self, parent) -> None:
+        dialog = QDialog(parent)
+        dialog.setWindowTitle("Licencia de Sentry")
+        dialog.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(24, 22, 24, 22)
+        title = QLabel("Licencia propietaria")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+        viewer = QTextBrowser()
+        viewer.setObjectName("aboutNotes")
+        viewer.setPlainText(license_text())
+        viewer.setAccessibleName("Texto de la licencia de Sentry")
+        layout.addWidget(viewer, 1)
+        controls = QHBoxLayout()
+        controls.addStretch()
+        close = QPushButton("Cerrar")
+        close.setObjectName("primaryButton")
+        close.clicked.connect(dialog.accept)
+        controls.addWidget(close)
+        layout.addLayout(controls)
+        available = self.screen().availableGeometry()
+        dialog.resize(min(680, available.width() - 40), min(620, available.height() - 60))
         dialog.exec()
 
     def _add_api_fields(

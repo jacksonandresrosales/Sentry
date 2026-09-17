@@ -96,6 +96,14 @@ class ReleaseInfo:
     sha256: str
 
 
+@dataclass(frozen=True)
+class ReleaseNotesInfo:
+    version: str
+    title: str
+    notes: str
+    published_at: str
+
+
 def _check_cancel(cancel: CancelCheck | None) -> None:
     if cancel and cancel():
         raise UpdateCancelled("Actualización cancelada.")
@@ -235,6 +243,37 @@ def check_for_update(
     if not candidates:
         return None
     return _release_info(max(candidates, key=lambda item: item[0])[1], cancel)
+
+
+def parse_release_history(
+    releases: object, current_version: str, *, limit: int = 20,
+) -> tuple[ReleaseNotesInfo, ...]:
+    current = Version.parse(current_version)
+    if type(limit) is not int or not 1 <= limit <= 50:
+        raise ValueError("El límite del historial debe estar entre 1 y 50.")
+    if not isinstance(releases, list):
+        raise UpdateError("GitHub devolvió un historial de versiones no válido.")
+    history: list[tuple[Version, ReleaseNotesInfo]] = []
+    for release in releases:
+        if not isinstance(release, dict) or release.get("draft"):
+            continue
+        tag = str(release.get("tag_name", ""))
+        try:
+            version = Version.parse(tag)
+        except UpdateError:
+            continue
+        if version > current or (not current.prerelease and version.prerelease):
+            continue
+        body = release.get("body")
+        name = release.get("name")
+        published = release.get("published_at")
+        history.append((version, ReleaseNotesInfo(
+            version=tag.removeprefix("v"),
+            title=name.strip() if isinstance(name, str) and name.strip() else f"Sentry {tag.removeprefix('v')}",
+            notes=body[:20000] if isinstance(body, str) else "",
+            published_at=published if isinstance(published, str) else "",
+        )))
+    return tuple(item for _version, item in sorted(history, key=lambda value: value[0], reverse=True)[:limit])
 
 
 def _validate_release(release: ReleaseInfo) -> None:
