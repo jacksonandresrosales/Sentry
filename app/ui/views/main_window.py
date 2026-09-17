@@ -249,6 +249,7 @@ class CallRecord:
     tags: tuple[str, ...] = ()
     reviewed: bool = False
     analysis_terms: str = ""
+    analysis_status: str = ""
 
 
 def format_time(seconds: int) -> str:
@@ -401,6 +402,7 @@ def call_record_from_row(row: dict) -> CallRecord:
         tags=tuple(dict.fromkeys(str(hit["keyword"]) for hit in hits if hit.get("keyword"))),
         reviewed=bool(row.get("reviewed")),
         analysis_terms=str(row.get("analysis_terms") or ""),
+        analysis_status=str(row.get("status") or ""),
     )
 
 
@@ -3607,6 +3609,7 @@ class SentryWindow(QMainWindow):
             if call.source_path is not None
             and (
                 call.category_code in {"PENDIENTE", "ERROR"}
+                or call.analysis_status == "ERROR"
                 or call.analysis_terms != terms_signature
             )
             and (not automatic or (

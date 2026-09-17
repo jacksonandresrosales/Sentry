@@ -168,4 +168,6 @@ def apply_app_theme(app, theme_name: str | None) -> str:
     for role, color in roles.items():
         palette.setColor(role, QColor(color))
     app.setPalette(palette)
+    from app.ui.idle_wheel import install_idle_wheel_guard
+    install_idle_wheel_guard(app)
     return theme_name

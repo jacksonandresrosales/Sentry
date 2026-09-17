@@ -9,8 +9,8 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QUrl
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtCore import QPoint, QPointF, Qt, QUrl
+from PySide6.QtGui import QColor, QPalette, QWheelEvent
 from PySide6.QtWidgets import QApplication, QComboBox, QFrame, QLabel, QLineEdit, QPushButton, QTextBrowser
 
 from app.about import APP_VERSION, license_text
@@ -19,6 +19,7 @@ from app.services.audio_analysis import assign_roles
 from app.services.base_conversion import BaseAudioIndex
 from app.secret_store import unprotect
 from app.ui.theme import apply_app_theme
+from app.ui.idle_wheel import IdleWheelGuard
 from app.ui.views.main_window import (
     CallRecord, SentryWindow, TranscriptLine, audio_filename_metadata, audio_phone_from_filename, call_record_from_audio,
     call_record_from_row, dated_local_directories, install_ui_font, issabel_directories,
@@ -254,6 +255,41 @@ class SentryWindowSmokeTest(unittest.TestCase):
 
         button_labels = {button.text() for button in self.window.findChildren(QPushButton)}
         self.assertNotIn("Escalar a supervisión", button_labels)
+
+    def _send_wheel(self, widget) -> None:
+        event = QWheelEvent(
+            QPointF(8, 8),
+            QPointF(8, 8),
+            QPoint(0, 0),
+            QPoint(0, 120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.NoScrollPhase,
+            False,
+        )
+        QApplication.sendEvent(widget, event)
+        self.app.processEvents()
+
+    def test_mouse_wheel_does_not_change_closed_menus(self) -> None:
+        self.assertIsNotNone(self.app.findChild(IdleWheelGuard, "sentryIdleWheelGuard"))
+        provider = self.window.transcription_provider
+        model = self.window.transcription_model
+        period = self.window.reports_page.period
+        date = self.window.reports_page.date
+        provider.setCurrentIndex(0)
+        model.setCurrentIndex(0)
+        period.setCurrentIndex(1)
+        original_date = date.date()
+        self._send_wheel(provider)
+        self._send_wheel(model)
+        self._send_wheel(period)
+        self._send_wheel(date)
+        self.assertEqual(provider.currentIndex(), 0)
+        self.assertEqual(model.currentIndex(), 0)
+        self.assertEqual(period.currentIndex(), 1)
+        self.assertEqual(date.date(), original_date)
+        provider.setCurrentIndex(1)
+        self.assertEqual(provider.currentIndex(), 1)
 
     def test_winscp_connection_is_masked_encrypted_and_restored(self) -> None:
         self.assertEqual(self.window.remote_password.echoMode(), QLineEdit.EchoMode.Password)

@@ -32,7 +32,7 @@ Sentry es una aplicación de escritorio para Windows que centraliza la auditorí
 
 La aplicación está orientada al uso interno de Ecuaconexión. Puede procesar información sensible, por lo que las credenciales, bases, grabaciones y reportes deben mantenerse en equipos y carpetas con acceso restringido.
 
-> **Versión actual:** `0.1.0-beta.8` · La versión beta debe validarse en un entorno controlado antes de utilizarse en producción.
+> **Versión actual:** `0.1.0-beta.9` · La versión beta debe validarse en un entorno controlado antes de utilizarse en producción.
 
 ## Funcionalidades
 
@@ -43,10 +43,12 @@ La aplicación está orientada al uso interno de Ecuaconexión. Puede procesar i
 - Clasificación en alertas, buzones y llamadas normales.
 - Detección y etiquetado de palabras o frases sensibles.
 - Reproducción de audio sincronizada con la transcripción.
-- Verificación manual de denuncias detectadas.
+- Verificación manual de denuncias, llamadas normales y buzones.
+- Reevaluación automática al actualizar palabras o frases sensibles.
 - Transformación y consolidación de bases CSV y Excel.
 - Historial persistente y reportes por día, semana o mes.
 - Exportación de resultados a Excel.
+- Los menús desplegables solo cambian con un clic; la rueda del mouse no altera la selección.
 - Temas claro y oscuro independientes de Windows.
 - Actualizaciones verificadas desde la propia aplicación.
 
@@ -138,6 +140,12 @@ Consulta las reglas específicas en [scripts/README.md](scripts/README.md).
 Sentry procesa varios audios en paralelo, reutiliza conexiones HTTP y agrupa archivos con la misma huella SHA-256. Las cachés separadas de transcripción y análisis evitan repetir solicitudes cuando coinciden el audio, el modelo y los términos configurados.
 
 Si no hay términos sensibles, la clasificación normal se realiza localmente y no consume la API contextual. Cuando existen candidatos, Gemini u OpenAI reciben únicamente fragmentos cercanos a las coincidencias.
+
+Al agregar o modificar términos en **Configuración**, las llamadas ya analizadas se vuelven a evaluar automáticamente al terminar la edición o tras una breve pausa. Si hay un análisis o una búsqueda en curso, la reevaluación espera y utiliza los últimos términos configurados. Se reutilizan las transcripciones si el audio, proveedor y modelo no cambian; la nueva validación contextual puede consumir API. Las llamadas pendientes de su primer análisis siguen iniciándose con **Analizar**.
+
+Las llamadas normales y los buzones se reclasifican como denuncias cuando la validación contextual confirma riesgo relacionado con los términos. Una grabación breve o con un solo hablante no se descarta antes de revisar las coincidencias.
+
+**Marcar como verificada** está disponible para denuncias, llamadas normales y buzones ya analizados. Al marcarla, la llamada pasa a Denuncias y se incluye en filtros, métricas, reportes y exportaciones de verificadas. La decisión manual persiste al reanalizar, incluso si falla un servicio. **Quitar verificación** restaura la última clasificación automática, sin borrar el análisis ni inventar evidencias.
 
 La transcripción acompaña la reproducción. Cuando el proveedor entrega marcas por palabra, el texto avanza con esos tiempos; los resultados anteriores utilizan una interpolación local.
 
