@@ -32,7 +32,7 @@ Sentry es una aplicación de escritorio para Windows que centraliza la auditorí
 
 La aplicación está orientada al uso interno de Ecuaconexión. Puede procesar información sensible, por lo que las credenciales, bases, grabaciones y reportes deben mantenerse en equipos y carpetas con acceso restringido.
 
-> **Versión actual:** `0.1.0-beta.7` · La versión beta debe validarse en un entorno controlado antes de utilizarse en producción.
+> **Versión actual:** `0.1.0-beta.8` · La versión beta debe validarse en un entorno controlado antes de utilizarse en producción.
 
 ## Funcionalidades
 
@@ -64,6 +64,8 @@ La instalación:
 ## Actualizaciones
 
 Desde beta.6, Sentry puede consultar las nuevas publicaciones del repositorio desde **Configuración → Actualizaciones de Sentry**. La aplicación comprueba versión, tamaño y huella SHA-256 antes de habilitar la instalación, crea un respaldo de SQLite y solo reinicia después de la confirmación del usuario.
+
+Desde beta.8, **Acerca de Sentry** obtiene de GitHub las notas oficiales de la versión instalada y permite consultar el historial de publicaciones anteriores. Si no hay conexión, muestra la información incluida con la aplicación.
 
 Las actualizaciones reemplazan el programa, pero conservan la base, los resultados, las grabaciones descargadas y la configuración en `%LOCALAPPDATA%\Ecuaconexion\Sentry`. Las versiones beta y estables se administran por separado.
 

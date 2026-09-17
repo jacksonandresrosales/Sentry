@@ -11,8 +11,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import QApplication, QFrame, QLabel, QLineEdit, QPushButton
+from PySide6.QtWidgets import QApplication, QComboBox, QFrame, QLabel, QLineEdit, QPushButton, QTextBrowser
 
+from app.about import APP_VERSION, license_text
+from app.services.app_updates import ReleaseNotesInfo
 from app.services.audio_analysis import assign_roles
 from app.services.base_conversion import BaseAudioIndex
 from app.secret_store import unprotect
@@ -62,6 +64,25 @@ class SentryWindowSmokeTest(unittest.TestCase):
         self.window._populate_call_list()
         self.window._update_category_metrics()
         self.window.call_list.setCurrentRow(0)
+
+    def test_about_history_and_license_are_available(self) -> None:
+        combo, notes, status = QComboBox(), QTextBrowser(), QLabel()
+        history = (
+            ReleaseNotesInfo(APP_VERSION, "Sentry beta.8",
+                             "- Historial automático", "2026-09-17T12:00:00Z"),
+            ReleaseNotesInfo("0.1.0-beta.7", "Sentry beta.7",
+                             "- Corrección anterior", "2026-09-16T12:00:00Z"),
+        )
+        combo.currentIndexChanged.connect(
+            lambda: self.window._render_about_release(combo, notes, status, "Respaldo")
+        )
+        self.window._populate_about_history(combo, notes, status, "Respaldo", history)
+        self.assertEqual(combo.count(), 2)
+        self.assertIn("instalada", combo.currentText())
+        self.assertIn("Historial automático", notes.toPlainText())
+        combo.setCurrentIndex(1)
+        self.assertIn("Corrección anterior", notes.toPlainText())
+        self.assertIn("Jackson Ocaña", license_text())
 
     def test_filters_selection_and_evidence_jump(self) -> None:
         self.assertEqual(self.window.call_list.count(), 0)
