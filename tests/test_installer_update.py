@@ -5,6 +5,7 @@ from contextlib import closing
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -16,11 +17,13 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 ISCC = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/Inno Setup 6/ISCC.exe"
-CSC = Path(os.environ.get("WINDIR", "C:/Windows")) / "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
-AVAILABLE = sys.platform == "win32" and ISCC.is_file() and CSC.is_file()
+PYTHON_HOME = Path(sys.base_prefix)
+PYTHONW = PYTHON_HOME / 'pythonw.exe'
+PYTHON_DLL = PYTHON_HOME / f'python{sys.version_info.major}{sys.version_info.minor}.dll'
+AVAILABLE = sys.platform == "win32" and all(path.is_file() for path in (ISCC, PYTHONW, PYTHON_DLL))
 
 
-@unittest.skipUnless(AVAILABLE, "Requiere Windows, Inno Setup y compilador .NET Framework")
+@unittest.skipUnless(AVAILABLE, "Requiere Windows, Inno Setup y Python con pythonw.exe")
 class InstallerUpdateTests(unittest.TestCase):
     def test_update_waits_for_parent_preserves_data_and_restarts(self):
         with tempfile.TemporaryDirectory(prefix="sentry-installer-test-") as temporary:
@@ -40,16 +43,18 @@ class InstallerUpdateTests(unittest.TestCase):
             recording.write_bytes(b"original recording fixture")
             marker = folder / "restart.txt"
 
-            # Un ejecutable GUI mínimo evita abrir consolas o ejecutar la app del cliente.
-            source = folder / "Program.cs"
+            # El runtime firmado evita depender de un binario C# nuevo bloqueado por Control de aplicaciones.
+            shutil.copy2(PYTHONW, payload / 'Sentry.exe')
+            shutil.copy2(PYTHON_DLL, payload / PYTHON_DLL.name)
+            (payload / 'pyvenv.cfg').write_text(
+                f'home = {PYTHON_HOME}\ninclude-system-site-packages = false\n', encoding='utf-8')
+            source = payload / 'restart_fixture.pyw'
             source.write_text(
-                'using System; using System.IO; using System.Diagnostics; class Program { static void Main() { '
-                'var p = Environment.GetEnvironmentVariable("SENTRY_TEST_RESTART"); '
-                'if (!String.IsNullOrEmpty(p)) File.WriteAllText(p, Process.GetCurrentProcess().Id.ToString()); } }',
+                'import os\nfrom pathlib import Path\n'
+                'marker = os.environ.get("SENTRY_TEST_RESTART")\n'
+                'if marker:\n    Path(marker).write_text(str(os.getpid()), encoding="utf-8")\n',
                 encoding="utf-8",
             )
-            self.run_hidden([str(CSC), "/nologo", "/target:winexe",
-                             f"/out:{payload / 'Sentry.exe'}", str(source)])
             version_file = payload / "payload.txt"
             version_file.write_text("old", encoding="utf-8")
             configuration = (ROOT / "SentryInstaller.iss").read_text(encoding="utf-8")
@@ -60,6 +65,10 @@ class InstallerUpdateTests(unittest.TestCase):
             configuration = re.sub(r"(?m)^SetupIconFile=.*$", lambda _: f"SetupIconFile={ROOT / 'app/ui/assets/sentry-installer-icon.ico'}", configuration)
             configuration = re.sub(r'(?m)^Source: .*$', lambda _: f'Source: "{payload}\\*"; DestDir: "{{app}}"; Flags: ignoreversion recursesubdirs createallsubdirs', configuration)
             configuration = re.sub(r"\[Icons\].*?(?=\[Run\])", "", configuration, flags=re.S)
+            run_entry = r'Filename: "{app}\{#MyAppExeName}";'
+            self.assertEqual(configuration.count(run_entry), 2)
+            configuration = configuration.replace(
+                run_entry, run_entry + r' Parameters: """{app}\restart_fixture.pyw""";')
             configuration = configuration.replace("Compression=lzma2/ultra64", "Compression=none")
             configuration = configuration.replace("[Setup]", "[Setup]\nUninstallable=no\nCreateUninstallRegKey=no")
             test_mutex = f"SentryTest-{uuid.uuid4().hex}"
@@ -123,8 +132,6 @@ class InstallerUpdateTests(unittest.TestCase):
             time.sleep(0.05)
         if process_id is None:
             log = marker.with_name('installer.log').read_text(encoding='utf-8-sig', errors='replace')
-            if 'CreateProcess failed; code 4551.' in log:
-                self.skipTest('Control de aplicaciones de Windows bloquea el ejecutable ficticio sin firmar (4551).')
             self.fail('El instalador no relanzó el ejecutable ficticio. Últimas entradas:\n' + log[-4000:])
 
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
