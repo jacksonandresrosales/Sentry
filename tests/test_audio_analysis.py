@@ -20,7 +20,7 @@ from app.database import Database
 from app.secret_store import protect, unprotect
 from app.services.audio_analysis import (
     RESULT_SCHEMA,
-    _deepgram_transcript, _gemini_analysis, _openai_analysis, _openai_transcript, analyze_file, assign_roles,
+    _assemblyai_transcript, _deepgram_transcript, _gemini_analysis, _openai_analysis, _openai_transcript, analyze_file, assign_roles,
     contextual_analysis, detected_keyword_hits, file_hash,
 )
 from app.ui.views.main_window import SentryWindow
@@ -100,6 +100,86 @@ class AnalysisPersistenceTests(unittest.TestCase):
             self.assertIn(("keyterm", "demanda"), params)
             self.assertEqual(transcript["speaker_count"], 2)
             self.assertEqual(transcript["segments"][0]["word_seconds"], [0.15])
+
+    def test_assemblyai_uploads_polls_and_returns_speakers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "audio.wav"
+            audio(path)
+            completed = {"id": "tr-1", "status": "completed", "text": "Hola. Presentaré una demanda.",
+                         "audio_duration": 12, "speech_model_used": "universal-3-5-pro", "utterances": [
+                             {"speaker": "B", "start": 0, "text": "Hola.", "words": [{"start": 150}]},
+                             {"speaker": "A", "start": 2500, "text": "Presentaré una demanda."},
+                             {"speaker": "B", "start": 5000, "text": "Entiendo."}]}
+            responses = [{"upload_url": "https://cdn.assemblyai.com/upload/x"},
+                         {"id": "tr-1", "status": "queued"}, {"id": "tr-1", "status": "processing"},
+                         completed]
+            keywords = ["demanda", "  abogado  ", "demanda", "una frase con más de seis palabras aquí"]
+            with patch("app.services.audio_analysis._request", side_effect=responses) as request, \
+                    patch("app.services.audio_analysis.time.sleep") as sleep:
+                transcript = _assemblyai_transcript(path, "clave", "universal-3-5-pro", keywords)
+            calls = request.call_args_list
+            self.assertEqual([call.args[0] for call in calls], ["POST", "POST", "GET", "GET"])
+            self.assertTrue(calls[0].args[1].endswith("/v2/upload"))
+            self.assertNotIsInstance(calls[0].kwargs["data"], bytes)
+            self.assertEqual(calls[0].kwargs["headers"]["authorization"], "clave")
+            body = calls[1].kwargs["json"]
+            self.assertEqual(body["audio_url"], "https://cdn.assemblyai.com/upload/x")
+            self.assertEqual(body["speech_models"], ["universal-3-5-pro"])
+            self.assertEqual(body["language_code"], "es")
+            self.assertTrue(body["speaker_labels"])
+            self.assertEqual(body["keyterms_prompt"], ["demanda", "abogado"])
+            self.assertEqual(transcript["request_id"], "tr-1")
+            self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(transcript["speaker_count"], 2)
+            self.assertEqual([item["speaker"] for item in transcript["segments"]],
+                             ["Hablante 1", "Hablante 2", "Hablante 1"])
+            self.assertEqual(transcript["segments"][1]["second"], 2.5)
+            self.assertEqual(transcript["segments"][0]["word_seconds"], [0.15])
+            self.assertEqual((transcript["provider"], transcript["model"]), ("assemblyai", "universal-3-5-pro"))
+
+    def test_assemblyai_error_status_and_keyterm_limit(self):
+        from app.services.audio_analysis import AnalysisError, _assemblyai_keyterms
+        self.assertEqual(len(_assemblyai_keyterms("universal-2", [f"t{i}" for i in range(500)])), 200)
+        self.assertEqual(len(_assemblyai_keyterms("universal-3-5-pro", [f"t{i}" for i in range(1500)])), 1000)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "audio.wav"
+            audio(path)
+            responses = [{"upload_url": "https://cdn.assemblyai.com/upload/x"},
+                         {"id": "tr-2", "status": "error", "error": "Audio sin voz"}]
+            with patch("app.services.audio_analysis._request", side_effect=responses):
+                with self.assertRaisesRegex(AnalysisError, "Audio sin voz"):
+                    _assemblyai_transcript(path, "clave", "universal-2", [])
+
+    def test_assemblyai_deletion_waits_for_local_cache(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'audio.wav'
+            audio(path)
+            database = Database(Path(temp) / 'audit.db')
+            register(database, path)
+            settings = {**config(), 'transcription_provider': 'assemblyai',
+                        'transcription_model': 'universal-2'}
+            transcript = {**TRANSCRIPT, 'provider': 'assemblyai', 'model': 'universal-2',
+                          'request_id': 'tr-1'}
+
+            def delete(method, url, **kwargs):
+                self.assertEqual(method, 'DELETE')
+                with database.connect() as connection:
+                    self.assertEqual(connection.execute('SELECT COUNT(*) FROM transcription_cache').fetchone()[0], 1)
+                return {}
+
+            with patch('app.services.audio_analysis.transcribe', return_value=transcript), \
+                 patch('app.services.audio_analysis.contextual_analysis', return_value=ALERT), \
+                 patch('app.services.audio_analysis._request', side_effect=delete) as request:
+                analyze_file(database, path, settings)
+                analyze_file(database, path, settings)
+            self.assertEqual(request.call_count, 1)
+            with patch.object(database, 'cache_get', return_value=None), \
+                 patch.object(database, 'cache_set', side_effect=OSError('disco lleno')), \
+                 patch('app.services.audio_analysis.transcribe', return_value=transcript), \
+                 patch('app.services.audio_analysis._request') as request:
+                with self.assertRaisesRegex(OSError, 'disco lleno'):
+                    analyze_file(database, path, settings)
+                request.assert_not_called()
 
     def test_contextual_api_responses_are_parsed_as_structured_json(self):
         result = {"category": "NORMAL", "summary": "Sin novedad", "sentiment": "NEUTRAL",

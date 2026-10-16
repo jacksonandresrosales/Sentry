@@ -250,11 +250,49 @@ class SentryWindowSmokeTest(unittest.TestCase):
 
         self.window.transcription_api_key.setText("session-secret")
         self.window.transcription_provider.setCurrentIndex(1)
+        self.assertEqual(self.window.transcription_provider.currentData(), "assemblyai")
         self.assertEqual(self.window.transcription_api_key.text(), "")
-        self.assertEqual(self.window.transcription_model.currentText(), "gpt-4o-transcribe-diarize")
+        model = self.window.transcription_model
+        self.assertEqual([model.itemData(index) for index in range(model.count())],
+                         ["universal-2", "universal-3-5-pro"])
+        self.assertEqual(self.window._model_id(model), "universal-3-5-pro")
 
         button_labels = {button.text() for button in self.window.findChildren(QPushButton)}
         self.assertNotIn("Escalar a supervisión", button_labels)
+
+    def test_transcription_provider_keys_and_model_survive_switching(self) -> None:
+        with patch("app.ui.views.main_window.protect", lambda value: f"cifrado:{value}"), \
+                patch("app.ui.views.main_window.unprotect", lambda value: value.removeprefix("cifrado:")):
+            provider = self.window.transcription_provider
+            model = self.window.transcription_model
+            self.window.transcription_api_key.setText("clave-deepgram")
+            self.window._persist_credentials(("transcription",))
+            provider.setCurrentIndex(provider.findData("assemblyai"))
+            self.assertEqual(self.window.transcription_api_key.text(), "")
+            model.setCurrentIndex(model.findData("universal-2"))
+            self.window.transcription_api_key.setText("clave-assembly")
+            self.window._persist_credentials(("transcription",))
+            stored = self.window.database.credentials()["transcription"]
+            self.assertEqual((stored["provider"], stored["model"]), ("assemblyai", "universal-2"))
+
+            provider.setCurrentIndex(provider.findData("deepgram"))
+            self.assertEqual(self.window.transcription_api_key.text(), "clave-deepgram")
+            self.assertEqual(self.window._model_id(model), "nova-3")
+            provider.setCurrentIndex(provider.findData("assemblyai"))
+            self.assertEqual(self.window.transcription_api_key.text(), "clave-assembly")
+
+            self.window.transcription_api_key.clear()
+            self.window._restore_credentials()
+            self.assertEqual(provider.currentData(), "assemblyai")
+            self.assertEqual(self.window._model_id(model), "universal-2")
+            self.assertEqual(self.window.transcription_api_key.text(), "clave-assembly")
+            self.window.keywords_input.setText("demanda")
+            config = self.window._analysis_config() if self.window.analysis_api_key.text() else None
+            if config is None:
+                self.window.analysis_api_key.setText("clave-analisis")
+                config = self.window._analysis_config()
+            self.assertEqual((config["transcription_provider"], config["transcription_model"]),
+                             ("assemblyai", "universal-2"))
 
     def _send_wheel(self, widget) -> None:
         event = QWheelEvent(
@@ -310,17 +348,9 @@ class SentryWindowSmokeTest(unittest.TestCase):
         self.window._restore_remote_connection()
         self.assertEqual(self.window.remote_password.text(), "secreto-local")
         self.assertIn("Configuración cifrada recuperada", self.window.remote_status.text())
-        self.assertTrue(self.window.remote_search_button.isEnabled())
-
-        self.window._remote_search_succeeded([{
-            "path": "/var/spool/asterisk/monitor/2026/09/q-000-0990000001.wav",
-            "name": "q-000-0990000001.wav",
-            "size": 16000,
-            "modified": "2026-09-15 10:30:00",
-        }])
-        self.assertEqual(self.window.remote_results.count(), 1)
-        self.assertIn("q-000-0990000001.wav", self.window.remote_results.item(0).text())
-        self.assertIn("1 archivo encontrado", self.window.remote_search_status.text())
+        self.assertTrue(self.window.remote_test_button.isEnabled())
+        self.assertEqual(self.window.remote_path.text(), "/grabaciones")
+        self.assertEqual(self.window.remote_username.text(), "jeremy")
 
     def test_model_catalogs_are_normalized(self) -> None:
         deepgram = {"stt": [{"name": "general", "canonical_name": "nova-3-general"}]}

@@ -69,7 +69,8 @@ class InstallerUpdateTests(unittest.TestCase):
             self.run_hidden([str(ISCC), "/Q", str(script)])
             installer = folder / "test-setup.exe"
             arguments = [str(installer), "/SP-", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
-                         "/NOCLOSEAPPLICATIONS", "/NORESTARTAPPLICATIONS", f"/DIR={destination}"]
+                         "/NOCLOSEAPPLICATIONS", "/NORESTARTAPPLICATIONS", f"/DIR={destination}",
+                         f"/LOG={folder / 'installer.log'}"]
             self.run_hidden(arguments)
             self.assertEqual((destination / "payload.txt").read_text(encoding="utf-8"), "old")
             self.assertFalse(marker.exists())
@@ -120,7 +121,11 @@ class InstallerUpdateTests(unittest.TestCase):
                 process_id = int(value)
                 break
             time.sleep(0.05)
-        self.assertIsNotNone(process_id, "El instalador no relanzó el ejecutable ficticio")
+        if process_id is None:
+            log = marker.with_name('installer.log').read_text(encoding='utf-8-sig', errors='replace')
+            if 'CreateProcess failed; code 4551.' in log:
+                self.skipTest('Control de aplicaciones de Windows bloquea el ejecutable ficticio sin firmar (4551).')
+            self.fail('El instalador no relanzó el ejecutable ficticio. Últimas entradas:\n' + log[-4000:])
 
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)

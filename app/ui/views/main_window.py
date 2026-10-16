@@ -16,7 +16,7 @@ from app.about import APP_NAME, APP_VERSION, APP_AUTHORS, APP_DESCRIPTION, APP_F
 from app.secret_store import SecretStoreError, protect, unprotect
 from app.services.audio_analysis import assign_roles, keyword_signature
 from app.services.analysis_batch import analysis_concurrency, run_analysis_batch
-from app.services.api_costs import RECOMMENDED_API_MODELS
+from app.services.api_costs import RECOMMENDED_API_MODELS, TRANSCRIPTION_MODEL_CHOICES
 from app.ui.update_controller import UpdatePanel
 from app.services.base_conversion import (
     LUCID_AUDIO_SINCE, BaseAudioIndex, load_hoja1_audio_index, normalize_phone_number,
@@ -42,10 +42,13 @@ from app.ui.views.reports_page import ReportsPage
 from app.ui.views.api_costs_page import ApiCostsPage
 
 from PySide6.QtCore import (
-    QByteArray, QEasingCurve, QPoint, QRectF, QSize, Qt, QThread, QTimer, QUrl,
+    QByteArray, QEasingCurve, QEvent, QPoint, QPointF, QRectF, QSize, Qt, QThread, QTimer, QUrl,
     QVariantAnimation, Signal,
 )
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import (
+    QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap,
+    QPolygonF,
+)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
@@ -653,7 +656,7 @@ class AnalysisProgressButton(QPushButton):
         if self._display_progress > 0:
             painter.save()
             painter.setClipRect(progress_rect)
-            painter.setPen(QColor("#ffffff"))
+            painter.setPen(QColor(colors["on_primary"]))
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.text())
             painter.restore()
 
@@ -753,6 +756,71 @@ class TranscriptRow(QFrame):
         super().keyPressEvent(event)
 
 
+class ElidedLabel(QLabel):
+    """Etiqueta de una línea que recorta con «…» en vez de ensanchar su contenedor."""
+
+    def __init__(self, text: str = "") -> None:
+        super().__init__()
+        self._full_text = ""
+        self.setMinimumWidth(24)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802 - API de Qt
+        self._full_text = text
+        self._apply_elide()
+        self.updateGeometry()
+
+    def text(self) -> str:
+        return self._full_text
+
+    def sizeHint(self) -> QSize:
+        hint = super().sizeHint()
+        return QSize(self.fontMetrics().horizontalAdvance(self._full_text) + 2, hint.height())
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(self.minimumWidth(), super().minimumSizeHint().height())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.FontChange, QEvent.Type.StyleChange):
+            self._apply_elide()
+
+    def _apply_elide(self) -> None:
+        elided = self.fontMetrics().elidedText(
+            self._full_text, Qt.TextElideMode.ElideRight, max(0, self.width())
+        )
+        QLabel.setText(self, elided)
+
+
+def media_icon(kind: str) -> QIcon:
+    """Glifo de reproducción dibujado con el color de texto sobre la acción primaria."""
+    icon = QIcon()
+    for mode, color in (
+        (QIcon.Mode.Normal, PALETTE["on_primary"]),
+        (QIcon.Mode.Active, PALETTE["on_primary"]),
+        (QIcon.Mode.Disabled, PALETTE["gray_light"]),
+    ):
+        pixmap = QPixmap(36, 36)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(color))
+        if kind == "pause":
+            painter.drawRoundedRect(QRectF(10, 8, 6, 20), 1.5, 1.5)
+            painter.drawRoundedRect(QRectF(20, 8, 6, 20), 1.5, 1.5)
+        else:
+            painter.drawPolygon(QPolygonF([QPointF(12, 7), QPointF(28, 18), QPointF(12, 29)]))
+        painter.end()
+        icon.addPixmap(pixmap, mode)
+    return icon
+
+
 class CallCard(QFrame):
     clicked = Signal(int)
 
@@ -810,7 +878,7 @@ class CallCard(QFrame):
             badge_label = f"{complaint_label} · {tag_text}" if tag_text else complaint_label
         else:
             badge_label = tag_text or classification_labels.get(classification, call.keyword.capitalize())
-        badge_text = QLabel(badge_label)
+        badge_text = ElidedLabel(badge_label)
         badge_text.setObjectName("classificationText")
         badge_layout.addWidget(badge_text)
         if call.reviewed:
@@ -820,8 +888,9 @@ class CallCard(QFrame):
             badge.setToolTip("Denuncia automática · Etiquetas encontradas: " + ", ".join(call.tags))
         else:
             badge.setToolTip("Clasificación: " + classification_labels.get(classification, call.category))
-        top.addWidget(badge)
-        top.addStretch()
+        badge.setMinimumWidth(0)
+        top.addWidget(badge, 0)
+        top.addStretch(1)
 
         clock = QLabel(call.clock)
         clock.setObjectName("monoMuted")
@@ -837,10 +906,13 @@ class CallCard(QFrame):
         client_row.addStretch()
         layout.addLayout(client_row)
 
-        snippet = QLabel(call.snippet)
+        snippet = ElidedLabel(call.snippet)
         snippet.setObjectName("callSnippet")
         snippet.setToolTip(call.snippet)
-        layout.addWidget(snippet)
+        snippet_row = QHBoxLayout()
+        snippet_row.setContentsMargins(16, 0, 0, 0)
+        snippet_row.addWidget(snippet, 1)
+        layout.addLayout(snippet_row)
 
         meta = QHBoxLayout()
         duration = QLabel(f"{format_time(call.duration)} min")
@@ -870,6 +942,8 @@ class CallListWidget(QListWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        # Al reducir la ventana Qt no siempre encoge las tarjetas ya creadas.
+        self.updateEditorGeometries()
         self.viewport_changed.emit()
 
     def showEvent(self, event) -> None:
@@ -1059,6 +1133,7 @@ class SentryWindow(QMainWindow):
         self.directory_label.setMaximumWidth(155)
         self._set_directory_display("")
         directory_layout.addWidget(self.directory_label, 1)
+        directory_layout.addStretch()
         change = QPushButton("Cambiar")
         change.setObjectName("linkButton")
         change.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1470,9 +1545,9 @@ class SentryWindow(QMainWindow):
 
         meta = QGridLayout()
         meta.setHorizontalSpacing(26)
-        self.customer_value = self._add_meta(meta, 0, "CLIENTE")
-        self.time_value = self._add_meta(meta, 1, "HORA")
-        self.risk_value = self._add_meta(meta, 2, "RIESGO")
+        self.customer_value = self._add_meta(meta, 0, "Cliente")
+        self.time_value = self._add_meta(meta, 1, "Hora")
+        self.risk_value = self._add_meta(meta, 2, "Riesgo")
         layout.addLayout(meta)
         return frame
 
@@ -1513,7 +1588,8 @@ class SentryWindow(QMainWindow):
         self.play_button = QPushButton()
         self.play_button.setObjectName("playButton")
         self.play_button.setFixedSize(42, 42)
-        self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+        self.play_button.setIcon(media_icon("play"))
+        self.play_button.setIconSize(QSize(18, 18))
         self.play_button.setAccessibleName("Reproducir audio")
         self.play_button.clicked.connect(self._toggle_playback)
         controls.addWidget(self.play_button)
@@ -1617,8 +1693,11 @@ class SentryWindow(QMainWindow):
         about_link.setObjectName("secondaryButton")
         about_link.clicked.connect(self._show_about)
         heading.addWidget(about_link)
-        outer.addLayout(heading)
-        outer.addWidget(subtitle)
+        heading_block = QVBoxLayout()
+        heading_block.setSpacing(4)
+        heading_block.addLayout(heading)
+        heading_block.addWidget(subtitle)
+        outer.addLayout(heading_block)
 
         appearance = QFrame()
         appearance.setObjectName("contentPanel")
@@ -1658,7 +1737,7 @@ class SentryWindow(QMainWindow):
         directory_help.setObjectName("pageSubtitle")
         directory_help.setWordWrap(True)
         source_row = QHBoxLayout()
-        source_label = QLabel("ORIGEN")
+        source_label = QLabel("Origen")
         source_label.setObjectName("fieldLabel")
         self.audio_source = QComboBox()
         self.audio_source.addItem("Carpeta local", "local")
@@ -1751,7 +1830,7 @@ class SentryWindow(QMainWindow):
         self.remote_fingerprint.setAccessibleName("Huella SSH del servidor")
 
         for column, (label_text, field) in enumerate(
-            (("IP DEL SERVIDOR", self.remote_host), ("PUERTO SFTP", self.remote_port))
+            (("IP del servidor", self.remote_host), ("Puerto SFTP", self.remote_port))
         ):
             label = QLabel(label_text)
             label.setObjectName("fieldLabel")
@@ -1759,14 +1838,14 @@ class SentryWindow(QMainWindow):
             remote_fields.addWidget(label, 0, column)
             remote_fields.addWidget(field, 1, column)
         for column, (label_text, field) in enumerate(
-            (("USUARIO", self.remote_username), ("CARPETA REMOTA", self.remote_path))
+            (("Usuario", self.remote_username), ("Carpeta remota", self.remote_path))
         ):
             label = QLabel(label_text)
             label.setObjectName("fieldLabel")
             label.setBuddy(field)
             remote_fields.addWidget(label, 2, column)
             remote_fields.addWidget(field, 3, column)
-        password_label = QLabel("CONTRASEÑA")
+        password_label = QLabel("Contraseña")
         password_label.setObjectName("fieldLabel")
         password_label.setBuddy(self.remote_password)
         remote_fields.addWidget(password_label, 4, 0, 1, 2)
@@ -1855,11 +1934,14 @@ class SentryWindow(QMainWindow):
         transcription.addWidget(transcription_title)
         self.transcription_provider = QComboBox()
         self.transcription_provider.addItem("Deepgram", "deepgram")
-        self.transcription_provider.setEnabled(False)
+        self.transcription_provider.addItem("AssemblyAI", "assemblyai")
+        self._select_provider(self.transcription_provider, os.getenv("SENTRY_TRANSCRIPTION_PROVIDER", "deepgram"))
         self.transcription_model = QComboBox()
         self.transcription_model.setEditable(False)
-        self.transcription_model.addItem(RECOMMENDED_API_MODELS["transcription"]["deepgram"])
-        self.transcription_api_key = QLineEdit(os.getenv("DEEPGRAM_API_KEY", ""))
+        transcription_provider = str(self.transcription_provider.currentData())
+        self._fill_model_choices("transcription", self.transcription_model, transcription_provider)
+        self.transcription_api_key = QLineEdit(os.getenv(
+            {"assemblyai": "ASSEMBLYAI_API_KEY"}.get(transcription_provider, "DEEPGRAM_API_KEY"), ""))
         self.transcription_key_toggle, self.transcription_validate, self.transcription_api_status = self._add_api_fields(
             transcription,
             self.transcription_provider,
@@ -1869,6 +1951,7 @@ class SentryWindow(QMainWindow):
             "transcription",
         )
         self.transcription_provider.currentIndexChanged.connect(lambda: self._reset_api_service("transcription"))
+        self.transcription_model.currentIndexChanged.connect(lambda: self._transcription_model_changed())
         self.transcription_api_key.textChanged.connect(lambda: self._mark_api_dirty("transcription"))
         services.addLayout(transcription, 1)
 
@@ -2176,10 +2259,39 @@ class SentryWindow(QMainWindow):
     def _select_provider(combo: QComboBox, requested: str) -> None:
         normalized = requested.strip().casefold()
         aliases = {"google gemini": "gemini", "deepgram": "deepgram", "deepseek": "deepseek",
+                   "assemblyai": "assemblyai", "assembly ai": "assemblyai",
                    "groq": "groq",
                    "openai": "openai"}
         index = combo.findData(aliases.get(normalized, normalized))
         combo.setCurrentIndex(max(0, index))
+
+    @staticmethod
+    def _fill_model_choices(service: str, model: QComboBox, provider: str, selected: str | None = None) -> bool:
+        """Carga los modelos permitidos; devuelve False si `selected` no está entre ellos."""
+        recommended = RECOMMENDED_API_MODELS[service][provider]
+        choices = (TRANSCRIPTION_MODEL_CHOICES.get(provider) if service == "transcription" else None) or (
+            (recommended, recommended),)
+        model.blockSignals(True)
+        model.clear()
+        for model_id, label in choices:
+            model.addItem(label, model_id)
+        index = model.findData(selected or recommended)
+        model.setCurrentIndex(index if index >= 0 else max(0, model.findData(recommended)))
+        model.blockSignals(False)
+        return selected is None or index >= 0
+
+    @staticmethod
+    def _model_id(model: QComboBox) -> str:
+        data = model.currentData()
+        return str(data if data else model.currentText()).strip()
+
+    def _transcription_model_changed(self) -> None:
+        # Cambiar de modelo no exige validar otra vez la clave del mismo proveedor.
+        if self.transcription_validate.text() == "Validada":
+            try:
+                self._persist_credentials(("transcription",))
+            except (SecretStoreError, sqlite3.Error, OSError) as exc:
+                self._show_toast(f"No se pudo guardar el modelo elegido: {exc}")
 
     def _api_controls(self, service: str) -> tuple[QComboBox, QComboBox, QLineEdit, QPushButton, QLabel]:
         if service == "transcription":
@@ -2200,16 +2312,24 @@ class SentryWindow(QMainWindow):
 
     def _reset_api_service(self, service: str) -> None:
         provider, model, key, button, status = self._api_controls(service)
-        recommended = RECOMMENDED_API_MODELS[service][str(provider.currentData())]
-        model.clear()
-        model.addItem(recommended)
-        key.clear()
+        provider_id = str(provider.currentData())
+        self._fill_model_choices(service, model, provider_id)
+        saved_key = ""
+        try:
+            encrypted = self.database.provider_key(service, provider_id)
+            saved_key = unprotect(encrypted) if encrypted else ""
+        except (SecretStoreError, sqlite3.Error, OSError):
+            saved_key = ""
+        key.blockSignals(True)
+        key.setText(saved_key)
+        key.blockSignals(False)
         toggle = self.transcription_key_toggle if service == "transcription" else self.analysis_key_toggle
         toggle.setChecked(False)
         key.setEchoMode(QLineEdit.EchoMode.Password)
         button.setEnabled(True)
         button.setText("Validar")
-        self._set_api_status(status, "Sin validar", "idle")
+        self._set_api_status(status, "Clave recuperada de forma segura · pendiente de validar" if saved_key
+                             else "Sin validar", "idle")
 
     def _restore_credentials(self) -> None:
         try:
@@ -2221,12 +2341,11 @@ class SentryWindow(QMainWindow):
                 provider, model, field, _button, status = self._api_controls(service)
                 allowed_models = RECOMMENDED_API_MODELS[service]
                 saved_provider = item["provider"]
-                if saved_provider not in allowed_models:
+                if saved_provider not in allowed_models or provider.findData(saved_provider) < 0:
                     provider.blockSignals(True)
                     provider.setCurrentIndex(0)
                     provider.blockSignals(False)
-                    model.clear()
-                    model.addItem(allowed_models[str(provider.currentData())])
+                    self._fill_model_choices(service, model, str(provider.currentData()))
                     self._set_api_status(
                         status,
                         "La clave guardada pertenece a un proveedor que ya no está habilitado. "
@@ -2237,11 +2356,10 @@ class SentryWindow(QMainWindow):
                 provider.blockSignals(True)
                 provider.setCurrentIndex(provider.findData(saved_provider))
                 provider.blockSignals(False)
-                model.clear()
-                model.addItem(allowed_models[saved_provider])
+                model_allowed = self._fill_model_choices(service, model, saved_provider, item["model"])
                 field.setText(unprotect(item["encrypted_key"]))
                 notice = ("Clave recuperada · se seleccionó el modelo recomendado. Valida la clave."
-                          if item["model"] != allowed_models[saved_provider]
+                          if not model_allowed
                           else "Clave recuperada de forma segura · pendiente de validar")
                 self._set_api_status(status, notice, "idle")
         except (SecretStoreError, sqlite3.Error, OSError) as exc:
@@ -2254,7 +2372,7 @@ class SentryWindow(QMainWindow):
             key = field.text().strip()
             if not key:
                 continue
-            self.database.save_credential(service, str(provider.currentData()), model.currentText().strip(), protect(key))
+            self.database.save_credential(service, str(provider.currentData()), self._model_id(model), protect(key))
             saved += 1
         return saved
 
@@ -2410,6 +2528,11 @@ class SentryWindow(QMainWindow):
         if provider_id == "deepgram":
             self._send_api_request(service, provider_id, key, "https://api.deepgram.com/v1/projects", "validate")
             return
+        if provider_id == "assemblyai":
+            # AssemblyAI no publica un catálogo de modelos; listar una transcripción comprueba la clave.
+            self._send_api_request(service, provider_id, key,
+                                   "https://api.assemblyai.com/v2/transcript?limit=1", "validate")
+            return
         endpoint = {
             "gemini": "https://generativelanguage.googleapis.com/v1beta/models",
             "deepseek": "https://api.deepseek.com/models",
@@ -2422,6 +2545,8 @@ class SentryWindow(QMainWindow):
         request.setTransferTimeout(15000)
         if provider == "deepgram":
             request.setRawHeader(QByteArray(b"Authorization"), QByteArray(f"Token {key}".encode()))
+        elif provider == "assemblyai":
+            request.setRawHeader(QByteArray(b"Authorization"), QByteArray(key.encode()))
         elif provider == "gemini":
             request.setRawHeader(QByteArray(b"x-goog-api-key"), QByteArray(key.encode()))
         else:
@@ -2459,6 +2584,16 @@ class SentryWindow(QMainWindow):
             self._send_api_request(service, provider, key, "https://api.deepgram.com/v1/models", "models")
             return
 
+        if provider == "assemblyai":
+            self._set_api_busy(service, False)
+            button.setText("Validada")
+            self._set_api_status(status, f"Clave válida · modelo elegido: {model.currentText().split(' · ')[0]}", "valid")
+            try:
+                self._persist_credentials((service,))
+            except (SecretStoreError, sqlite3.Error, OSError) as exc:
+                self._set_api_status(status, f"Clave válida, pero no se pudo guardar: {exc}", "error")
+            return
+
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -2469,11 +2604,10 @@ class SentryWindow(QMainWindow):
 
         models = self._extract_models(provider, service, payload)
         recommended = RECOMMENDED_API_MODELS.get(service, {}).get(provider)
-        model.blockSignals(True)
-        model.clear()
         if recommended:
-            model.addItem(recommended)
-        model.blockSignals(False)
+            self._fill_model_choices(service, model, provider)
+        else:
+            model.clear()
         available = self._recommended_model_available(provider, service, recommended, models)
         self._set_api_busy(service, False)
         if models and not available:
@@ -2531,6 +2665,7 @@ class SentryWindow(QMainWindow):
             return current
         hints = {
             ("deepgram", "transcription"): ("nova-3",),
+            ("assemblyai", "transcription"): ("universal-3-5-pro", "universal-2"),
             ("openai", "transcription"): ("mini-transcribe", "transcribe", "whisper"),
             ("gemini", "analysis"): ("flash",),
             ("openai", "analysis"): ("gpt-4o-mini", "mini"),
@@ -2918,7 +3053,7 @@ class SentryWindow(QMainWindow):
     def _stop_playback(self) -> None:
         self.media_player.stop()
         if hasattr(self, "play_button"):
-            self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+            self.play_button.setIcon(media_icon("play"))
             self.play_button.setAccessibleName("Reproducir audio")
 
     def _on_player_position_changed(self, position_ms: int) -> None:
@@ -2944,8 +3079,7 @@ class SentryWindow(QMainWindow):
         if not hasattr(self, "play_button"):
             return
         playing = state == QMediaPlayer.PlaybackState.PlayingState
-        icon = QStyle.StandardPixmap.SP_MediaPause if playing else QStyle.StandardPixmap.SP_MediaPlay
-        self.play_button.setIcon(self.style().standardIcon(icon))
+        self.play_button.setIcon(media_icon("pause" if playing else "play"))
         self.play_button.setAccessibleName("Pausar audio" if playing else "Reproducir audio")
 
     def _on_player_error(self, error: QMediaPlayer.Error, error_string: str) -> None:
@@ -3050,6 +3184,9 @@ class SentryWindow(QMainWindow):
             self.timeline.set_theme(self.theme)
         if hasattr(self, "analyze_button"):
             self.analyze_button.set_theme(self.theme)
+        if hasattr(self, "play_button"):
+            playing = self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+            self.play_button.setIcon(media_icon("pause" if playing else "play"))
         if hasattr(self, "theme_combo"):
             index = self.theme_combo.findData(self.theme)
             if index >= 0 and self.theme_combo.currentIndex() != index:
@@ -3453,10 +3590,10 @@ class SentryWindow(QMainWindow):
             "keywords": keywords,
             "analysis_parallelism": analysis_concurrency(self.analysis_parallelism.currentData()),
             "transcription_provider": str(self.transcription_provider.currentData()),
-            "transcription_model": self.transcription_model.currentText().strip(),
+            "transcription_model": self._model_id(self.transcription_model),
             "transcription_key": transcription_key,
             "analysis_provider": str(self.analysis_provider.currentData()),
-            "analysis_model": self.analysis_model.currentText().strip(),
+            "analysis_model": self._model_id(self.analysis_model),
             "analysis_key": analysis_key,
         }
 
@@ -3907,7 +4044,7 @@ class SentryWindow(QMainWindow):
             }}
             QPushButton#primaryButton {{
                 background: {PALETTE['green_accessible']};
-                color: white;
+                color: {PALETTE['on_primary']};
                 border: 1px solid {PALETTE['green_accessible']};
             }}
             QPushButton#primaryButton:hover {{ background: {PALETTE['primary_hover']}; }}
@@ -3935,6 +4072,22 @@ class SentryWindow(QMainWindow):
             }}
             QPushButton#linkButton:hover {{ color: {PALETTE['text']}; }}
             QPushButton#linkButton:disabled {{ color: {PALETTE['gray_light']}; }}
+            QPushButton#disclosureButton {{
+                background: transparent;
+                color: {PALETTE['text_soft']};
+                border: 1px solid transparent;
+                padding: 0 8px;
+                text-align: left;
+                font-weight: 600;
+            }}
+            QPushButton#disclosureButton:hover {{ color: {PALETTE['text']}; background: {PALETTE['surface']}; }}
+            QPushButton#disclosureButton:checked {{ color: {PALETTE['green_accessible']}; }}
+            QPushButton#disclosureButton:disabled {{ color: {PALETTE['gray_light']}; }}
+            QFrame#directoryBar QPushButton#linkButton {{
+                min-height: 0;
+                padding: 2px 4px;
+                font-size: 12px;
+            }}
             QFrame#filterBar {{
                 background: {PALETTE['panel']};
                 border-bottom: 1px solid {PALETTE['border']};
@@ -3953,6 +4106,14 @@ class SentryWindow(QMainWindow):
                 selection-color: white;
             }}
             QLineEdit::placeholder {{ color: {PALETTE['placeholder']}; }}
+            QLineEdit:hover:!focus, QComboBox:hover:!focus, QDateEdit:hover:!focus {{
+                border-color: {PALETTE['secondary_hover_border']};
+            }}
+            QLineEdit:disabled, QComboBox:disabled {{
+                background: {PALETTE['disabled_bg']};
+                color: {PALETTE['gray_light']};
+                border-color: {PALETTE['border']};
+            }}
             QComboBox::drop-down {{
                 width: 28px;
                 background: {PALETTE['surface']};
@@ -4046,11 +4207,11 @@ class SentryWindow(QMainWindow):
                 font-weight: 600;
             }}
             QFrame#classificationBadge[category="NORMAL"] {{
-                background: {PALETTE['green_soft']};
-                border: 1px solid {PALETTE['mailbox_border']};
+                background: {PALETTE['neutral_badge_bg']};
+                border: 1px solid {PALETTE['border']};
             }}
             QFrame#classificationBadge[category="NORMAL"] QLabel#classificationText {{
-                color: {PALETTE['green_accessible']};
+                color: {PALETTE['gray']};
                 font-size: 10px;
                 font-weight: 600;
             }}
@@ -4060,8 +4221,8 @@ class SentryWindow(QMainWindow):
                 background: {PALETTE['green_soft']};
                 border: 1px solid {PALETTE['mailbox_border']};
                 border-radius: 5px;
-                padding: 2px 6px;
-                font-size: 9px;
+                padding: 2px 7px;
+                font-size: 10px;
                 font-weight: 600;
             }}
             QLabel#neutralBadge, QLabel#riskBadge[sensitive="false"] {{
@@ -4069,8 +4230,8 @@ class SentryWindow(QMainWindow):
                 background: {PALETTE['neutral_badge_bg']};
                 border: 1px solid {PALETTE['border']};
                 border-radius: 5px;
-                padding: 2px 6px;
-                font-size: 9px;
+                padding: 2px 7px;
+                font-size: 10px;
                 font-weight: 550;
             }}
             QLabel#callSnippet {{ color: {PALETTE['gray']}; }}
@@ -4122,17 +4283,17 @@ class SentryWindow(QMainWindow):
                 color: {PALETTE['green_accessible']};
                 background: {PALETTE['green_soft']};
                 border-radius: 5px;
-                padding: 3px 7px;
-                font-size: 9px;
+                padding: 3px 8px;
+                font-size: 10px;
                 font-weight: 600;
             }}
             QLabel#pageTitle {{ color: {PALETTE['text']}; font-size: 23px; font-weight: 600; }}
             QLabel#formTitle, QLabel#reportLabel {{ color: {PALETTE['text']}; font-size: 14px; font-weight: 600; }}
             QLabel#apiGroupTitle {{ color: {PALETTE['text']}; font-size: 13px; font-weight: 600; padding-bottom: 2px; }}
-            QLabel#fieldLabel {{ color: {PALETTE['muted']}; font-size: 10px; font-weight: 550; }}
+            QLabel#fieldLabel {{ color: {PALETTE['muted']}; font-size: 11px; font-weight: 550; }}
             QPushButton#validateButton {{
                 background: {PALETTE['green_accessible']};
-                color: white;
+                color: {PALETTE['on_primary']};
                 border: 1px solid {PALETTE['green_accessible']};
             }}
             QPushButton#validateButton:hover {{ background: {PALETTE['primary_hover']}; }}
@@ -4188,6 +4349,37 @@ class SentryWindow(QMainWindow):
             QFrame#reportMetricAccent {{ background: {PALETTE['panel']}; }}
             QLabel#reportValue, QLabel#reportValueAccent {{ color: {PALETTE['text']}; font-size: 28px; font-weight: 600; }}
             QLabel#reportValueAccent {{ color: {PALETTE['green_accessible']}; }}
+            QLabel#costMetricDetail {{ color: {PALETTE['muted']}; font-size: 11px; }}
+            QLabel#costSummary {{ color: {PALETTE['charcoal']}; font-size: 11px; font-weight: 550; }}
+            QLabel#costGroup {{
+                color: {PALETTE['muted']}; font-size: 10px; font-weight: 650; letter-spacing: 0.3px;
+                padding: 10px 0 4px 0; border-bottom: 1px solid {PALETTE['border']};
+            }}
+            QLabel#costModelName {{ color: {PALETTE['text']}; font-size: 13px; font-weight: 600; }}
+            QLabel#costAmount {{ color: {PALETTE['text']}; font-size: 13px; font-weight: 650; }}
+            QLabel#costCell {{ color: {PALETTE['text_soft']}; font-size: 12px; }}
+            QLabel#costMuted {{ color: {PALETTE['muted']}; font-size: 11px; }}
+            QLabel#costLegend {{ color: {PALETTE['text_soft']}; font-size: 11px; font-weight: 550; }}
+            QDateEdit {{
+                min-height: 36px;
+                background: {PALETTE['panel']};
+                color: {PALETTE['text']};
+                border: 1px solid {PALETTE['border_strong']};
+                border-radius: 7px;
+                padding: 0 8px 0 11px;
+                selection-background-color: {PALETTE['green_deep']};
+                selection-color: white;
+            }}
+            QDateEdit:disabled {{ background: {PALETTE['disabled_bg']}; color: {PALETTE['gray_light']}; }}
+            QDateEdit::drop-down {{
+                width: 28px;
+                background: {PALETTE['surface']};
+                border: none;
+                border-left: 1px solid {PALETTE['border']};
+                border-top-right-radius: 6px;
+                border-bottom-right-radius: 6px;
+            }}
+            QDateEdit::down-arrow {{ image: url("{combo_arrow}"); width: 12px; height: 12px; }}
             QLabel#toast {{
                 background: {PALETTE['toast_bg']};
                 color: {PALETTE['toast_text']};

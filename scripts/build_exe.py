@@ -46,7 +46,8 @@ def clean_database(destination: Path) -> None:
             raise RuntimeError("La base inicial no superó la comprobación de integridad.")
         populated = {
             table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            for table in ("calls", "base_jobs", "base_records", "call_bases", "app_settings", "api_credentials")
+            for table in ("calls", "base_jobs", "base_records", "call_bases", "app_settings",
+                          "api_credentials", "api_provider_keys")
         }
     if any(populated.values()):
         raise RuntimeError(f"La base inicial contiene datos locales: {populated}")

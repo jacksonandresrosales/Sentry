@@ -9,17 +9,20 @@ import tempfile
 
 import xlsxwriter
 
-from app.services.api_costs import DEFAULT_PRICES, DEEPGRAM_KEYTERM_RATE, load_cost_report
+from app.services.api_costs import (
+    ASSEMBLYAI_KEYTERM_RATE, DEFAULT_PRICES, DEEPGRAM_KEYTERM_RATE, load_cost_report,
+)
 
 
 SOURCES = {
     'deepgram': 'https://deepgram.com/pricing',
+    'assemblyai': 'https://www.assemblyai.com/pricing',
     'gemini': 'https://ai.google.dev/gemini-api/docs/pricing',
     'deepseek': 'https://api-docs.deepseek.com/quick_start/pricing/',
     'groq': 'https://console.groq.com/docs/models',
 }
 SERVICE_NAMES = {'transcription': 'Transcripción', 'analysis': 'Análisis'}
-PROVIDER_NAMES = {'deepgram': 'Deepgram', 'gemini': 'Gemini', 'deepseek': 'DeepSeek',
+PROVIDER_NAMES = {'deepgram': 'Deepgram', 'assemblyai': 'AssemblyAI', 'gemini': 'Gemini', 'deepseek': 'DeepSeek',
                   'groq': 'Groq',
                   'openai': 'OpenAI'}
 
@@ -35,6 +38,10 @@ def _tariff_name(event: dict) -> str:
     if key == ('transcription', 'deepgram', 'nova-3'):
         base = DEFAULT_PRICES[key][1]
         return 'Nova-3 + Keyterm' if abs((event['input_rate'] or 0) - base - DEEPGRAM_KEYTERM_RATE) < 1e-8 else 'Nova-3 base'
+    if key[:2] == ('transcription', 'assemblyai') and key in DEFAULT_PRICES:
+        base = DEFAULT_PRICES[key][1]
+        keyterm = abs((event['input_rate'] or 0) - base - ASSEMBLYAI_KEYTERM_RATE) < 1e-8
+        return 'Diarización + Keyterms' if keyterm else 'Diarización'
     if key == ('analysis', 'deepseek', 'deepseek-flash'):
         peak = DEFAULT_PRICES[key][1]
         return 'Pico' if abs((event['input_rate'] or 0) - peak) < 1e-8 else 'Fuera de pico'
@@ -195,7 +202,8 @@ def export_api_costs_excel(database, output: Path, start: date, end: date,
 
             tariffs = book.add_worksheet('Tarifas')
             tariffs.write_string(0, 0, 'Referencias automáticas de pago por uso', title)
-            tariffs.write_string(1, 0, 'Precios consultados el 23/09/2026.', note)
+            tariffs.write_string(1, 0, 'Referencias incluidas en Sentry; pueden cambiar. '
+                                 'AssemblyAI verificado el 16/10/2026.', note)
             tariffs.write_string(2, 0, 'Tarifa usada: hoja Solicitudes.', note)
             tariffs.set_row(1, 42)
             tariffs.set_row(2, 42)
@@ -206,6 +214,12 @@ def export_api_costs_excel(database, output: Path, start: date, end: date,
                 ('deepgram', 'Nova-3', 'Audio pregrabado monolingüe', 'USD/min', .0043, None, None),
                 ('deepgram', 'Keyterm Prompting', 'Adicional si se envían términos', 'USD/min',
                  DEEPGRAM_KEYTERM_RATE, None, None),
+                ('assemblyai', 'Universal-2', 'Pregrabado con diarización estándar', 'USD/min',
+                 DEFAULT_PRICES[('transcription', 'assemblyai', 'universal-2')][1], None, None),
+                ('assemblyai', 'Universal-3.5 Pro', 'Pregrabado con diarización estándar', 'USD/min',
+                 DEFAULT_PRICES[('transcription', 'assemblyai', 'universal-3-5-pro')][1], None, None),
+                ('assemblyai', 'Keyterms Prompting', 'Universal-3.5 Pro; incluido en Universal-2', 'USD/min',
+                 ASSEMBLYAI_KEYTERM_RATE, None, None),
                 ('gemini', 'Gemini 3.5 Flash', 'Estándar, nivel de pago', 'USD/1M tokens', 1.50, .15, 9.00),
                 ('deepseek', 'DeepSeek V4.1 Flash', 'Pico UTC, lunes a viernes 01–04 y 06–10',
                  'USD/1M tokens', .30, .006, 1.20),
@@ -219,10 +233,11 @@ def export_api_costs_excel(database, output: Path, start: date, end: date,
                 for column, value in ((4, input_rate), (5, cached_rate), (6, output_rate)):
                     _number(tariffs, row, column, value, currency)
                 tariffs.write_url(row, 7, SOURCES[source], string='Fuente oficial')
-            tariffs.write_string(11, 0, 'Tarifas efectivamente guardadas en este período', title)
+            applied_title_row = 4 + len(references) + 1
+            tariffs.write_string(applied_title_row, 0, 'Tarifas efectivamente guardadas en este período', title)
             applied_headers = ('Servicio', 'Proveedor', 'Modelo', 'Unidad', 'Entrada / minuto USD',
                                'Caché USD', 'Salida USD', 'Solicitudes', 'Costo USD', 'Sin estimación')
-            tariffs.write_row(13, 0, applied_headers, header)
+            tariffs.write_row(applied_title_row + 2, 0, applied_headers, header)
             applied = defaultdict(lambda: {'requests': 0, 'cost': 0.0, 'unpriced': 0})
             for event in report['events']:
                 key = (event['service'], event['provider'], event['model'], event['price_unit'],
@@ -230,7 +245,7 @@ def export_api_costs_excel(database, output: Path, start: date, end: date,
                 applied[key]['requests'] += 1
                 applied[key]['cost'] += event['cost_usd'] or 0
                 applied[key]['unpriced'] += event['cost_usd'] is None
-            for row, (key, values) in enumerate(sorted(applied.items(), key=lambda item: str(item[0])), 14):
+            for row, (key, values) in enumerate(sorted(applied.items(), key=lambda item: str(item[0])), applied_title_row + 3):
                 service_id, provider_id, model, unit, input_rate, cached_rate, output_rate = key
                 for column, value in enumerate((_label(service_id, SERVICE_NAMES),
                         _label(provider_id, PROVIDER_NAMES), model, unit or '')):
@@ -241,17 +256,17 @@ def export_api_costs_excel(database, output: Path, start: date, end: date,
                 tariffs.write_number(row, 7, values['requests'])
                 tariffs.write_number(row, 8, values['cost'], currency)
                 tariffs.write_number(row, 9, values['unpriced'])
-            tariff_total_row = 14 + len(applied)
+            tariff_total_row = applied_title_row + 3 + len(applied)
             tariffs.write_string(tariff_total_row, 6, 'TOTAL', total_label)
             tariffs.write_number(tariff_total_row, 7, report['requests'])
             if applied:
-                tariffs.write_formula(tariff_total_row, 8, f'=SUM(I15:I{tariff_total_row})',
+                tariffs.write_formula(tariff_total_row, 8, f'=SUM(I{applied_title_row + 4}:I{tariff_total_row})',
                                       total_currency, report['total_usd'])
             else:
                 tariffs.write_number(tariff_total_row, 8, 0, total_currency)
             tariffs.write_number(tariff_total_row, 9, report['unpriced'])
             explanations = (
-                'Audio: segundos / 60 × tarifa por minuto. Keyterm suma su tarifa al minuto de Nova-3.',
+                'Audio: segundos / 60 × tarifa por minuto. Keyterm suma su tarifa al minuto de Nova-3 o de AssemblyAI.',
                 'Texto: (tokens de entrada sin caché × tarifa de entrada + tokens en caché × tarifa '
                 'de caché + tokens de salida × tarifa de salida) / 1 000 000.',
                 'DeepSeek: pico de lunes a viernes, 01:00–04:00 y 06:00–10:00 UTC. '

@@ -74,6 +74,13 @@ CREATE TABLE IF NOT EXISTS api_credentials (
     provider TEXT NOT NULL, model TEXT NOT NULL, encrypted_key TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+-- Última clave validada de cada proveedor, para alternar sin volver a escribirla.
+CREATE TABLE IF NOT EXISTS api_provider_keys (
+    service TEXT NOT NULL CHECK(service IN ('transcription','analysis')),
+    provider TEXT NOT NULL, encrypted_key TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(service, provider)
+);
 CREATE TABLE IF NOT EXISTS remote_connection (
     id INTEGER PRIMARY KEY CHECK(id = 1),
     host TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 22,
@@ -274,10 +281,23 @@ class Database:
                                "ON CONFLICT(service) DO UPDATE SET provider=excluded.provider,model=excluded.model,"
                                "encrypted_key=excluded.encrypted_key,updated_at=CURRENT_TIMESTAMP",
                                (service, provider, model, encrypted_key))
+            connection.execute("INSERT INTO api_provider_keys(service,provider,encrypted_key) VALUES (?,?,?) "
+                               "ON CONFLICT(service,provider) DO UPDATE SET encrypted_key=excluded.encrypted_key,"
+                               "updated_at=CURRENT_TIMESTAMP", (service, provider, encrypted_key))
 
     def credentials(self):
         with self.connect() as connection:
             return {row["service"]: dict(row) for row in connection.execute("SELECT * FROM api_credentials")}
+
+    def provider_key(self, service: str, provider: str) -> str | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT encrypted_key FROM api_provider_keys WHERE service=? AND provider=?",
+                                     (service, provider)).fetchone()
+            if row is None:
+                # Bases anteriores solo guardaban la clave del proveedor activo.
+                row = connection.execute("SELECT encrypted_key FROM api_credentials WHERE service=? AND provider=?",
+                                         (service, provider)).fetchone()
+            return row[0] if row else None
 
     def save_remote_connection(self, host: str, port: int, username: str, encrypted_password: str,
                                remote_path: str, host_fingerprint: str):

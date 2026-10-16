@@ -14,7 +14,7 @@ from urllib.error import HTTPError
 from urllib.request import Request
 
 from app.services import app_updates as updates
-from scripts.build_exe import write_update_metadata
+from scripts.build_exe import clean_database, write_update_metadata
 
 
 PAYLOAD = b"MZ" + b"test-installer-never-executed" * 10
@@ -271,6 +271,18 @@ class UpdateDownloadTests(unittest.TestCase):
                                "asset": {"name": installer.name, "size": len(PAYLOAD), "sha256": DIGEST}})
         self.assertEqual(checksum.read_text(encoding="utf-8"), f"{DIGEST}  {installer.name}\n")
         self.assertFalse(list(self.root.glob("*.tmp")))
+
+
+class InitialDatabaseTests(unittest.TestCase):
+    def test_installer_database_has_no_saved_keys_or_client_records(self):
+        from app.database import Database
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'initial.db'
+            clean_database(path)
+            with Database(path).connect() as connection:
+                for table in ('calls', 'api_credentials', 'api_provider_keys', 'remote_connection'):
+                    with self.subTest(table=table):
+                        self.assertEqual(connection.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0], 0)
 
 
 if __name__ == "__main__":

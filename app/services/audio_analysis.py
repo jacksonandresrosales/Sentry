@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import mimetypes
 from contextvars import ContextVar
@@ -16,6 +17,8 @@ import unicodedata
 from urllib.parse import quote, urlsplit
 
 import requests
+
+from app.services.audio_trim import trim_silence
 
 
 TRANSCRIPTION_VERSION = "2"
@@ -120,7 +123,18 @@ def cached_file_hash(database, path: Path) -> str:
     return digest
 
 
-def _request(method, url, *, retries=3, **kwargs):
+def _record_usage(service: str, provider: str, payload: dict, *, keyterm: bool = False):
+    context = _COST_CONTEXT.get()
+    if context is not None and isinstance(payload, dict):
+        model = payload.get('speech_model_used') if provider == 'assemblyai' else None
+        context['database'].record_api_usage(
+            context['path'], service, provider, model or context['config'][f'{service}_model'],
+            payload, context['duration_seconds'], keyterm=keyterm,
+        )
+
+
+def _request(method, url, *, retries=3, billable=False, **kwargs):
+    """`billable`: el proveedor cobra al recibir el audio; tras un corte ambiguo no se reenvía."""
     last = None
     for attempt in range(retries):
         _wait_for_provider(url)
@@ -144,14 +158,22 @@ def _request(method, url, *, retries=3, **kwargs):
             response = session.request(method, url, timeout=(15, 300), **kwargs)
         except requests.RequestException as exc:
             last = exc
+            # Si el audio pudo llegar al proveedor, reenviarlo podría cobrarse dos veces.
+            if billable and not isinstance(exc, requests.ConnectTimeout):
+                raise AnalysisError("Se cortó la conexión después de enviar el audio; no se reenvía para "
+                                    f"evitar un cobro doble. Vuelve a analizar más tarde: {exc}") from exc
             if attempt + 1 == retries:
                 raise AnalysisError(f"No se pudo conectar con la API: {exc}") from exc
         else:
             if response.status_code < 400:
+                if method == 'DELETE' and response.status_code == 204:
+                    return {}
                 try:
                     payload = response.json()
                 except ValueError as exc:
                     raise AnalysisError("La API devolvió una respuesta que no es JSON.") from exc
+                if not isinstance(payload, dict):
+                    raise AnalysisError("La API devolvió un formato de respuesta inesperado.")
                 context = _COST_CONTEXT.get()
                 if context is not None and isinstance(payload, dict):
                     if 'api.deepgram.com/v1/listen' in url:
@@ -168,22 +190,22 @@ def _request(method, url, *, retries=3, **kwargs):
                         service, provider = 'analysis', 'groq'
                     else:
                         return payload
-                    context['database'].record_api_usage(
-                        context['path'], service, provider, context['config'][f'{service}_model'],
-                        payload, context['duration_seconds'],
-                        keyterm=(provider == 'deepgram' and any(
-                            item[0] == 'keyterm' for item in (kwargs.get('params') or ()))),
-                    )
+                    _record_usage(service, provider, payload, keyterm=(provider == 'deepgram' and any(
+                        item[0] == 'keyterm' for item in (kwargs.get('params') or ()))))
                 return payload
             message = ""
             try:
                 body = response.json()
-                message = body.get("error", {}).get("message", "") if isinstance(body.get("error"), dict) else str(body.get("error", ""))
+                if isinstance(body, dict):
+                    message = body.get("error", {}).get("message", "") if isinstance(body.get("error"), dict) else str(body.get("error", ""))
             except ValueError:
                 pass
             retry_after = _retry_after_seconds(response)
             if response.status_code == 429:
                 _defer_provider(url, retry_after if retry_after is not None else 2 ** attempt)
+            if billable and response.status_code in {500, 502, 503, 504}:
+                raise AnalysisError(f"La API respondió {response.status_code}; no se reenvía el audio "
+                                    "para evitar un cobro doble.")
             if response.status_code not in {429, 500, 502, 503, 504} or attempt + 1 == retries:
                 if response.status_code in {401, 403}:
                     raise AnalysisError("La API rechazó la clave configurada.")
@@ -200,12 +222,17 @@ def _request(method, url, *, retries=3, **kwargs):
     raise AnalysisError(str(last))
 
 
-def _deepgram_transcript(path: Path, key: str, model: str, keywords: list[str]):
+def _audio_stream(path: Path, audio: bytes | None):
+    """El audio recortado viaja desde memoria; si no hubo recorte se lee el archivo original."""
+    return io.BytesIO(audio) if audio is not None else path.open("rb")
+
+
+def _deepgram_transcript(path: Path, key: str, model: str, keywords: list[str], audio: bytes | None = None):
     params = [("model", model), ("language", "es-419"), ("smart_format", "true"),
               ("utterances", "true"), ("diarize_model", "latest"), ("mip_opt_out", "true")]
     params.extend(("keyterm", word) for word in keywords)
-    with path.open("rb") as stream:
-        payload = _request("POST", "https://api.deepgram.com/v1/listen", params=params,
+    with _audio_stream(path, audio) as stream:
+        payload = _request("POST", "https://api.deepgram.com/v1/listen", params=params, billable=True,
                            headers={"Authorization": f"Token {key}",
                                     "Content-Type": mimetypes.guess_type(path.name)[0] or "application/octet-stream"},
                            data=stream)
@@ -225,13 +252,73 @@ def _deepgram_transcript(path: Path, key: str, model: str, keywords: list[str]):
             "speaker_count": speakers, "provider": "deepgram", "model": model}
 
 
-def _openai_transcript(path: Path, key: str, model: str):
+ASSEMBLYAI_API = "https://api.assemblyai.com/v2"
+ASSEMBLYAI_KEYTERM_LIMITS = {"universal-2": 200, "universal-3-5-pro": 1000}
+ASSEMBLYAI_POLL_SECONDS = 3.0
+ASSEMBLYAI_MAX_WAIT_SECONDS = 30 * 60
+
+
+def _assemblyai_keyterms(model: str, keywords: list[str]) -> list[str]:
+    """Respeta los límites publicados: hasta 6 palabras por frase y 200/1000 frases por modelo."""
+    terms = [" ".join(str(word).split()) for word in keywords]
+    terms = list(dict.fromkeys(term for term in terms if term and len(term.split()) <= 6))
+    return terms[:ASSEMBLYAI_KEYTERM_LIMITS.get(model, 200)]
+
+
+def _assemblyai_transcript(path: Path, key: str, model: str, keywords: list[str], audio: bytes | None = None):
+    headers = {"authorization": key}
+    with _audio_stream(path, audio) as stream:
+        upload = _request("POST", f"{ASSEMBLYAI_API}/upload",
+                          headers={**headers, "Content-Type": "application/octet-stream"}, data=stream)
+    audio_url = upload.get("upload_url")
+    if not audio_url:
+        raise AnalysisError("AssemblyAI no devolvió la dirección del audio subido.")
+    body = {"audio_url": audio_url, "speech_models": [model], "language_code": "es",
+            "speaker_labels": True, "punctuate": True, "format_text": True}
+    keyterms = _assemblyai_keyterms(model, keywords)
+    if keyterms:
+        body["keyterms_prompt"] = keyterms
+    job = _request("POST", f"{ASSEMBLYAI_API}/transcript", headers=headers, json=body, billable=True)
+    transcript_id = job.get("id")
+    if not transcript_id:
+        raise AnalysisError("AssemblyAI no devolvió el identificador de la transcripción.")
+    deadline = time.monotonic() + ASSEMBLYAI_MAX_WAIT_SECONDS
+    payload = job
+    while payload.get("status") not in {"completed", "error"}:
+        if time.monotonic() > deadline:
+            raise AnalysisError("AssemblyAI no terminó la transcripción en 30 minutos. Vuelve a analizar más tarde.")
+        time.sleep(ASSEMBLYAI_POLL_SECONDS)
+        payload = _request("GET", f"{ASSEMBLYAI_API}/transcript/{transcript_id}", headers=headers)
+    if payload.get("status") == "error":
+        raise AnalysisError(f"AssemblyAI no pudo transcribir el audio: {payload.get('error') or 'error desconocido'}")
+    _record_usage("transcription", "assemblyai", payload, keyterm=bool(keyterms))
+    utterances = payload.get("utterances") or []
+    labels: dict[str, str] = {}
+    segments = []
+    for item in utterances:
+        text = str(item.get("text", "")).strip()
+        if not text:
+            continue
+        label = labels.setdefault(str(item.get("speaker", "")), f"Hablante {len(labels) + 1}")
+        segments.append({"second": float(item.get("start") or 0) / 1000, "speaker": label, "text": text,
+                         "word_seconds": [float(word.get("start") or 0) / 1000 for word in (item.get("words") or [])
+                                          if isinstance(word, dict)]})
+    text = str(payload.get("text") or "").strip()
+    if not segments and text:
+        segments = [{"second": 0.0, "speaker": "Hablante", "text": text}]
+    speakers = len(labels) if utterances else None
+    return {"text": text or " ".join(item["text"] for item in segments), "segments": segments,
+            "speaker_count": speakers, "provider": "assemblyai",
+            "model": str(payload.get("speech_model_used") or model), "request_id": str(transcript_id)}
+
+
+def _openai_transcript(path: Path, key: str, model: str, audio: bytes | None = None):
     data = {"model": model, "language": "es", "response_format": "json"}
     if "diarize" in model:
         data["response_format"] = "diarized_json"
         data["chunking_strategy"] = "auto"
-    with path.open("rb") as stream:
-        payload = _request("POST", "https://api.openai.com/v1/audio/transcriptions",
+    with _audio_stream(path, audio) as stream:
+        payload = _request("POST", "https://api.openai.com/v1/audio/transcriptions", billable=True,
                            headers={"Authorization": f"Bearer {key}"}, data=data,
                            files={"file": (path.name, stream, mimetypes.guess_type(path.name)[0] or "application/octet-stream")})
     text = str(payload.get("text", "")).strip()
@@ -248,12 +335,49 @@ def _openai_transcript(path: Path, key: str, model: str):
             "provider": "openai", "model": model}
 
 
-def transcribe(path: Path, provider: str, key: str, model: str, keywords: list[str]):
+def _shift_transcript(transcript: dict, offset: float) -> dict:
+    """Devuelve las marcas de tiempo a la posición que tienen en el audio original."""
+    if offset:
+        transcript["segments"] = [
+            {**segment, "second": round(float(segment.get("second", 0)) + offset, 3),
+             **({"word_seconds": [round(float(value) + offset, 3) for value in segment["word_seconds"]]}
+                if "word_seconds" in segment else {})}
+            for segment in transcript.get("segments") or []
+        ]
+    return transcript
+
+
+def _provider_transcript(path: Path, provider: str, key: str, model: str, keywords: list[str],
+                         audio: bytes | None = None):
     if provider == "deepgram":
-        return _deepgram_transcript(path, key, model, keywords)
+        return _deepgram_transcript(path, key, model, keywords, audio)
+    if provider == "assemblyai":
+        return _assemblyai_transcript(path, key, model, keywords, audio)
     if provider == "openai":
-        return _openai_transcript(path, key, model)
+        return _openai_transcript(path, key, model, audio)
     raise AnalysisError(f"Proveedor de transcripción no compatible: {provider}")
+
+
+def transcribe(path: Path, provider: str, key: str, model: str, keywords: list[str]):
+    """Omite silencio digital inicial/final sin descartar señales de volumen bajo.
+    Las marcas de tiempo se corrigen para coincidir con el archivo original."""
+    if provider not in {"deepgram", "assemblyai", "openai"}:
+        raise AnalysisError(f"Proveedor de transcripción no compatible: {provider}")
+    trimmed = trim_silence(path)
+    if trimmed is not None and not trimmed.has_speech:
+        return {"text": "", "segments": [], "speaker_count": None, "provider": provider, "model": model,
+                "skipped_reason": "sin_voz"}
+    if trimmed is None or trimmed.data is None:
+        return _provider_transcript(path, provider, key, model, keywords)
+    context = _COST_CONTEXT.get()
+    token = _COST_CONTEXT.set({**context, 'duration_seconds': trimmed.kept_seconds}) if context is not None else None
+    try:
+        transcript = _provider_transcript(path, provider, key, model, keywords, trimmed.data)
+    finally:
+        if token is not None:
+            _COST_CONTEXT.reset(token)
+    transcript["trimmed_seconds"] = round(trimmed.original_seconds - trimmed.kept_seconds, 3)
+    return _shift_transcript(transcript, trimmed.offset_seconds)
 
 
 def _normalized(text: str) -> str:
@@ -500,6 +624,14 @@ def _analyze_file(database, path: Path, config: dict, digest: str | None = None)
         lambda: transcribe(path, config["transcription_provider"], config["transcription_key"],
                            config["transcription_model"], keywords),
     )
+    if (not transcription_cached and transcript.get("provider") == "assemblyai"
+            and transcript.get("request_id")):
+        try:
+            # El resultado ya está guardado: un fallo de disco no elimina la única copia remota.
+            _request("DELETE", f"{ASSEMBLYAI_API}/transcript/{quote(transcript['request_id'], safe='')}",
+                     headers={"authorization": config["transcription_key"]}, retries=1)
+        except AnalysisError:
+            pass
     transcription_ms = (time.perf_counter() - transcription_started) * 1000
     transcript = assign_roles(transcript)
     database.set_call_status(path, "ANALIZANDO")

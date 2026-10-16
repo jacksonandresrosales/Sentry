@@ -122,7 +122,7 @@ class UpdateUiTests(unittest.TestCase):
         self.ready_to_install()
         for name in ("analysis_worker", "local_scan_worker", "issabel_match_worker", "winscp_worker",
                      "remote_search_worker", "report_export_worker"):
-            with self.subTest(worker=name), patch.object(self.window, name, object()):
+            with self.subTest(worker=name), patch.object(self.window, name, object(), create=True):
                 self.panel._action()
                 self.assertIsNone(self.panel.worker)
                 self.assertIn("Termina o detén", self.panel.status.text())
@@ -132,6 +132,10 @@ class UpdateUiTests(unittest.TestCase):
         with patch.object(self.window.reports_page, "worker", object()):
             self.panel._action()
             self.assertIsNone(self.panel.worker)
+        for name in ('worker', 'export_worker'):
+            with self.subTest(page='costs', worker=name), patch.object(self.window.costs_page, name, object()):
+                self.panel._action()
+                self.assertIsNone(self.panel.worker)
         self.question.assert_not_called()
         self.launch.assert_not_called()
 

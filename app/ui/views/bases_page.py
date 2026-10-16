@@ -81,8 +81,11 @@ class BasesPage(QWidget):
         subtitle = QLabel("Prepara bases CSV o Excel de Issabel o Lucid para relacionarlas con tus grabaciones.")
         subtitle.setObjectName("pageSubtitle")
         subtitle.setWordWrap(True)
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
+        heading_block = QVBoxLayout()
+        heading_block.setSpacing(4)
+        heading_block.addWidget(title)
+        heading_block.addWidget(subtitle)
+        layout.addLayout(heading_block)
 
         panel = QFrame()
         panel.setObjectName("contentPanel")
@@ -145,11 +148,18 @@ class BasesPage(QWidget):
         fields.addWidget(number_label, 1, 2)
         fields.addWidget(self.base_number, 1, 3, 1, 2)
         self.issabel_controls = [type_label, self.base_type, number_label, self.base_number]
+        fields.setColumnStretch(1, 1)
+        fields.setColumnStretch(3, 1)
         form.addLayout(fields)
 
         self.advanced_toggle = self.button("Opciones avanzadas", self.toggle_advanced)
         self.advanced_toggle.setCheckable(True)
-        form.addWidget(self.advanced_toggle)
+        self.advanced_toggle.setObjectName("disclosureButton")
+        self.advanced_toggle.setText("▸  Opciones avanzadas")
+        advanced_row = QHBoxLayout()
+        advanced_row.addWidget(self.advanced_toggle)
+        advanced_row.addStretch()
+        form.addLayout(advanced_row)
         self.advanced = QWidget()
         advanced = QGridLayout(self.advanced)
         advanced.setContentsMargins(0, 0, 0, 0)
@@ -256,7 +266,9 @@ class BasesPage(QWidget):
         return button
 
     def toggle_advanced(self):
-        self.advanced.setVisible(self.advanced_toggle.isChecked())
+        expanded = self.advanced_toggle.isChecked()
+        self.advanced_toggle.setText(("▾" if expanded else "▸") + "  Opciones avanzadas")
+        self.advanced.setVisible(expanded)
 
     def update_source_controls(self):
         lucid = self.source_system.currentData() == "lucid"

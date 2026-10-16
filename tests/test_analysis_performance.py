@@ -86,7 +86,7 @@ class AnalysisPerformanceTests(unittest.TestCase):
         self.assertEqual(result, (4, 0, False))
         self.assertEqual(transcribe.call_count, 1)
 
-    def test_changing_terms_reuses_transcript_but_changing_models_invalidates_correct_cache(self):
+    def test_changing_terms_or_models_reuses_transcript_and_reclassifies(self):
         path = self.audios(1)[0]
         with patch.object(audio_analysis, "transcribe", return_value=TRANSCRIPT) as transcribe, \
              patch.object(audio_analysis, "contextual_analysis", return_value=RESULT) as classify:
@@ -100,6 +100,11 @@ class AnalysisPerformanceTests(unittest.TestCase):
             changed_transcription = {**changed_analysis, "transcription_model": "another-transcription-model"}
             analyze_file(self.database, path, changed_transcription)
             self.assertEqual((transcribe.call_count, classify.call_count), (2, 4))
+            changed_provider = {**changed_transcription, "transcription_provider": "assemblyai"}
+            analyze_file(self.database, path, changed_provider)
+            self.assertEqual((transcribe.call_count, classify.call_count), (3, 5))
+            analyze_file(self.database, path, CONFIG)
+            self.assertEqual((transcribe.call_count, classify.call_count), (3, 5))
 
     def test_starts_before_hashing_entire_batch_and_respects_concurrency(self):
         paths = self.audios(12)
@@ -226,6 +231,18 @@ class ApiRetryTests(unittest.TestCase):
                 audio_analysis._request("POST", "https://api.example.test/audio")
         self.assertEqual(session.request.call_count, 3)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+
+    def test_api_rejects_non_object_json_and_handles_empty_delete(self):
+        for status in (200, 400):
+            with self.subTest(status=status):
+                response = SimpleNamespace(status_code=status, headers={}, json=lambda: [])
+                session = Mock(request=Mock(return_value=response))
+                with patch.object(audio_analysis._HTTP, 'session', session, create=True):
+                    with self.assertRaises(AnalysisError):
+                        audio_analysis._request('POST', 'https://api.example.test/audio')
+        session = Mock(request=Mock(return_value=SimpleNamespace(status_code=204)))
+        with patch.object(audio_analysis._HTTP, 'session', session, create=True):
+            self.assertEqual(audio_analysis._request('DELETE', 'https://api.example.test/transcript/1'), {})
 
     def test_provider_cooldown_does_not_hold_network_lock_and_is_origin_scoped(self):
         with patch.dict(audio_analysis._PROVIDER_COOLDOWNS, {}, clear=True), \

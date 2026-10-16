@@ -191,7 +191,10 @@ class UpdatePanel(QFrame):
         return any(getattr(self.window, name, None) is not None for name in (
             "analysis_worker", "local_scan_worker", "issabel_match_worker", "winscp_worker",
             "remote_search_worker", "report_export_worker",
-        )) or self.window.bases_page.busy or self.window.reports_page.worker is not None
+        )) or self.window.bases_page.busy or any(worker is not None for worker in (
+            self.window.reports_page.worker, self.window.costs_page.worker,
+            self.window.costs_page.export_worker,
+        ))
 
     def _action(self):
         if self.worker is not None or self.release is None or not getattr(sys, "frozen", False):
