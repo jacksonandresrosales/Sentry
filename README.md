@@ -35,7 +35,7 @@ Sentry es una aplicación de escritorio para Windows que centraliza la auditorí
 
 La aplicación está orientada al uso interno de Ecuaconexión. Puede procesar información sensible, por lo que las credenciales, bases, grabaciones y reportes deben mantenerse en equipos y carpetas con acceso restringido.
 
-> **Versión actual:** `1.0.1`
+> **Versión actual:** `1.0.2`
 
 ## Funcionalidades
 

@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 
 APP_NAME = "Sentry"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 UPDATE_REPOSITORY = "jacksonandresrosales/Sentry"
 APP_AUTHORS = "Jackson Ocaña y Jeremy Godoy"
 APP_DESCRIPTION = (
@@ -12,9 +12,10 @@ APP_DESCRIPTION = (
     "para facilitar la revisión y el seguimiento de cada caso."
 )
 APP_FEATURES = (
-    ("Groq para análisis", "En Configuración, Otros proveedores permite seleccionar Groq GPT-OSS 120B para el análisis contextual de las llamadas."),
-    ("Modelo y clave", "El modelo queda fijado para evitar errores de compatibilidad; Sentry valida la clave de Groq y la guarda cifrada con Windows."),
-    ("Costes API", "La pantalla y el Excel incluyen las solicitudes de Groq con tarifas de referencia. En el plan gratuito puede no existir un cargo real."),
+    ("Transcripción con AssemblyAI", "Puedes elegir Universal-2 o Universal-3.5 Pro. Las claves de cada proveedor se guardan cifradas con Windows."),
+    ("Costes API renovados", "Consulta costes y consumo por modelo, gráficos por día, semana o mes y filtros por periodo, servicio y proveedor. El Excel incluye todas las solicitudes del periodo."),
+    ("Audio y facturación", "El recorte elimina silencios digitales conservando la voz y los tiempos originales. Se evitan reenvíos automáticos de audio tras errores que podrían duplicar cargos."),
+    ("Fiabilidad y experiencia de uso", "Se corrige la reutilización de transcripciones entre modelos y proveedores, se afinan las estimaciones de costes y se mejora la lectura y los controles en los temas claro y oscuro."),
 )
 
 
