@@ -275,7 +275,8 @@ def _assemblyai_transcript(path: Path, key: str, model: str, keywords: list[str]
         raise AnalysisError("AssemblyAI no devolvió la dirección del audio subido.")
     body = {"audio_url": audio_url, "speech_models": [model], "language_code": "es",
             "speaker_labels": True, "punctuate": True, "format_text": True}
-    keyterms = _assemblyai_keyterms(model, keywords)
+    # Universal-2 solo admite keyterms en inglés; Sentry transcribe en español.
+    keyterms = _assemblyai_keyterms(model, keywords) if model == "universal-3-5-pro" else []
     if keyterms:
         body["keyterms_prompt"] = keyterms
     job = _request("POST", f"{ASSEMBLYAI_API}/transcript", headers=headers, json=body, billable=True)

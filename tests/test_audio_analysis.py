@@ -137,6 +137,32 @@ class AnalysisPersistenceTests(unittest.TestCase):
             self.assertEqual(transcript["segments"][0]["word_seconds"], [0.15])
             self.assertEqual((transcript["provider"], transcript["model"]), ("assemblyai", "universal-3-5-pro"))
 
+    def test_assemblyai_universal_2_spanish_omits_english_only_keyterms(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "audio.wav"
+            audio(path)
+            keywords = ["demanda", "abogado"]
+            responses = [{"upload_url": "https://cdn.assemblyai.com/upload/x"},
+                         {"id": "tr-u2", "status": "queued"},
+                         {"id": "tr-u2", "status": "completed", "text": "Presentaré una demanda.",
+                          "utterances": [{"speaker": "A", "start": 1000,
+                                          "text": "Presentaré una demanda."}]}]
+            with patch("app.services.audio_analysis._request", side_effect=responses) as request, \
+                    patch("app.services.audio_analysis.time.sleep"), \
+                    patch("app.services.audio_analysis._record_usage") as usage:
+                transcript = _assemblyai_transcript(path, "clave", "universal-2", keywords)
+            body = request.call_args_list[1].kwargs["json"]
+            self.assertNotIn("keyterms_prompt", body)
+            self.assertNotIn("word_boost", body)
+            self.assertEqual(body["speech_models"], ["universal-2"])
+            self.assertEqual(body["language_code"], "es")
+            self.assertTrue(body["speaker_labels"])
+            self.assertEqual(transcript["model"], "universal-2")
+            self.assertEqual(transcript["segments"][0]["second"], 1)
+            self.assertEqual(detected_keyword_hits(transcript, keywords)[0]["keyword"], "demanda")
+            self.assertEqual(keywords, ["demanda", "abogado"])
+            self.assertFalse(usage.call_args.kwargs["keyterm"])
+
     def test_assemblyai_error_status_and_keyterm_limit(self):
         from app.services.audio_analysis import AnalysisError, _assemblyai_keyterms
         self.assertEqual(len(_assemblyai_keyterms("universal-2", [f"t{i}" for i in range(500)])), 200)

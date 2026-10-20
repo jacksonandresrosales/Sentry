@@ -18,6 +18,7 @@ from app.services.audio_analysis import assign_roles, keyword_signature
 from app.services.analysis_batch import analysis_concurrency, run_analysis_batch
 from app.services.api_costs import RECOMMENDED_API_MODELS, TRANSCRIPTION_MODEL_CHOICES
 from app.ui.update_controller import UpdatePanel
+from app.ui.cache_dialog import CacheDialog
 from app.services.base_conversion import (
     LUCID_AUDIO_SINCE, BaseAudioIndex, load_hoja1_audio_index, normalize_phone_number,
 )
@@ -1001,6 +1002,7 @@ class SentryWindow(QMainWindow):
         self.keyword_reanalysis_timer.setInterval(1500)
         self.keyword_reanalysis_timer.timeout.connect(self._commit_sensitive_terms)
         self.about_release_history: tuple[ReleaseNotesInfo, ...] = ()
+        self.cache_dialog: CacheDialog | None = None
 
         self.audio_output = QAudioOutput(self)
         self.audio_output.setVolume(1.0)
@@ -2009,6 +2011,10 @@ class SentryWindow(QMainWindow):
         performance_help.setWordWrap(True)
         performance_help.setObjectName("pageSubtitle")
         performance_layout.addWidget(performance_help)
+        self.clear_cache_button = QPushButton("Limpiar caché")
+        self.clear_cache_button.setObjectName("secondaryButton")
+        self.clear_cache_button.clicked.connect(self._show_cache_dialog)
+        performance_layout.addWidget(self.clear_cache_button)
         outer.addWidget(performance)
         self.updates_panel = UpdatePanel(self)
         outer.addWidget(self.updates_panel)
@@ -2024,6 +2030,15 @@ class SentryWindow(QMainWindow):
         outer.addStretch()
         scroll.setWidget(page)
         return scroll
+
+    def _show_cache_dialog(self) -> None:
+        self.cache_dialog = CacheDialog(self)
+        try:
+            self.cache_dialog.exec()
+        finally:
+            self.cache_dialog.deleteLater()
+            self.cache_dialog = None
+            QTimer.singleShot(0, self._run_pending_keyword_reanalysis)
 
     def _show_about(self) -> None:
         dialog = QDialog(self)
@@ -2515,18 +2530,21 @@ class SentryWindow(QMainWindow):
 
     def _validate_api(self, service: str) -> None:
         provider, _model, api_key, button, status = self._api_controls(service)
+        provider_id = str(provider.currentData())
         key = api_key.text().strip()
+        if provider_id == "deepgram":
+            key = re.sub(r"^Token\s+", "", key, flags=re.IGNORECASE).strip()
+            api_key.setText(key)
         if not key:
             self._set_api_status(status, "Introduce una clave antes de validar.", "error")
             api_key.setFocus()
             return
 
-        provider_id = str(provider.currentData())
         self._set_api_busy(service, True)
         button.setText("Validando…")
         self._set_api_status(status, f"Comprobando {provider.currentText()}…", "loading")
         if provider_id == "deepgram":
-            self._send_api_request(service, provider_id, key, "https://api.deepgram.com/v1/projects", "validate")
+            self._send_api_request(service, provider_id, key, "https://api.deepgram.com/v1/auth/token", "validate")
             return
         if provider_id == "assemblyai":
             # AssemblyAI no publica un catálogo de modelos; listar una transcripción comprueba la clave.
@@ -2569,7 +2587,13 @@ class SentryWindow(QMainWindow):
         reply.deleteLater()
 
         if error != QNetworkReply.NetworkError.NoError or not isinstance(status_code, int) or status_code >= 400:
-            if status_code in (401, 403):
+            if provider == "deepgram" and status_code == 401:
+                message = ("Deepgram rechazó la clave (HTTP 401). Copia la clave secreta completa "
+                           "y comprueba que no haya caducado ni sido revocada.")
+            elif provider == "deepgram" and status_code == 403:
+                message = ("Deepgram denegó el acceso (HTTP 403). Revisa los permisos de la clave "
+                           "y el estado del proyecto en Deepgram.")
+            elif status_code in (401, 403):
                 message = "Clave rechazada. Revisa la credencial y vuelve a intentar."
             elif status_code == 429:
                 message = "Límite temporal alcanzado. Intenta nuevamente en unos minutos."
@@ -2581,10 +2605,18 @@ class SentryWindow(QMainWindow):
             return
 
         if provider == "deepgram" and stage == "validate":
-            self._send_api_request(service, provider, key, "https://api.deepgram.com/v1/models", "models")
-            return
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+                if not isinstance(payload, dict) or not payload:
+                    raise ValueError("Respuesta de autenticación vacía o no válida.")
+            except (UnicodeDecodeError, ValueError):
+                self._set_api_busy(service, False)
+                button.setText("Reintentar")
+                self._set_api_status(status, "No se pudo leer la respuesta de autenticación de Deepgram. "
+                                     "Vuelve a validar la clave.", "error")
+                return
 
-        if provider == "assemblyai":
+        if provider in {"deepgram", "assemblyai"}:
             self._set_api_busy(service, False)
             button.setText("Validada")
             self._set_api_status(status, f"Clave válida · modelo elegido: {model.currentText().split(' · ')[0]}", "valid")
@@ -3621,6 +3653,8 @@ class SentryWindow(QMainWindow):
         QTimer.singleShot(0, self._run_pending_keyword_reanalysis)
 
     def _run_pending_keyword_reanalysis(self) -> None:
+        if self.cache_dialog is not None:
+            return
         if not self._keyword_reanalysis_pending or self.close_after_analysis or self.close_after_remote_scan:
             return
         if self.analysis_worker is not None or self.local_scan_worker is not None or self.issabel_match_worker is not None:

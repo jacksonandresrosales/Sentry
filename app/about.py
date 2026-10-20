@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 
 APP_NAME = "Sentry"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 UPDATE_REPOSITORY = "jacksonandresrosales/Sentry"
 APP_AUTHORS = "Jackson Ocaña y Jeremy Godoy"
 APP_DESCRIPTION = (
@@ -12,10 +12,10 @@ APP_DESCRIPTION = (
     "para facilitar la revisión y el seguimiento de cada caso."
 )
 APP_FEATURES = (
-    ("Transcripción con AssemblyAI", "Puedes elegir Universal-2 o Universal-3.5 Pro. Las claves de cada proveedor se guardan cifradas con Windows."),
-    ("Costes API renovados", "Consulta costes y consumo por modelo, gráficos por día, semana o mes y filtros por periodo, servicio y proveedor. El Excel incluye todas las solicitudes del periodo."),
-    ("Audio y facturación", "El recorte elimina silencios digitales conservando la voz y los tiempos originales. Se evitan reenvíos automáticos de audio tras errores que podrían duplicar cargos."),
-    ("Fiabilidad y experiencia de uso", "Se corrige la reutilización de transcripciones entre modelos y proveedores, se afinan las estimaciones de costes y se mejora la lectura y los controles en los temas claro y oscuro."),
+    ("Excel de costes más claro", "El informe organiza resumen, consumo diario, solicitudes y tarifas con navegación entre hojas, gráficos, filtros, fechas y totales. Conserva los identificadores y distingue los costes sin estimación."),
+    ("Limpieza de caché", "Configuración incorpora un cuadro con el tamaño aproximado y los registros de transcripciones, análisis e índice de archivos. Permite eliminar la caché y recuperar espacio conservando grabaciones, resultados, historial de costes y claves. La limpieza espera a que terminen las tareas activas; volver a procesar sin caché puede consumir API."),
+    ("Validación de Deepgram", "Se comprueba la clave sin exigir acceso a la administración de proyectos ni al catálogo de modelos. Se acepta el prefijo Token al pegarla y se diferencian las credenciales rechazadas de los problemas de permisos."),
+    ("Universal-2 en español", "Se corrige el error HTTP 400 al transcribir con AssemblyAI Universal-2: se omite el refuerzo de vocabulario que ese modelo solo admite en inglés. Las palabras clave siguen utilizándose para detectar alertas en el análisis posterior; Universal-3.5 Pro conserva su refuerzo de vocabulario."),
 )
 
 

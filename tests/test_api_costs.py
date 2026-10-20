@@ -20,7 +20,8 @@ class ApiCostsTests(unittest.TestCase):
             database = Database(Path(folder) / 'costs.db')
             path = Path(folder) / 'audio.wav'
             database.record_api_usage(path, 'transcription', 'deepgram', 'nova-3',
-                                      {'metadata': {'duration': 60, 'request_id': 'dg-1'}}, 60,
+                                      {'metadata': {'duration': 60, 'request_id': 'dg-1'},
+                                       'usage': {'input_tokens': 40, 'output_tokens': 10}}, 60,
                                       keyterm=True)
             database.record_api_usage(path, 'analysis', 'gemini', 'gemini-3.5-flash',
                                       {'usageMetadata': {'promptTokenCount': 1000,
@@ -40,9 +41,93 @@ class ApiCostsTests(unittest.TestCase):
             try:
                 self.assertEqual(book.sheetnames, ['Resumen', 'Diario', 'Solicitudes', 'Tarifas'])
                 self.assertAlmostEqual(book['Resumen']['B12'].value, report['total_usd'])
-                self.assertAlmostEqual(book['Solicitudes']['P6'].value, report['total_usd'])
+                self.assertAlmostEqual(book['Solicitudes']['E6'].value, report['total_usd'])
                 self.assertAlmostEqual(book['Tarifas']['I22'].value, report['total_usd'])
                 self.assertEqual(book['Solicitudes'].max_row, 6)
+                self.assertIsInstance(book['Solicitudes']['A2'].value, datetime)
+                self.assertIsInstance(book['Diario']['A2'].value, datetime)
+                self.assertEqual(book['Solicitudes'].freeze_panes, 'E2')
+                self.assertEqual(book['Solicitudes']['F1'].value, 'Estado')
+                self.assertEqual(book['Solicitudes'].auto_filter.ref, 'A1:Q5')
+                self.assertTrue(book['Solicitudes'].column_dimensions['L'].hidden)
+                self.assertEqual(len(book['Resumen']._charts), 1)
+                chart = book['Resumen']._charts[0]
+                self.assertEqual(chart.series[0].marker.symbol, 'circle')
+                self.assertEqual([series.val.numRef.numCache.ptCount for series in chart.series], [1, 1])
+                self.assertAlmostEqual(sum(series.val.numRef.numCache.pt[0].v for series in chart.series),
+                                       report['total_usd'])
+                self.assertAlmostEqual(sum(book['Resumen'].cell(row, 7).value for row in range(18, 21)), 1)
+                self.assertAlmostEqual(book['Resumen']['H18'].value, 1)
+                self.assertEqual(book['Resumen']['I18'].value, 40)
+                self.assertEqual(book['Resumen']['J18'].value, 10)
+                self.assertFalse(book['Resumen'].sheet_view.showGridLines)
+            finally:
+                book.close()
+
+    def test_excel_preserves_missing_costs_zero_costs_and_literal_identifiers(self):
+        with TemporaryDirectory() as folder:
+            database = Database(Path(folder) / 'costs.db')
+            path = Path(folder) / '=SUM(1,1).wav'
+            with database.connect() as connection:
+                connection.execute('INSERT INTO calls(filename,file_path) VALUES (?,?)', (path.name, str(path.resolve())))
+            database.record_api_usage(path, 'analysis', 'gemini', '=1+1',
+                                      {'usageMetadata': {'promptTokenCount': 500, 'candidatesTokenCount': 30}}, None)
+            database.record_api_usage(path, 'analysis', 'groq', 'openai/gpt-oss-120b',
+                                      {'usage': {'prompt_tokens': 0, 'completion_tokens': 0}}, None)
+            today = date.today()
+            output = export_api_costs_excel(database, Path(folder) / 'costs.xlsx', today, today + timedelta(days=1))
+            book = openpyxl.load_workbook(output, data_only=True)
+            try:
+                self.assertEqual(book['Solicitudes']['E2'].value, 0)
+                self.assertEqual(book['Solicitudes']['F2'].value, 'Estimado')
+                self.assertIsNone(book['Solicitudes']['E3'].value)
+                self.assertEqual(book['Solicitudes']['F3'].value, 'Sin estimación')
+                self.assertEqual(book['Solicitudes']['D3'].value, '=1+1')
+                self.assertEqual(book['Solicitudes']['D3'].data_type, 's')
+                self.assertEqual(book['Solicitudes']['G3'].value, path.name)
+                self.assertEqual(book['Solicitudes']['G3'].data_type, 's')
+                self.assertEqual(book['Resumen']['B9'].value, 1)
+                self.assertEqual(book['Resumen']['B12'].value, 0)
+            finally:
+                book.close()
+
+    def test_excel_exports_all_filtered_requests_and_reconciles_totals(self):
+        with TemporaryDirectory() as folder:
+            database = Database(Path(folder) / 'costs.db')
+            with database.connect() as connection:
+                connection.executemany("""INSERT INTO api_usage
+                    (service,provider,model,request_id,cost_usd,created_at)
+                    VALUES ('analysis','groq','openai/gpt-oss-120b',?,?,datetime(?,'utc'))""",
+                    [(str(index), .001, '2026-10-01 12:00:00') for index in range(502)] +
+                    [('outside-period', 100, '2026-10-02 12:00:00')])
+                connection.execute("""INSERT INTO api_usage (service,provider,model,cost_usd,created_at)
+                    VALUES ('analysis','gemini','custom',200,datetime('2026-10-01 12:00:00','utc'))""")
+            output = export_api_costs_excel(database, Path(folder) / 'costs.xlsx', date(2026, 10, 1),
+                                           date(2026, 10, 2), 'analysis', 'groq')
+            book = openpyxl.load_workbook(output, data_only=True)
+            try:
+                self.assertEqual(book['Solicitudes'].max_row, 504)
+                self.assertEqual(book['Resumen']['B8'].value, 502)
+                for sheet, cell in (('Resumen', 'B12'), ('Resumen', 'E19'), ('Diario', 'D3'),
+                                    ('Solicitudes', 'E504'), ('Tarifas', 'I19')):
+                    self.assertAlmostEqual(book[sheet][cell].value, .502, msg=f'{sheet}!{cell}')
+                self.assertEqual(book['Resumen']['B5'].value, 'Análisis')
+                self.assertEqual(book['Resumen']['B6'].value, 'Groq')
+            finally:
+                book.close()
+
+    def test_empty_excel_has_zero_totals_without_self_referencing_formulas(self):
+        with TemporaryDirectory() as folder:
+            database = Database(Path(folder) / 'costs.db')
+            day = date(2026, 10, 1)
+            output = export_api_costs_excel(database, Path(folder) / 'empty.xlsx', day, day)
+            book = openpyxl.load_workbook(output)
+            try:
+                self.assertEqual(book['Diario']['D2'].value, 0)
+                self.assertEqual(book['Solicitudes']['E2'].value, 0)
+                self.assertEqual(book['Resumen']['E18'].value, 0)
+                self.assertEqual(book['Tarifas']['I18'].value, 0)
+                self.assertEqual(len(book['Resumen']._charts), 0)
             finally:
                 book.close()
 

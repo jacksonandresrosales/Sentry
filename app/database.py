@@ -40,6 +40,12 @@ def _bundled_database() -> Path:
 
 DEFAULT_DATABASE = _bundled_database()
 
+_PROCESSING_CACHE_COLUMNS = {
+    "transcription_cache": ("cache_key", "transcript_json", "created_at"),
+    "analysis_cache": ("cache_key", "result_json", "created_at"),
+    "file_fingerprints": ("file_path", "file_size", "modified_ns", "digest", "updated_at"),
+}
+
 
 def effective_call_category(category: str | None, reviewed: bool) -> str:
     """La decisión humana prevalece sin sustituir la clasificación automática."""
@@ -384,6 +390,29 @@ class Database:
         with self.connect() as connection:
             connection.execute("UPDATE calls SET status=?,analysis_error=? WHERE file_path=?",
                                (status, error, str(Path(file_path).resolve())))
+
+    def processing_cache_usage(self) -> dict[str, dict[str, int]]:
+        """Tamaño aproximado del contenido; excluye las llamadas y sus resultados."""
+        usage = {}
+        with self.connect() as connection:
+            for table, columns in _PROCESSING_CACHE_COLUMNS.items():
+                size = "+".join(f"length(CAST({column} AS BLOB))" for column in columns)
+                row = connection.execute(f"SELECT COUNT(*),COALESCE(SUM({size}),0) FROM {table}").fetchone()
+                usage[table] = {"entries": row[0], "bytes": row[1]}
+        return usage
+
+    def clear_processing_cache(self) -> str:
+        """Borra únicamente datos regenerables y compacta el archivo sin tocar resultados."""
+        with self.connect() as connection:
+            for table in _PROCESSING_CACHE_COLUMNS:
+                connection.execute(f"DELETE FROM {table}")
+        try:
+            with self.connect() as connection:
+                connection.execute("VACUUM")
+        except sqlite3.Error:
+            return ("La caché se eliminó, pero no se pudo compactar la base. "
+                    "El espacio queda disponible para reutilizarse dentro de Sentry.")
+        return ""
 
     def cache_get(self, table: str, key: str):
         if table not in {"transcription_cache", "analysis_cache"}:
